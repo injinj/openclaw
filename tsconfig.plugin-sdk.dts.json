@@ -17,5 +17,12 @@
     "src/video-generation/types.ts",
     "src/types/**/*.d.ts"
   ],
-  "exclude": ["node_modules", "dist", "src/**/*.test.ts", "src/**/*.test-helpers.ts"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/**/*.test.ts",
+    "src/**/*.test-helpers.ts",
+    "src/plugin-sdk/test-helpers/**",
+    "src/plugin-sdk/provider-http-test-mocks.ts"
+  ]
 }
