@@ -1,3 +1,4 @@
+// OpenClaw runtime test setup installs runtime mocks and cleanup.
 import { afterAll, afterEach, beforeAll, vi } from "vitest";
 import type {
   ChannelId,
@@ -6,6 +7,7 @@ import type {
 } from "../src/channels/plugins/types.js";
 import type { OpenClawConfig } from "../src/config/config.js";
 import type { OutboundSendDeps } from "../src/infra/outbound/deliver.js";
+import { createEmptyPluginRegistry } from "../src/plugins/registry-empty.js";
 import type { PluginRegistry } from "../src/plugins/registry.js";
 import { installSharedTestSetup } from "./setup.shared.js";
 
@@ -23,11 +25,9 @@ type WorkerPluginRuntimeHelpers = {
   setActivePluginRegistry: typeof import("../src/plugins/runtime.js").setActivePluginRegistry;
 };
 type WorkerCleanupHelpers = {
-  clearPluginDiscoveryCache: typeof import("../src/plugins/discovery.js").clearPluginDiscoveryCache;
-  clearPluginManifestRegistryCache: typeof import("../src/plugins/manifest-registry-state.js").clearPluginManifestRegistryCache;
   clearSessionStoreCaches: typeof import("../src/config/sessions/store-cache.js").clearSessionStoreCaches;
   drainFileLockStateForTest: typeof import("../src/infra/file-lock.js").drainFileLockStateForTest;
-  drainSessionStoreLockQueuesForTest: typeof import("../src/config/sessions/store-lock-state.js").drainSessionStoreLockQueuesForTest;
+  drainSessionStoreWriterQueuesForTest: typeof import("../src/config/sessions/store-writer-state.js").drainSessionStoreWriterQueuesForTest;
   drainSessionWriteLockStateForTest: typeof import("../src/agents/session-write-lock.js").drainSessionWriteLockStateForTest;
   resetContextWindowCacheForTest: typeof import("../src/agents/context-runtime-state.js").resetContextWindowCacheForTest;
   resetFileLockStateForTest: typeof import("../src/infra/file-lock.js").resetFileLockStateForTest;
@@ -82,30 +82,23 @@ function loadWorkerCleanupHelpers(): Promise<WorkerCleanupHelpers> {
     vi.importActual<typeof import("../src/config/sessions/store-cache.js")>(
       "../src/config/sessions/store-cache.js",
     ),
-    vi.importActual<typeof import("../src/config/sessions/store-lock-state.js")>(
-      "../src/config/sessions/store-lock-state.js",
+    vi.importActual<typeof import("../src/config/sessions/store-writer-state.js")>(
+      "../src/config/sessions/store-writer-state.js",
     ),
     vi.importActual<typeof import("../src/infra/file-lock.js")>("../src/infra/file-lock.js"),
-    vi.importActual<typeof import("../src/plugins/discovery.js")>("../src/plugins/discovery.js"),
-    vi.importActual<typeof import("../src/plugins/manifest-registry-state.js")>(
-      "../src/plugins/manifest-registry-state.js",
-    ),
   ]).then(
     ([
       contextRuntimeState,
       modelsConfigState,
       sessionWriteLock,
       sessionStoreCache,
-      sessionStoreLockState,
+      sessionStoreWriterState,
       fileLock,
-      discovery,
-      manifestRegistryState,
     ]) => ({
-      clearPluginDiscoveryCache: discovery.clearPluginDiscoveryCache,
-      clearPluginManifestRegistryCache: manifestRegistryState.clearPluginManifestRegistryCache,
       clearSessionStoreCaches: sessionStoreCache.clearSessionStoreCaches,
       drainFileLockStateForTest: fileLock.drainFileLockStateForTest,
-      drainSessionStoreLockQueuesForTest: sessionStoreLockState.drainSessionStoreLockQueuesForTest,
+      drainSessionStoreWriterQueuesForTest:
+        sessionStoreWriterState.drainSessionStoreWriterQueuesForTest,
       drainSessionWriteLockStateForTest: sessionWriteLock.drainSessionWriteLockStateForTest,
       resetContextWindowCacheForTest: contextRuntimeState.resetContextWindowCacheForTest,
       resetFileLockStateForTest: fileLock.resetFileLockStateForTest,
@@ -133,10 +126,7 @@ function createTestRegistryForSetup(
   channels: Array<{ pluginId: string; plugin: ChannelPlugin; source: string }> = [],
 ): PluginRegistry {
   return {
-    plugins: [],
-    tools: [],
-    hooks: [],
-    typedHooks: [],
+    ...createEmptyPluginRegistry(),
     channels: channels as unknown as PluginRegistry["channels"],
     channelSetups: channels.map((entry) => ({
       pluginId: entry.pluginId,
@@ -144,29 +134,6 @@ function createTestRegistryForSetup(
       source: entry.source,
       enabled: true,
     })),
-    providers: [],
-    speechProviders: [],
-    realtimeTranscriptionProviders: [],
-    realtimeVoiceProviders: [],
-    mediaUnderstandingProviders: [],
-    imageGenerationProviders: [],
-    videoGenerationProviders: [],
-    webFetchProviders: [],
-    webSearchProviders: [],
-    migrationProviders: [],
-    memoryEmbeddingProviders: [],
-    gatewayHandlers: {},
-    gatewayMethodScopes: {},
-    httpRoutes: [],
-    cliRegistrars: [],
-    reloads: [],
-    nodeHostCommands: [],
-    securityAuditCollectors: [],
-    services: [],
-    gatewayDiscoveryServices: [],
-    commands: [],
-    conversationBindingResolvedHandlers: [],
-    diagnostics: [],
   };
 }
 
@@ -213,8 +180,7 @@ const createStubOutbound = (
   sendText: async ({ deps, to, text }) => {
     const send = pickSendFn(id, deps);
     if (send) {
-      // oxlint-disable-next-line typescript/no-explicit-any
-      const result = (await send(to, text, { verbose: false } as any)) as {
+      const result = (await send(to, text, { verbose: false })) as {
         messageId: string;
       };
       return { channel: id, ...result };
@@ -224,8 +190,7 @@ const createStubOutbound = (
   sendMedia: async ({ deps, to, text, mediaUrl }) => {
     const send = pickSendFn(id, deps);
     if (send) {
-      // oxlint-disable-next-line typescript/no-explicit-any
-      const result = (await send(to, text, { verbose: false, mediaUrl } as any)) as {
+      const result = (await send(to, text, { verbose: false, mediaUrl })) as {
         messageId: string;
       };
       return { channel: id, ...result };
@@ -401,18 +366,16 @@ beforeAll(async () => {
 
 afterEach(async () => {
   const {
-    clearPluginDiscoveryCache,
-    clearPluginManifestRegistryCache,
     clearSessionStoreCaches,
     drainFileLockStateForTest,
-    drainSessionStoreLockQueuesForTest,
+    drainSessionStoreWriterQueuesForTest,
     drainSessionWriteLockStateForTest,
     resetContextWindowCacheForTest,
     resetFileLockStateForTest,
     resetModelsJsonReadyCacheForTest,
     resetSessionWriteLockStateForTest,
   } = await loadWorkerCleanupHelpers();
-  await drainSessionStoreLockQueuesForTest();
+  await drainSessionStoreWriterQueuesForTest();
   clearSessionStoreCaches();
   await drainFileLockStateForTest();
   await drainSessionWriteLockStateForTest();
@@ -420,22 +383,13 @@ afterEach(async () => {
   resetContextWindowCacheForTest();
   resetModelsJsonReadyCacheForTest();
   resetSessionWriteLockStateForTest();
-  clearPluginDiscoveryCache();
-  clearPluginManifestRegistryCache();
   await installDefaultPluginRegistry();
 });
 
 afterAll(async () => {
-  const {
-    clearPluginDiscoveryCache,
-    clearPluginManifestRegistryCache,
-    clearSessionStoreCaches,
-    drainFileLockStateForTest,
-    drainSessionWriteLockStateForTest,
-  } = await loadWorkerCleanupHelpers();
+  const { clearSessionStoreCaches, drainFileLockStateForTest, drainSessionWriteLockStateForTest } =
+    await loadWorkerCleanupHelpers();
   clearSessionStoreCaches();
   await drainFileLockStateForTest();
   await drainSessionWriteLockStateForTest();
-  clearPluginDiscoveryCache();
-  clearPluginManifestRegistryCache();
 });

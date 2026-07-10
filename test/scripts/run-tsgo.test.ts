@@ -1,3 +1,4 @@
+// Run Tsgo tests cover run tsgo script behavior.
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -26,7 +27,7 @@ describe("run-tsgo sparse guard", () => {
     const cwd = createTempDir("openclaw-run-tsgo-");
 
     expect(
-      getSparseTsgoGuardError(["-p", "tsconfig.core.test.json"], {
+      getSparseTsgoGuardError(["-p", "test/tsconfig/tsconfig.core.test.json"], {
         cwd,
         isSparseCheckoutEnabled: () => false,
       }),
@@ -37,7 +38,7 @@ describe("run-tsgo sparse guard", () => {
     const cwd = createTempDir("openclaw-run-tsgo-");
 
     expect(
-      getSparseTsgoGuardError(["-p", "tsconfig.core.test.json", "--showConfig"], {
+      getSparseTsgoGuardError(["-p", "test/tsconfig/tsconfig.core.test.json", "--showConfig"], {
         cwd,
         isSparseCheckoutEnabled: () => true,
       }),
@@ -48,10 +49,11 @@ describe("run-tsgo sparse guard", () => {
     const cwd = createTempDir("openclaw-run-tsgo-");
     const requiredPaths = [
       "packages/plugin-package-contract/src/index.ts",
+      "ui/config/control-ui-chunking.ts",
       "ui/src/i18n/lib/registry.ts",
       "ui/src/i18n/lib/types.ts",
-      "ui/src/ui/app-settings.ts",
-      "ui/src/ui/gateway.ts",
+      "ui/src/app/settings.ts",
+      "ui/src/api/gateway.ts",
     ];
 
     for (const relativePath of requiredPaths) {
@@ -62,10 +64,10 @@ describe("run-tsgo sparse guard", () => {
     }
 
     expect(
-      getSparseTsgoGuardError(["-p", "tsconfig.core.test.non-agents.json"], {
+      getSparseTsgoGuardError(["-p", "test/tsconfig/tsconfig.core.test.non-agents.json"], {
         cwd,
         isSparseCheckoutEnabled: () => true,
-        sparseCheckoutPatterns: ["/packages/", "/ui/src/"],
+        sparseCheckoutPatterns: ["/packages/", "/ui/config/", "/ui/src/"],
       }),
     ).toBeNull();
   });
@@ -74,10 +76,11 @@ describe("run-tsgo sparse guard", () => {
     const cwd = createTempDir("openclaw-run-tsgo-");
     const requiredPaths = [
       "packages/plugin-package-contract/src/index.ts",
+      "ui/config/control-ui-chunking.ts",
       "ui/src/i18n/lib/registry.ts",
       "ui/src/i18n/lib/types.ts",
-      "ui/src/ui/app-settings.ts",
-      "ui/src/ui/gateway.ts",
+      "ui/src/app/settings.ts",
+      "ui/src/api/gateway.ts",
     ];
 
     for (const relativePath of requiredPaths) {
@@ -87,20 +90,22 @@ describe("run-tsgo sparse guard", () => {
     }
 
     expect(
-      getSparseTsgoGuardError(["-p", "tsconfig.core.test.json"], {
+      getSparseTsgoGuardError(["-p", "test/tsconfig/tsconfig.core.test.json"], {
         cwd,
         isSparseCheckoutEnabled: () => true,
         sparseCheckoutPatterns: [
           "/packages/plugin-package-contract/src/index.ts",
+          "/ui/config/control-ui-chunking.ts",
           "/ui/src/i18n/lib/registry.ts",
           "/ui/src/i18n/lib/types.ts",
-          "/ui/src/ui/app-settings.ts",
-          "/ui/src/ui/gateway.ts",
+          "/ui/src/app/settings.ts",
+          "/ui/src/api/gateway.ts",
         ],
       }),
     ).toMatchInlineSnapshot(`
       "tsconfig.core.test.json cannot be typechecked from this sparse checkout because tracked project inputs are missing or only partially included:
       - packages
+      - ui/config
       - ui/src
       Expand this worktree's sparse checkout to include those paths, or rerun in a full worktree."
     `);
@@ -128,17 +133,18 @@ describe("run-tsgo sparse guard", () => {
     const cwd = createTempDir("openclaw-run-tsgo-");
 
     expect(
-      getSparseTsgoGuardError(["-p", "tsconfig.core.test.json"], {
+      getSparseTsgoGuardError(["-p", "test/tsconfig/tsconfig.core.test.json"], {
         cwd,
         isSparseCheckoutEnabled: () => true,
       }),
     ).toMatchInlineSnapshot(`
       "tsconfig.core.test.json cannot be typechecked from this sparse checkout because tracked project inputs are missing or only partially included:
       - packages/plugin-package-contract/src/index.ts
+      - ui/config/control-ui-chunking.ts
+      - ui/src/api/gateway.ts
+      - ui/src/app/settings.ts
       - ui/src/i18n/lib/registry.ts
       - ui/src/i18n/lib/types.ts
-      - ui/src/ui/app-settings.ts
-      - ui/src/ui/gateway.ts
       Expand this worktree's sparse checkout to include those paths, or rerun in a full worktree."
     `);
   });
@@ -147,7 +153,7 @@ describe("run-tsgo sparse guard", () => {
     expect(shouldSkipSparseTsgoGuardError({ OPENCLAW_TSGO_SPARSE_SKIP: "1" })).toBe(true);
     expect(shouldSkipSparseTsgoGuardError({ OPENCLAW_TSGO_SPARSE_SKIP: "true" })).toBe(true);
     expect(shouldSkipSparseTsgoGuardError({ OPENCLAW_TSGO_SPARSE_SKIP: "0" })).toBe(false);
-    expect(createSparseTsgoSkipEnv({ PATH: "/usr/bin" })).toMatchObject({
+    expect(createSparseTsgoSkipEnv({ PATH: "/usr/bin" })).toStrictEqual({
       PATH: "/usr/bin",
       OPENCLAW_TSGO_SPARSE_SKIP: "1",
     });

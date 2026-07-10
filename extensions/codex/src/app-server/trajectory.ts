@@ -1,13 +1,25 @@
+/**
+ * Records optional Codex runtime trajectory sidecars with bounded, redacted
+ * context and completion events.
+ */
 import nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { resolveUserPath } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type {
   EmbeddedRunAttemptParams,
   EmbeddedRunAttemptResult,
-} from "openclaw/plugin-sdk/agent-harness";
-import { resolveUserPath } from "openclaw/plugin-sdk/agent-harness";
+} from "openclaw/plugin-sdk/agent-harness-runtime";
+import {
+  appendRegularFile,
+  resolveRegularFileAppendFlags,
+} from "openclaw/plugin-sdk/security-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
+import { resolveCodexLocalRuntimeAttribution } from "./local-runtime-attribution.js";
+import { flattenCodexDynamicToolFunctions, type CodexDynamicToolSpec } from "./protocol.js";
 
-type CodexTrajectoryRecorder = {
+/** Runtime trajectory recorder used by Codex run attempts and event projectors. */
+export type CodexTrajectoryRecorder = {
   filePath: string;
   recordEvent: (type: string, data?: Record<string, unknown>) => void;
   flush: () => Promise<void>;
@@ -18,7 +30,7 @@ type CodexTrajectoryInit = {
   cwd: string;
   developerInstructions?: string;
   prompt?: string;
-  tools?: Array<{ name?: string; description?: string; inputSchema?: unknown }>;
+  tools?: CodexDynamicToolSpec[];
   env?: NodeJS.ProcessEnv;
 };
 
@@ -29,6 +41,7 @@ const JWT_VALUE_RE = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]
 const COOKIE_PAIR_RE = /\b([A-Za-z][A-Za-z0-9_.-]{1,64})=([A-Za-z0-9+/._~%=-]{16,})(?=;|\s|$)/gu;
 const TRAJECTORY_RUNTIME_FILE_MAX_BYTES = 50 * 1024 * 1024;
 const TRAJECTORY_RUNTIME_EVENT_MAX_BYTES = 256 * 1024;
+const TRAJECTORY_RUNTIME_OVERSIZE_PRESERVED_DATA_KEYS = ["usage", "promptCache"] as const;
 
 type CodexTrajectoryOpenFlagConstants = Pick<
   typeof nodeFs.constants,
@@ -36,18 +49,14 @@ type CodexTrajectoryOpenFlagConstants = Pick<
 > &
   Partial<Pick<typeof nodeFs.constants, "O_NOFOLLOW">>;
 
+/** Resolves secure append flags for trajectory runtime files. */
 export function resolveCodexTrajectoryAppendFlags(
   constants: CodexTrajectoryOpenFlagConstants = nodeFs.constants,
 ): number {
-  const noFollow = constants.O_NOFOLLOW;
-  return (
-    constants.O_CREAT |
-    constants.O_APPEND |
-    constants.O_WRONLY |
-    (typeof noFollow === "number" ? noFollow : 0)
-  );
+  return resolveRegularFileAppendFlags(constants);
 }
 
+/** Resolves secure create/truncate flags for trajectory pointer files. */
 export function resolveCodexTrajectoryPointerFlags(
   constants: CodexTrajectoryOpenFlagConstants = nodeFs.constants,
 ): number {
@@ -60,78 +69,13 @@ export function resolveCodexTrajectoryPointerFlags(
   );
 }
 
-async function assertNoSymlinkParents(filePath: string): Promise<void> {
-  const resolvedDir = path.resolve(path.dirname(filePath));
-  const parsed = path.parse(resolvedDir);
-  const relativeParts = path.relative(parsed.root, resolvedDir).split(path.sep).filter(Boolean);
-  let current = parsed.root;
-  for (const part of relativeParts) {
-    current = path.join(current, part);
-    const stat = await fs.lstat(current);
-    if (stat.isSymbolicLink()) {
-      if (path.dirname(current) === parsed.root) {
-        continue;
-      }
-      throw new Error(`Refusing to write trajectory under symlinked directory: ${current}`);
-    }
-    if (!stat.isDirectory()) {
-      throw new Error(`Refusing to write trajectory under non-directory: ${current}`);
-    }
-  }
-}
-
-function verifyStableOpenedTrajectoryFile(params: {
-  preOpenStat?: nodeFs.Stats;
-  postOpenStat: nodeFs.Stats;
-  filePath: string;
-}): void {
-  if (!params.postOpenStat.isFile()) {
-    throw new Error(`Refusing to write trajectory to non-file: ${params.filePath}`);
-  }
-  if (params.postOpenStat.nlink > 1) {
-    throw new Error(`Refusing to write trajectory to hardlinked file: ${params.filePath}`);
-  }
-  const pre = params.preOpenStat;
-  if (pre && (pre.dev !== params.postOpenStat.dev || pre.ino !== params.postOpenStat.ino)) {
-    throw new Error(`Refusing to write trajectory after file changed: ${params.filePath}`);
-  }
-}
-
 async function safeAppendTrajectoryFile(filePath: string, line: string): Promise<void> {
-  await assertNoSymlinkParents(filePath);
-
-  let preOpenStat: nodeFs.Stats | undefined;
-  try {
-    const stat = await fs.lstat(filePath);
-    if (stat.isSymbolicLink()) {
-      throw new Error(`Refusing to write trajectory through symlink: ${filePath}`);
-    }
-    if (!stat.isFile()) {
-      throw new Error(`Refusing to write trajectory to non-file: ${filePath}`);
-    }
-    preOpenStat = stat;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw err;
-    }
-  }
-  const lineBytes = Buffer.byteLength(line, "utf8");
-  if ((preOpenStat?.size ?? 0) + lineBytes > TRAJECTORY_RUNTIME_FILE_MAX_BYTES) {
-    return;
-  }
-
-  const handle = await fs.open(filePath, resolveCodexTrajectoryAppendFlags(), 0o600);
-  try {
-    const stat = await handle.stat();
-    verifyStableOpenedTrajectoryFile({ preOpenStat, postOpenStat: stat, filePath });
-    if (stat.size + lineBytes > TRAJECTORY_RUNTIME_FILE_MAX_BYTES) {
-      return;
-    }
-    await handle.chmod(0o600);
-    await handle.appendFile(line, "utf8");
-  } finally {
-    await handle.close();
-  }
+  await appendRegularFile({
+    filePath,
+    content: line,
+    maxFileBytes: TRAJECTORY_RUNTIME_FILE_MAX_BYTES,
+    rejectSymlinkParents: true,
+  });
 }
 
 function boundedTrajectoryLine(event: Record<string, unknown>): string | undefined {
@@ -140,19 +84,57 @@ function boundedTrajectoryLine(event: Record<string, unknown>): string | undefin
   if (bytes <= TRAJECTORY_RUNTIME_EVENT_MAX_BYTES) {
     return `${line}\n`;
   }
-  const truncated = JSON.stringify({
-    ...event,
-    data: {
-      truncated: true,
-      originalBytes: bytes,
-      limitBytes: TRAJECTORY_RUNTIME_EVENT_MAX_BYTES,
-      reason: "trajectory-event-size-limit",
-    },
-  });
-  if (Buffer.byteLength(truncated, "utf8") <= TRAJECTORY_RUNTIME_EVENT_MAX_BYTES) {
-    return `${truncated}\n`;
+
+  const originalData =
+    event.data && typeof event.data === "object" && !Array.isArray(event.data)
+      ? (event.data as Record<string, unknown>)
+      : {};
+  const originalDataKeys = Object.keys(originalData);
+  const preservedDataKeys = new Set<string>();
+  const baseData = {
+    truncated: true,
+    originalBytes: bytes,
+    limitBytes: TRAJECTORY_RUNTIME_EVENT_MAX_BYTES,
+    reason: "trajectory-event-size-limit",
+  };
+  const buildTruncatedLine = (includeDroppedFields: boolean): string | undefined => {
+    const data: Record<string, unknown> = { ...baseData };
+    for (const key of TRAJECTORY_RUNTIME_OVERSIZE_PRESERVED_DATA_KEYS) {
+      if (preservedDataKeys.has(key)) {
+        data[key] = originalData[key];
+      }
+    }
+    if (includeDroppedFields) {
+      const droppedFields = originalDataKeys.filter((key) => !preservedDataKeys.has(key));
+      if (droppedFields.length > 0) {
+        data.droppedFields = droppedFields;
+      }
+    }
+    const truncated = JSON.stringify({ ...event, data });
+    if (Buffer.byteLength(truncated, "utf8") <= TRAJECTORY_RUNTIME_EVENT_MAX_BYTES) {
+      return `${truncated}\n`;
+    }
+    return undefined;
+  };
+
+  let best = buildTruncatedLine(true) ?? buildTruncatedLine(false);
+  if (!best) {
+    return undefined;
   }
-  return undefined;
+
+  for (const key of TRAJECTORY_RUNTIME_OVERSIZE_PRESERVED_DATA_KEYS) {
+    if (!Object.hasOwn(originalData, key)) {
+      continue;
+    }
+    preservedDataKeys.add(key);
+    const next = buildTruncatedLine(true) ?? buildTruncatedLine(false);
+    if (next) {
+      best = next;
+      continue;
+    }
+    preservedDataKeys.delete(key);
+  }
+  return best;
 }
 
 function resolveTrajectoryPointerFilePath(sessionFile: string): string {
@@ -206,6 +188,7 @@ function writeTrajectoryPointerBestEffort(params: {
   }
 }
 
+/** Creates a trajectory recorder when trajectory capture is enabled for the environment. */
 export function createCodexTrajectoryRecorder(
   params: CodexTrajectoryInit,
 ): CodexTrajectoryRecorder | null {
@@ -230,6 +213,7 @@ export function createCodexTrajectoryRecorder(
   });
   let queue = Promise.resolve();
   let seq = 0;
+  const attribution = resolveCodexLocalRuntimeAttribution(params.attempt);
 
   return {
     filePath,
@@ -247,9 +231,9 @@ export function createCodexTrajectoryRecorder(
         sessionKey: params.attempt.sessionKey,
         runId: params.attempt.runId,
         workspaceDir: params.cwd,
-        provider: params.attempt.provider,
+        provider: attribution.provider,
         modelId: params.attempt.modelId,
-        modelApi: params.attempt.model.api,
+        modelApi: attribution.api,
         data: data ? sanitizeValue(data) : undefined,
       };
       const line = boundedTrajectoryLine(event);
@@ -267,6 +251,7 @@ export function createCodexTrajectoryRecorder(
   };
 }
 
+/** Records compiled prompt/tool context at the start of a Codex runtime attempt. */
 export function recordCodexTrajectoryContext(
   recorder: CodexTrajectoryRecorder | null,
   params: CodexTrajectoryInit,
@@ -282,6 +267,7 @@ export function recordCodexTrajectoryContext(
   });
 }
 
+/** Records final Codex model completion metadata and assistant snapshots. */
 export function recordCodexTrajectoryCompletion(
   recorder: CodexTrajectoryRecorder | null,
   params: {
@@ -353,12 +339,12 @@ function resolveContainedPath(baseDir: string, fileName: string): string {
 }
 
 function toTrajectoryToolDefinitions(
-  tools: Array<{ name?: string; description?: string; inputSchema?: unknown }> | undefined,
+  tools: readonly CodexDynamicToolSpec[] | undefined,
 ): Array<{ name: string; description?: string; parameters?: unknown }> | undefined {
   if (!tools || tools.length === 0) {
     return undefined;
   }
-  return tools
+  return flattenCodexDynamicToolFunctions(tools)
     .flatMap((tool) => {
       const name = tool.name?.trim();
       if (!name) {
@@ -376,6 +362,8 @@ function toTrajectoryToolDefinitions(
 }
 
 function sanitizeValue(value: unknown, depth = 0, key = ""): unknown {
+  // Trajectory files may be inspected outside the live process, so redact
+  // credentials and private payloads before queueing the line for disk writes.
   if (value == null || typeof value === "boolean" || typeof value === "number") {
     return value;
   }
@@ -390,7 +378,7 @@ function sanitizeValue(value: unknown, depth = 0, key = ""): unknown {
       return "<redacted payload>";
     }
     const redacted = redactSensitiveString(value);
-    return redacted.length > 20_000 ? `${redacted.slice(0, 20_000)}…` : redacted;
+    return redacted.length > 20_000 ? `${truncateUtf16Safe(redacted, 20_000)}…` : redacted;
   }
   if (depth >= 6) {
     return "<truncated>";
@@ -400,8 +388,8 @@ function sanitizeValue(value: unknown, depth = 0, key = ""): unknown {
   }
   if (typeof value === "object") {
     const next: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value).slice(0, 100)) {
-      next[key] = sanitizeValue(child, depth + 1, key);
+    for (const [keyLocal, child] of Object.entries(value).slice(0, 100)) {
+      next[keyLocal] = sanitizeValue(child, depth + 1, keyLocal);
     }
     return next;
   }
@@ -415,6 +403,7 @@ function redactSensitiveString(value: string): string {
     .replace(COOKIE_PAIR_RE, "$1=<redacted>");
 }
 
+/** Converts arbitrary prompt errors into trajectory-safe text. */
 export function normalizeCodexTrajectoryError(value: unknown): string | null {
   if (!value) {
     return null;

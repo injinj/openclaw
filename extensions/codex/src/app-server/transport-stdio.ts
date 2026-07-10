@@ -1,3 +1,7 @@
+/**
+ * Creates and configures stdio-backed Codex app-server transports, including
+ * Windows spawn normalization and environment filtering.
+ */
 import { spawn } from "node:child_process";
 import {
   materializeWindowsSpawnProgram,
@@ -7,6 +11,7 @@ import type { CodexAppServerStartOptions } from "./config.js";
 import type { CodexAppServerTransport } from "./transport.js";
 
 const UNSAFE_ENVIRONMENT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const QA_PARENT_PID_ENV = "OPENCLAW_QA_PARENT_PID";
 
 type CodexAppServerSpawnRuntime = {
   platform: NodeJS.Platform;
@@ -20,6 +25,7 @@ const DEFAULT_SPAWN_RUNTIME: CodexAppServerSpawnRuntime = {
   execPath: process.execPath,
 };
 
+/** Resolves the concrete command/argv/shell settings used to spawn Codex app-server. */
 export function resolveCodexAppServerSpawnInvocation(
   options: CodexAppServerStartOptions,
   runtime: CodexAppServerSpawnRuntime = DEFAULT_SPAWN_RUNTIME,
@@ -43,17 +49,48 @@ export function resolveCodexAppServerSpawnInvocation(
   };
 }
 
+/** Merges app-server environment overrides while honoring clearEnv and unsafe key filtering. */
 export function resolveCodexAppServerSpawnEnv(
   options: Pick<CodexAppServerStartOptions, "env" | "clearEnv">,
   baseEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
   const env = Object.create(null) as NodeJS.ProcessEnv;
   copySafeEnvironmentEntries(env, baseEnv);
   copySafeEnvironmentEntries(env, options.env ?? {});
-  for (const key of options.clearEnv ?? []) {
-    delete env[key];
+  const keysToClear = normalizedEnvironmentKeys(options.clearEnv ?? []);
+  if (platform === "win32") {
+    const lowerCaseKeysToClear = new Set(keysToClear.map((key) => key.toLowerCase()));
+    for (const candidate of Object.keys(env)) {
+      if (lowerCaseKeysToClear.has(candidate.toLowerCase())) {
+        delete env[candidate];
+      }
+    }
+  } else {
+    for (const key of keysToClear) {
+      delete env[key];
+    }
   }
   return env;
+}
+
+/** Keeps QA-owned app-server processes inside the gateway process-group cleanup boundary. */
+export function resolveCodexAppServerDetachedMode(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform !== "win32" && !env[QA_PARENT_PID_ENV]?.trim();
+}
+
+function normalizedEnvironmentKeys(rawKeys: readonly string[]): string[] {
+  const keys: string[] = [];
+  for (const rawKey of rawKeys) {
+    const key = rawKey.trim();
+    if (key.length > 0) {
+      keys.push(key);
+    }
+  }
+  return keys;
 }
 
 function copySafeEnvironmentEntries(
@@ -68,6 +105,7 @@ function copySafeEnvironmentEntries(
   }
 }
 
+/** Spawns the Codex app-server process and returns the shared transport interface. */
 export function createStdioTransport(options: CodexAppServerStartOptions): CodexAppServerTransport {
   const env = resolveCodexAppServerSpawnEnv(options);
   const invocation = resolveCodexAppServerSpawnInvocation(options, {
@@ -77,7 +115,7 @@ export function createStdioTransport(options: CodexAppServerStartOptions): Codex
   });
   return spawn(invocation.command, invocation.args, {
     env,
-    detached: process.platform !== "win32",
+    detached: resolveCodexAppServerDetachedMode(env),
     shell: invocation.shell,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: invocation.windowsHide,

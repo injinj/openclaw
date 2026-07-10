@@ -23,6 +23,7 @@
  * vitest (which resolves bare specifiers via `resolve.alias`, not Node CJS).
  */
 
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import {
   hasConfiguredSecretInput,
   normalizeResolvedSecretInputString,
@@ -38,10 +39,14 @@ import {
 import type { FetchMediaOptions, FetchMediaResult } from "../engine/adapter/types.js";
 import { getBridgeLogger } from "./logger.js";
 
+const loadMediaRuntimeModule = createLazyRuntimeModule(
+  () => import("openclaw/plugin-sdk/media-runtime"),
+);
+
 function createBuiltinAdapter(): PlatformAdapter {
   return {
     async validateRemoteUrl(_url: string, _options?: { allowPrivate?: boolean }): Promise<void> {
-      // Built-in version delegates SSRF validation to fetchRemoteMedia's ssrfPolicy.
+      // Built-in version delegates SSRF validation to readRemoteMediaBuffer's ssrfPolicy.
     },
 
     async resolveSecret(value): Promise<string | undefined> {
@@ -52,8 +57,8 @@ function createBuiltinAdapter(): PlatformAdapter {
     },
 
     async downloadFile(url: string, destDir: string, filename?: string): Promise<string> {
-      const { fetchRemoteMedia } = await import("openclaw/plugin-sdk/media-runtime");
-      const result = await fetchRemoteMedia({ url, filePathHint: filename });
+      const { readRemoteMediaBuffer } = await loadMediaRuntimeModule();
+      const result = await readRemoteMediaBuffer({ url, filePathHint: filename });
       const fs = await import("node:fs");
       const path = await import("node:path");
       if (!fs.existsSync(destDir)) {
@@ -65,8 +70,8 @@ function createBuiltinAdapter(): PlatformAdapter {
     },
 
     async fetchMedia(options: FetchMediaOptions): Promise<FetchMediaResult> {
-      const { fetchRemoteMedia } = await import("openclaw/plugin-sdk/media-runtime");
-      const result = await fetchRemoteMedia({
+      const { readRemoteMediaBuffer } = await loadMediaRuntimeModule();
+      const result = await readRemoteMediaBuffer({
         url: options.url,
         filePathHint: options.filePathHint,
         maxBytes: options.maxBytes,

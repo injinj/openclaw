@@ -84,11 +84,16 @@ actor GatewayEndpointStore {
         env: [String: String],
         launchdSnapshot: LaunchAgentPlistSnapshot?) -> String?
     {
+        let serviceEnv = launchdSnapshot?.environment ?? [:]
         let raw = env["OPENCLAW_GATEWAY_PASSWORD"] ?? ""
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
-            if let configPassword = self.resolveConfigPassword(isRemote: isRemote, root: root),
-               !configPassword.isEmpty
+            if let configPassword = self.resolveConfigPassword(
+                isRemote: isRemote,
+                root: root,
+                env: env,
+                serviceEnv: serviceEnv),
+                !configPassword.isEmpty
             {
                 self.warnEnvOverrideOnce(
                     kind: .password,
@@ -113,8 +118,11 @@ actor GatewayEndpointStore {
            let auth = gateway["auth"] as? [String: Any],
            let password = auth["password"] as? String
         {
-            let pw = password.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !pw.isEmpty {
+            if let pw = self.resolveLocalConfigAuthString(
+                password,
+                env: env,
+                serviceEnv: serviceEnv)
+            {
                 return pw
             }
         }
@@ -126,7 +134,12 @@ actor GatewayEndpointStore {
         return nil
     }
 
-    private static func resolveConfigPassword(isRemote: Bool, root: [String: Any]) -> String? {
+    private static func resolveConfigPassword(
+        isRemote: Bool,
+        root: [String: Any],
+        env: [String: String] = [:],
+        serviceEnv: [String: String] = [:]) -> String?
+    {
         if isRemote {
             if let gateway = root["gateway"] as? [String: Any],
                let remote = gateway["remote"] as? [String: Any],
@@ -141,7 +154,7 @@ actor GatewayEndpointStore {
            let auth = gateway["auth"] as? [String: Any],
            let password = auth["password"] as? String
         {
-            return password.trimmingCharacters(in: .whitespacesAndNewlines)
+            return self.resolveLocalConfigAuthString(password, env: env, serviceEnv: serviceEnv)
         }
         return nil
     }
@@ -152,12 +165,17 @@ actor GatewayEndpointStore {
         env: [String: String],
         launchdSnapshot: LaunchAgentPlistSnapshot?) -> String?
     {
+        let serviceEnv = launchdSnapshot?.environment ?? [:]
         let raw = env["OPENCLAW_GATEWAY_TOKEN"] ?? ""
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
-            if let configToken = self.resolveConfigToken(isRemote: isRemote, root: root),
-               !configToken.isEmpty,
-               configToken != trimmed
+            if let configToken = self.resolveConfigToken(
+                isRemote: isRemote,
+                root: root,
+                env: env,
+                serviceEnv: serviceEnv),
+                !configToken.isEmpty,
+                configToken != trimmed
             {
                 self.warnEnvOverrideOnce(
                     kind: .token,
@@ -167,8 +185,12 @@ actor GatewayEndpointStore {
             return trimmed
         }
 
-        if let configToken = self.resolveConfigToken(isRemote: isRemote, root: root),
-           !configToken.isEmpty
+        if let configToken = self.resolveConfigToken(
+            isRemote: isRemote,
+            root: root,
+            env: env,
+            serviceEnv: serviceEnv),
+            !configToken.isEmpty
         {
             return configToken
         }
@@ -186,7 +208,12 @@ actor GatewayEndpointStore {
         return nil
     }
 
-    private static func resolveConfigToken(isRemote: Bool, root: [String: Any]) -> String? {
+    private static func resolveConfigToken(
+        isRemote: Bool,
+        root: [String: Any],
+        env: [String: String] = [:],
+        serviceEnv: [String: String] = [:]) -> String?
+    {
         if isRemote {
             return GatewayRemoteConfig.resolveTokenString(root: root)
         }
@@ -195,9 +222,50 @@ actor GatewayEndpointStore {
            let auth = gateway["auth"] as? [String: Any],
            let token = auth["token"] as? String
         {
-            return token.trimmingCharacters(in: .whitespacesAndNewlines)
+            return self.resolveLocalConfigAuthString(token, env: env, serviceEnv: serviceEnv)
         }
         return nil
+    }
+
+    private static func resolveLocalConfigAuthString(
+        _ raw: String,
+        env: [String: String],
+        serviceEnv: [String: String]) -> String?
+    {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let envName = self.envSecretRefName(trimmed) else {
+            return trimmed
+        }
+        // Finder-launched apps cannot see gateway-service-only env values. Resolve
+        // local refs from app env first, then the gateway LaunchAgent snapshot.
+        for source in [env, serviceEnv] {
+            let value = source[envName]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let value, !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func envSecretRefName(_ value: String) -> String? {
+        let name: Substring
+        if value.hasPrefix("${"), value.hasSuffix("}") {
+            let nameStart = value.index(value.startIndex, offsetBy: 2)
+            let nameEnd = value.index(before: value.endIndex)
+            name = value[nameStart..<nameEnd]
+        } else if value.hasPrefix("$") {
+            let nameStart = value.index(after: value.startIndex)
+            name = value[nameStart..<value.endIndex]
+        } else {
+            return nil
+        }
+        let candidate = String(name)
+        return self.isValidEnvSecretRefID(candidate) ? candidate : nil
+    }
+
+    private static func isValidEnvSecretRefID(_ value: String) -> Bool {
+        value.range(of: #"^[A-Z][A-Z0-9_]{0,127}$"#, options: .regularExpression) != nil
     }
 
     private static func warnEnvOverrideOnce(
@@ -306,8 +374,9 @@ actor GatewayEndpointStore {
                 password: password))
         case .remote:
             let root = OpenClawConfigFile.loadDict()
-            if GatewayRemoteConfig.resolveTransport(root: root) == .direct {
-                guard let url = GatewayRemoteConfig.resolveGatewayUrl(root: root) else {
+            let resolution = GatewayRemoteConfig.resolveTransportResolution(root: root)
+            if resolution.transport == .direct {
+                guard let url = resolution.directURL else {
                     self.cancelRemoteEnsure()
                     self.setState(.unavailable(
                         mode: .remote,
@@ -470,8 +539,9 @@ actor GatewayEndpointStore {
 
     private func resolveDirectRemoteURL() throws -> URL? {
         let root = OpenClawConfigFile.loadDict()
-        guard GatewayRemoteConfig.resolveTransport(root: root) == .direct else { return nil }
-        guard let url = GatewayRemoteConfig.resolveGatewayUrl(root: root) else {
+        let resolution = GatewayRemoteConfig.resolveTransportResolution(root: root)
+        guard resolution.transport == .direct else { return nil }
+        guard let url = resolution.directURL else {
             throw NSError(
                 domain: "GatewayEndpoint",
                 code: 1,
@@ -667,7 +737,8 @@ extension GatewayEndpointStore {
     static func dashboardURL(
         for config: GatewayConnection.Config,
         mode: AppState.ConnectionMode,
-        localBasePath: String? = nil) throws -> URL
+        localBasePath: String? = nil,
+        authToken: String? = nil) throws -> URL
     {
         guard var components = URLComponents(url: config.url, resolvingAgainstBaseURL: false) else {
             throw NSError(domain: "Dashboard", code: 1, userInfo: [
@@ -694,7 +765,8 @@ extension GatewayEndpointStore {
         }
 
         var fragmentItems: [URLQueryItem] = []
-        if let token = config.token?.trimmingCharacters(in: .whitespacesAndNewlines),
+        let tokenCandidate = authToken ?? config.token
+        if let token = tokenCandidate?.trimmingCharacters(in: .whitespacesAndNewlines),
            !token.isEmpty
         {
             fragmentItems.append(URLQueryItem(name: "token", value: token))

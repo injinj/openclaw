@@ -1,10 +1,56 @@
+// Slack tests cover actions.blocks plugin behavior.
 import { describe, expect, it } from "vitest";
-import { createSlackEditTestClient, installSlackBlockTestMocks } from "./blocks.test-helpers.js";
+import { createSlackEditTestClient } from "./blocks.test-helpers.js";
 
-installSlackBlockTestMocks();
 const { editSlackMessage } = await import("./actions.js");
+const SLACK_TEXT_LIMIT = 8000;
+
+function readFirstChatUpdatePayload(client: ReturnType<typeof createSlackEditTestClient>): {
+  text?: string;
+} {
+  const [call] = client.chat.update.mock.calls;
+  if (!call) {
+    throw new Error("expected Slack chat.update call");
+  }
+  const [payload] = call;
+  if (!payload || typeof payload !== "object") {
+    throw new Error("expected Slack chat.update payload");
+  }
+  return payload as { text?: string };
+}
 
 describe("editSlackMessage blocks", () => {
+  it("preserves long plain-text edits", async () => {
+    const client = createSlackEditTestClient();
+    const text = "a".repeat(SLACK_TEXT_LIMIT + 500);
+
+    await editSlackMessage("C123", "171234.567", text, {
+      token: "xoxb-test",
+      client,
+    });
+
+    expect(client.chat.update).toHaveBeenCalledWith({
+      channel: "C123",
+      ts: "171234.567",
+      text,
+    });
+  });
+
+  it("preserves the empty-edit sentinel without blocks", async () => {
+    const client = createSlackEditTestClient();
+
+    await editSlackMessage("C123", "171234.567", "", {
+      token: "xoxb-test",
+      client,
+    });
+
+    expect(client.chat.update).toHaveBeenCalledWith({
+      channel: "C123",
+      ts: "171234.567",
+      text: " ",
+    });
+  });
+
   it("updates with valid blocks", async () => {
     const client = createSlackEditTestClient();
 
@@ -14,14 +60,12 @@ describe("editSlackMessage blocks", () => {
       blocks: [{ type: "divider" }],
     });
 
-    expect(client.chat.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "C123",
-        ts: "171234.567",
-        text: "Shared a Block Kit message",
-        blocks: [{ type: "divider" }],
-      }),
-    );
+    expect(client.chat.update).toHaveBeenCalledWith({
+      channel: "C123",
+      ts: "171234.567",
+      text: "Shared a Block Kit message",
+      blocks: [{ type: "divider" }],
+    });
   });
 
   it("uses image block text as edit fallback", async () => {
@@ -33,11 +77,12 @@ describe("editSlackMessage blocks", () => {
       blocks: [{ type: "image", image_url: "https://example.com/a.png", alt_text: "Chart" }],
     });
 
-    expect(client.chat.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        text: "Chart",
-      }),
-    );
+    expect(client.chat.update).toHaveBeenCalledWith({
+      channel: "C123",
+      ts: "171234.567",
+      text: "Chart",
+      blocks: [{ type: "image", image_url: "https://example.com/a.png", alt_text: "Chart" }],
+    });
   });
 
   it("uses video block title as edit fallback", async () => {
@@ -57,11 +102,20 @@ describe("editSlackMessage blocks", () => {
       ],
     });
 
-    expect(client.chat.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        text: "Walkthrough",
-      }),
-    );
+    expect(client.chat.update).toHaveBeenCalledWith({
+      channel: "C123",
+      ts: "171234.567",
+      text: "Walkthrough",
+      blocks: [
+        {
+          type: "video",
+          title: { type: "plain_text", text: "Walkthrough" },
+          video_url: "https://example.com/demo.mp4",
+          thumbnail_url: "https://example.com/thumb.jpg",
+          alt_text: "demo",
+        },
+      ],
+    });
   });
 
   it("uses generic file fallback text for file blocks", async () => {
@@ -73,11 +127,79 @@ describe("editSlackMessage blocks", () => {
       blocks: [{ type: "file", source: "remote", external_id: "F123" }],
     });
 
-    expect(client.chat.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        text: "Shared a file",
-      }),
-    );
+    expect(client.chat.update).toHaveBeenCalledWith({
+      channel: "C123",
+      ts: "171234.567",
+      text: "Shared a file",
+      blocks: [{ type: "file", source: "remote", external_id: "F123" }],
+    });
+  });
+
+  it("retries rejected native charts as a text-only edit", async () => {
+    const client = createSlackEditTestClient();
+    client.chat.update.mockRejectedValueOnce({ data: { error: "invalid_blocks" } });
+    const blocks = [
+      { type: "section", text: { type: "mrkdwn", text: "Overview" } },
+      {
+        type: "data_visualization",
+        title: "Revenue mix",
+        chart: {
+          type: "pie",
+          segments: [
+            { label: "Product", value: 60 },
+            { label: "Services", value: 40 },
+          ],
+        },
+      },
+    ];
+
+    await editSlackMessage("C123", "171234.567", "Overview", {
+      token: "xoxb-test",
+      client,
+      blocks,
+    });
+
+    expect(client.chat.update).toHaveBeenCalledTimes(2);
+    expect(client.chat.update).toHaveBeenNthCalledWith(1, {
+      channel: "C123",
+      ts: "171234.567",
+      text: "Overview\n\nRevenue mix (pie chart)\n- Product: 60\n- Services: 40",
+      blocks,
+    });
+    expect(client.chat.update).toHaveBeenNthCalledWith(2, {
+      channel: "C123",
+      ts: "171234.567",
+      text: "Overview\n\nRevenue mix (pie chart)\n- Product: 60\n- Services: 40",
+    });
+  });
+
+  it("caps long block fallback text while preserving edit blocks", async () => {
+    const client = createSlackEditTestClient();
+    const longContextText = "a".repeat(3000);
+    const blocks = [
+      {
+        type: "context",
+        elements: [
+          { type: "mrkdwn", text: longContextText },
+          { type: "mrkdwn", text: longContextText },
+          { type: "mrkdwn", text: longContextText },
+        ],
+      },
+    ];
+
+    await editSlackMessage("C123", "171234.567", "", {
+      token: "xoxb-test",
+      client,
+      blocks,
+    });
+
+    expect(client.chat.update).toHaveBeenCalledWith({
+      channel: "C123",
+      ts: "171234.567",
+      text: `${longContextText} ${longContextText} ${"a".repeat(SLACK_TEXT_LIMIT - longContextText.length * 2 - 3)}…`,
+      blocks,
+    });
+    expect(readFirstChatUpdatePayload(client).text).toHaveLength(SLACK_TEXT_LIMIT);
   });
 
   it("rejects empty blocks arrays", async () => {

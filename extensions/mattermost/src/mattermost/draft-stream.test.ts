@@ -1,6 +1,7 @@
+// Mattermost tests cover draft stream plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import type { MattermostClient } from "./client.js";
-import { buildMattermostToolStatusText, createMattermostDraftStream } from "./draft-stream.js";
+import { createMattermostDraftStream } from "./draft-stream.js";
 
 type RequestRecord = {
   path: string;
@@ -38,6 +39,17 @@ function createMockClient(): {
   return { client, calls, requestMock };
 }
 
+function parseRequestJson(init: RequestInit | undefined): Record<string, unknown> {
+  if (typeof init?.body !== "string") {
+    throw new Error("expected JSON request body");
+  }
+  const parsed: unknown = JSON.parse(init.body);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("expected JSON object request body");
+  }
+  return parsed as Record<string, unknown>;
+}
+
 describe("createMattermostDraftStream", () => {
   it("creates a preview post and updates it on later changes", async () => {
     const { client, calls } = createMockClient();
@@ -56,8 +68,7 @@ describe("createMattermostDraftStream", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.path).toBe("/posts");
 
-    const createBody = JSON.parse((calls[0]?.init?.body as string | undefined) ?? "{}");
-    expect(createBody).toMatchObject({
+    expect(parseRequestJson(calls[0]?.init)).toEqual({
       channel_id: "channel-1",
       root_id: "root-1",
       message: "Running `read`…",
@@ -158,7 +169,8 @@ describe("createMattermostDraftStream", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.path).toBe("/posts");
     expect(calls[1]?.path).toBe("/posts/post-1");
-    expect(JSON.parse((calls[1]?.init?.body as string | undefined) ?? "{}")).toMatchObject({
+    expect(parseRequestJson(calls[1]?.init)).toEqual({
+      id: "post-1",
       message: "Stale partial",
     });
   });
@@ -191,6 +203,32 @@ describe("createMattermostDraftStream", () => {
     expect(warn).toHaveBeenCalled();
     expect(requestMock).toHaveBeenCalledTimes(1);
     expect(stream.postId()).toBeUndefined();
+  });
+
+  it("truncates on a code-point boundary so a straddling emoji is dropped whole", async () => {
+    const { client, calls } = createMockClient();
+    // maxChars=12 => cut point is maxChars-3=9. The emoji 😀 occupies UTF-16
+    // indices 8-9, so a raw slice(0,9) would keep the lone high surrogate at
+    // index 8 and drop its low surrogate at index 9, leaking a dangling half.
+    const stream = createMattermostDraftStream({
+      client,
+      channelId: "channel-1",
+      throttleMs: 0,
+      maxChars: 12,
+    });
+
+    const input = `${"a".repeat(8)}\u{1F600}${"b".repeat(5)}`;
+    stream.update(input);
+    await stream.flush();
+
+    expect(calls).toHaveLength(1);
+    const message = parseRequestJson(calls[0]?.init).message;
+    expect(typeof message).toBe("string");
+    const sent = message as string;
+    // The straddling emoji must be dropped whole, leaving no dangling surrogate half.
+    expect(/[\uD800-\uDFFF]/u.test(sent)).toBe(false);
+    expect(sent.length).toBeLessThanOrEqual(12);
+    expect(sent).toBe("aaaaaaaa...");
   });
 
   it("does not resend after an update failure followed by stop", async () => {
@@ -239,15 +277,5 @@ describe("createMattermostDraftStream", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.path).toBe("/posts");
     expect(calls[1]?.path).toBe("/posts/post-1");
-  });
-});
-
-describe("buildMattermostToolStatusText", () => {
-  it("renders a status with the tool name", () => {
-    expect(buildMattermostToolStatusText({ name: "read" })).toBe("Running `read`…");
-  });
-
-  it("falls back to a generic running tool status", () => {
-    expect(buildMattermostToolStatusText({ name: "exec" })).toBe("Running `exec`…");
   });
 });

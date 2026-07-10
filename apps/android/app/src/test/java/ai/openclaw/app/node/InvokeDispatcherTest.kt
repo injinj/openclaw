@@ -1,11 +1,15 @@
 package ai.openclaw.app.node
 
 import ai.openclaw.app.gateway.DeviceIdentityStore
+import ai.openclaw.app.gateway.GatewaySession
 import ai.openclaw.app.protocol.OpenClawCallLogCommand
 import ai.openclaw.app.protocol.OpenClawCameraCommand
+import ai.openclaw.app.protocol.OpenClawDeviceCommand
 import ai.openclaw.app.protocol.OpenClawLocationCommand
 import ai.openclaw.app.protocol.OpenClawMotionCommand
+import ai.openclaw.app.protocol.OpenClawPhotosCommand
 import ai.openclaw.app.protocol.OpenClawSmsCommand
+import ai.openclaw.app.protocol.OpenClawTalkCommand
 import android.content.Context
 import android.content.pm.PackageManager
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -168,6 +172,20 @@ class InvokeDispatcherTest {
     }
 
   @Test
+  fun handleInvoke_blocksDeviceAppsWhenSharingDisabled() =
+    runTest {
+      val result =
+        newDispatcher(installedAppsSharingEnabled = false)
+          .handleInvoke(OpenClawDeviceCommand.Apps.rawValue, """{"limit":1}""")
+
+      assertEquals("INSTALLED_APPS_SHARING_DISABLED", result.error?.code)
+      assertEquals(
+        "INSTALLED_APPS_SHARING_DISABLED: enable Installed Apps in Settings",
+        result.error?.message,
+      )
+    }
+
+  @Test
   fun handleInvoke_blocksMotionActivityWhenUnavailable() =
     runTest {
       val result =
@@ -200,6 +218,15 @@ class InvokeDispatcherTest {
     }
 
   @Test
+  fun handleInvoke_blocksPhotosWhenUnavailable() =
+    runTest {
+      val result = newDispatcher(photosAvailable = false).handleInvoke(OpenClawPhotosCommand.Latest.rawValue, null)
+
+      assertEquals("PHOTOS_UNAVAILABLE", result.error?.code)
+      assertEquals("PHOTOS_UNAVAILABLE: photos not available on this build", result.error?.message)
+    }
+
+  @Test
   fun handleInvoke_treatsDebugCommandsAsUnknownOutsideDebugBuilds() =
     runTest {
       val result = newDispatcher(debugBuild = false).handleInvoke("debug.logs", null)
@@ -208,7 +235,48 @@ class InvokeDispatcherTest {
       assertEquals("INVALID_REQUEST: unknown command", result.error?.message)
     }
 
+  @Test
+  fun handleInvoke_routesTalkPttCommands() =
+    runTest {
+      val talk = InvokeDispatcherFakeTalkHandler()
+      val dispatcher = newDispatcher(talkHandler = talk)
+
+      val start = dispatcher.handleInvoke(OpenClawTalkCommand.PttStart.rawValue, null)
+      val stop = dispatcher.handleInvoke(OpenClawTalkCommand.PttStop.rawValue, null)
+      val cancel = dispatcher.handleInvoke(OpenClawTalkCommand.PttCancel.rawValue, null)
+      val once = dispatcher.handleInvoke(OpenClawTalkCommand.PttOnce.rawValue, null)
+
+      assertEquals("""{"captureId":"start"}""", start.payloadJson)
+      assertEquals("""{"status":"stop"}""", stop.payloadJson)
+      assertEquals("""{"status":"cancel"}""", cancel.payloadJson)
+      assertEquals("""{"status":"once"}""", once.payloadJson)
+      assertEquals(
+        listOf("start", "stop", "cancel", "once"),
+        talk.calls,
+      )
+    }
+
+  @Test
+  fun handleInvoke_blocksTalkOnceButLeavesPttStartToRuntimeStateGateWhenBackgrounded() =
+    runTest {
+      val talk = InvokeDispatcherFakeTalkHandler()
+      val dispatcher = newDispatcher(isForeground = false, talkHandler = talk)
+
+      val start = dispatcher.handleInvoke(OpenClawTalkCommand.PttStart.rawValue, null)
+      val once = dispatcher.handleInvoke(OpenClawTalkCommand.PttOnce.rawValue, null)
+      val stop = dispatcher.handleInvoke(OpenClawTalkCommand.PttStop.rawValue, null)
+      val cancel = dispatcher.handleInvoke(OpenClawTalkCommand.PttCancel.rawValue, null)
+
+      assertEquals("""{"captureId":"start"}""", start.payloadJson)
+      assertEquals("NODE_BACKGROUND_UNAVAILABLE", once.error?.code)
+      assertEquals("NODE_BACKGROUND_UNAVAILABLE: command requires foreground", once.error?.message)
+      assertEquals("""{"status":"stop"}""", stop.payloadJson)
+      assertEquals("""{"status":"cancel"}""", cancel.payloadJson)
+      assertEquals(listOf("start", "stop", "cancel"), talk.calls)
+    }
+
   private fun newDispatcher(
+    isForeground: Boolean = true,
     cameraEnabled: Boolean = false,
     locationEnabled: Boolean = false,
     sendSmsAvailable: Boolean = false,
@@ -216,9 +284,12 @@ class InvokeDispatcherTest {
     smsFeatureEnabled: Boolean = true,
     smsTelephonyAvailable: Boolean = true,
     callLogAvailable: Boolean = false,
+    photosAvailable: Boolean = true,
+    installedAppsSharingEnabled: Boolean = true,
     debugBuild: Boolean = false,
     motionActivityAvailable: Boolean = false,
     motionPedometerAvailable: Boolean = false,
+    talkHandler: TalkHandler = InvokeDispatcherFakeTalkHandler(),
   ): InvokeDispatcher {
     val appContext = RuntimeEnvironment.getApplication()
     shadowOf(appContext.packageManager).setSystemFeature(PackageManager.FEATURE_TELEPHONY, smsTelephonyAvailable)
@@ -238,6 +309,7 @@ class InvokeDispatcherTest {
           stateProvider = InvokeDispatcherFakeNotificationsStateProvider(),
         ),
       systemHandler = SystemHandler.forTesting(InvokeDispatcherFakeSystemNotificationPoster()),
+      talkHandler = talkHandler,
       photosHandler = PhotosHandler.forTesting(appContext, InvokeDispatcherFakePhotosDataSource()),
       contactsHandler = ContactsHandler.forTesting(appContext, InvokeDispatcherFakeContactsDataSource()),
       calendarHandler = CalendarHandler.forTesting(appContext, InvokeDispatcherFakeCalendarDataSource()),
@@ -247,12 +319,10 @@ class InvokeDispatcherTest {
         A2UIHandler(
           canvas = canvas,
           json = Json { ignoreUnknownKeys = true },
-          getNodeCanvasHostUrl = { null },
-          getOperatorCanvasHostUrl = { null },
         ),
       debugHandler = DebugHandler(appContext, DeviceIdentityStore(appContext)),
       callLogHandler = CallLogHandler.forTesting(appContext, InvokeDispatcherFakeCallLogDataSource()),
-      isForeground = { true },
+      isForeground = { isForeground },
       cameraEnabled = { cameraEnabled },
       locationEnabled = { locationEnabled },
       sendSmsAvailable = { sendSmsAvailable },
@@ -260,8 +330,9 @@ class InvokeDispatcherTest {
       smsFeatureEnabled = { smsFeatureEnabled },
       smsTelephonyAvailable = { smsTelephonyAvailable },
       callLogAvailable = { callLogAvailable },
+      photosAvailable = { photosAvailable },
+      installedAppsSharingEnabled = { installedAppsSharingEnabled },
       debugBuild = { debugBuild },
-      refreshNodeCanvasCapability = { false },
       onCanvasA2uiPush = {},
       onCanvasA2uiReset = {},
       motionActivityAvailable = { motionActivityAvailable },
@@ -275,7 +346,6 @@ class InvokeDispatcherTest {
       camera = CameraCaptureManager(appContext),
       externalAudioCaptureActive = MutableStateFlow(false),
       showCameraHud = { _, _, _ -> },
-      triggerCameraFlash = {},
       invokeErrorFromThrowable = { err -> "UNAVAILABLE" to (err.message ?: "camera failed") },
     )
 }
@@ -284,6 +354,8 @@ private class InvokeDispatcherFakeLocationDataSource : LocationDataSource {
   override fun hasFinePermission(context: Context): Boolean = false
 
   override fun hasCoarsePermission(context: Context): Boolean = false
+
+  override fun hasBackgroundPermission(context: Context): Boolean = false
 
   override suspend fun fetchLocation(
     desiredProviders: List<String>,
@@ -310,6 +382,30 @@ private class InvokeDispatcherFakeSystemNotificationPoster : SystemNotificationP
   override fun isAuthorized(): Boolean = true
 
   override fun post(request: SystemNotifyRequest) = Unit
+}
+
+private class InvokeDispatcherFakeTalkHandler : TalkHandler {
+  val calls = mutableListOf<String>()
+
+  override suspend fun handlePttStart(paramsJson: String?): GatewaySession.InvokeResult {
+    calls.add("start")
+    return GatewaySession.InvokeResult.ok("""{"captureId":"start"}""")
+  }
+
+  override suspend fun handlePttStop(paramsJson: String?): GatewaySession.InvokeResult {
+    calls.add("stop")
+    return GatewaySession.InvokeResult.ok("""{"status":"stop"}""")
+  }
+
+  override suspend fun handlePttCancel(paramsJson: String?): GatewaySession.InvokeResult {
+    calls.add("cancel")
+    return GatewaySession.InvokeResult.ok("""{"status":"cancel"}""")
+  }
+
+  override suspend fun handlePttOnce(paramsJson: String?): GatewaySession.InvokeResult {
+    calls.add("once")
+    return GatewaySession.InvokeResult.ok("""{"status":"once"}""")
+  }
 }
 
 private class InvokeDispatcherFakePhotosDataSource : PhotosDataSource {

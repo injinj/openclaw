@@ -1,23 +1,31 @@
-import { constants as fsConstants } from "node:fs";
+/**
+ * Resolves the managed Codex app-server binary shipped with or installed beside
+ * the Codex plugin before stdio startup.
+ */
+import { constants as fsConstants, readFileSync } from "node:fs";
 import { access } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CodexAppServerStartOptions } from "./config.js";
 import { MANAGED_CODEX_APP_SERVER_PACKAGE } from "./version.js";
 
-const CODEX_PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const CODEX_APP_SERVER_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const CODEX_PLUGIN_ROOT = resolveDefaultCodexPluginRoot(CODEX_APP_SERVER_MODULE_DIR);
+const MACOS_DESKTOP_CODEX_APP_SERVER_COMMAND = "/Applications/Codex.app/Contents/Resources/codex";
 
 type ManagedCodexAppServerPaths = {
   commandPath: string;
   candidateCommandPaths: string[];
 };
 
-export type ResolveManagedCodexAppServerOptions = {
+type ResolveManagedCodexAppServerOptions = {
   platform?: NodeJS.Platform;
   pluginRoot?: string;
   pathExists?: (filePath: string, platform: NodeJS.Platform) => Promise<boolean>;
 };
 
+/** Rewrites managed stdio start options to point at an executable Codex binary path. */
 export async function resolveManagedCodexAppServerStartOptions(
   startOptions: CodexAppServerStartOptions,
   options: ResolveManagedCodexAppServerOptions = {},
@@ -32,19 +40,23 @@ export async function resolveManagedCodexAppServerStartOptions(
     pluginRoot: options.pluginRoot,
   });
   const pathExists = options.pathExists ?? commandPathExists;
-  const commandPath = await findManagedCodexAppServerCommandPath({
+  const commandPaths = await findManagedCodexAppServerCommandPaths({
     candidateCommandPaths: paths.candidateCommandPaths,
     pathExists,
     platform,
   });
+  const commandPath = commandPaths[0];
+  const managedFallbackCommandPaths = commandPaths.slice(1);
 
   return {
     ...startOptions,
     command: commandPath,
     commandSource: "resolved-managed",
+    ...(managedFallbackCommandPaths.length > 0 ? { managedFallbackCommandPaths } : {}),
   };
 }
 
+/** Returns the preferred and fallback managed Codex binary paths for a plugin root. */
 export function resolveManagedCodexAppServerPaths(params: {
   platform?: NodeJS.Platform;
   pluginRoot?: string;
@@ -66,7 +78,34 @@ function resolveManagedCodexAppServerCommandCandidates(
 ): string[] {
   const pathApi = pathForPlatform(platform);
   const commandName = platform === "win32" ? "codex.cmd" : "codex";
-  const roots = [
+  const roots = resolveManagedCodexAppServerCandidateRoots(pluginRoot, platform);
+  return [
+    ...new Set([
+      ...resolveDesktopCodexAppServerCommandCandidates(platform),
+      ...roots.map((root) => pathApi.join(root, "node_modules", ".bin", commandName)),
+      ...resolveManagedCodexPackageBinCandidates(roots, platform),
+    ]),
+  ];
+}
+
+function resolveDesktopCodexAppServerCommandCandidates(platform: NodeJS.Platform): string[] {
+  return platform === "darwin" ? [MACOS_DESKTOP_CODEX_APP_SERVER_COMMAND] : [];
+}
+
+function resolveDefaultCodexPluginRoot(moduleDir: string): string {
+  const moduleBaseName = path.basename(moduleDir);
+  if (moduleBaseName === "dist" || moduleBaseName === "dist-runtime") {
+    return path.dirname(moduleDir);
+  }
+  return path.resolve(moduleDir, "..", "..");
+}
+
+function resolveManagedCodexAppServerCandidateRoots(
+  pluginRoot: string,
+  platform: NodeJS.Platform,
+): string[] {
+  const pathApi = pathForPlatform(platform);
+  const directRoots = [
     pluginRoot,
     pathApi.dirname(pluginRoot),
     pathApi.dirname(pathApi.dirname(pluginRoot)),
@@ -74,8 +113,82 @@ function resolveManagedCodexAppServerCommandCandidates(
       ? pathApi.dirname(pathApi.dirname(pathApi.dirname(pluginRoot)))
       : null,
   ].filter((root): root is string => Boolean(root));
-  return [...new Set(roots.map((root) => pathApi.join(root, "node_modules", ".bin", commandName)))];
+  return [
+    ...new Set([...directRoots, ...resolveNearestNodeModulesProjectRoots(directRoots, platform)]),
+  ];
 }
+
+function resolveNearestNodeModulesProjectRoots(
+  roots: readonly string[],
+  platform: NodeJS.Platform,
+): string[] {
+  const pathApi = pathForPlatform(platform);
+  const projectRoots: string[] = [];
+  for (const root of roots) {
+    let current = pathApi.resolve(root);
+    while (true) {
+      if (pathApi.basename(current) === "node_modules") {
+        projectRoots.push(pathApi.dirname(current));
+        break;
+      }
+      const parent = pathApi.dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
+    }
+  }
+  return projectRoots;
+}
+
+function resolveManagedCodexPackageBinCandidates(
+  roots: readonly string[],
+  platform: NodeJS.Platform,
+): string[] {
+  if (platform === "win32") {
+    return [];
+  }
+
+  const candidates: string[] = [];
+  for (const root of roots) {
+    const candidate = resolveManagedCodexPackageBinCandidate(root);
+    if (candidate) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+function resolveManagedCodexPackageBinCandidate(root: string): string | null {
+  try {
+    const requireFromRoot = createRequire(path.join(root, "package.json"));
+    const packageJsonPath = requireFromRoot.resolve(
+      `${MANAGED_CODEX_APP_SERVER_PACKAGE}/package.json`,
+    );
+    const packageRoot = path.dirname(packageJsonPath);
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      bin?: unknown;
+    };
+    const binPath =
+      typeof packageJson.bin === "string"
+        ? packageJson.bin
+        : isRecord(packageJson.bin) && typeof packageJson.bin.codex === "string"
+          ? packageJson.bin.codex
+          : null;
+    return binPath ? path.resolve(packageRoot, binPath) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Internal helpers exposed for managed-binary path-resolution tests. */
+export const testing = {
+  resolveDefaultCodexPluginRoot,
+};
 
 function isDistExtensionRoot(pluginRoot: string, platform: NodeJS.Platform): boolean {
   const pathApi = pathForPlatform(platform);
@@ -91,21 +204,25 @@ function pathForPlatform(platform: NodeJS.Platform): typeof path {
   return platform === "win32" ? path.win32 : path.posix;
 }
 
-async function findManagedCodexAppServerCommandPath(params: {
+async function findManagedCodexAppServerCommandPaths(params: {
   candidateCommandPaths: readonly string[];
   pathExists: (filePath: string, platform: NodeJS.Platform) => Promise<boolean>;
   platform: NodeJS.Platform;
-}): Promise<string> {
+}): Promise<string[]> {
+  const commandPaths: string[] = [];
   for (const commandPath of params.candidateCommandPaths) {
     if (await params.pathExists(commandPath, params.platform)) {
-      return commandPath;
+      commandPaths.push(commandPath);
     }
+  }
+  if (commandPaths.length > 0) {
+    return commandPaths;
   }
 
   throw new Error(
     [
       `Managed Codex app-server binary was not found for ${MANAGED_CODEX_APP_SERVER_PACKAGE}.`,
-      "Run OpenClaw with bundled plugin runtime dependencies enabled, or run pnpm install in a source checkout.",
+      "Reinstall or update OpenClaw, or run pnpm install in a source checkout.",
       "Set plugins.entries.codex.config.appServer.command or OPENCLAW_CODEX_APP_SERVER_BIN to use a custom Codex binary.",
     ].join(" "),
   );
@@ -119,3 +236,4 @@ async function commandPathExists(filePath: string, platform: NodeJS.Platform): P
     return false;
   }
 }
+export { testing as __testing };

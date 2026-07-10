@@ -1,9 +1,10 @@
+// Crestodian assistant planning converts fuzzy user text into one safe command.
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
-import { extractAssistantText } from "../agents/pi-embedded-utils.js";
+import { extractAssistantText } from "../agents/embedded-agent-utils.js";
 import {
   completeWithPreparedSimpleCompletionModel,
   prepareSimpleCompletionModelForAgent,
@@ -17,6 +18,7 @@ import {
   buildCrestodianAssistantUserPrompt,
   parseCrestodianAssistantPlanText,
   type CrestodianAssistantPlan,
+  type CrestodianAssistantTurn,
 } from "./assistant-prompts.js";
 import type { CrestodianOverview } from "./overview.js";
 
@@ -24,15 +26,18 @@ export {
   buildCrestodianAssistantUserPrompt,
   parseCrestodianAssistantPlanText,
   type CrestodianAssistantPlan,
+  type CrestodianAssistantTurn,
 } from "./assistant-prompts.js";
 
 export type CrestodianAssistantPlanner = (params: {
   input: string;
   overview: CrestodianOverview;
+  history?: CrestodianAssistantTurn[];
+  pendingOperation?: string;
 }) => Promise<CrestodianAssistantPlan | null>;
 
 type RunCliAgentFn = typeof import("../agents/cli-runner.js").runCliAgent;
-type RunEmbeddedPiAgentFn = typeof import("../agents/pi-embedded.js").runEmbeddedPiAgent;
+type RunEmbeddedAgentFn = typeof import("../agents/embedded-agent.js").runEmbeddedAgent;
 type ReadConfigFileSnapshotFn = typeof readConfigFileSnapshot;
 type PrepareSimpleCompletionModelForAgentFn = typeof prepareSimpleCompletionModelForAgent;
 type CompleteWithPreparedSimpleCompletionModelFn = typeof completeWithPreparedSimpleCompletionModel;
@@ -45,7 +50,7 @@ export type CrestodianConfiguredModelPlannerDeps = {
 
 export type CrestodianLocalRuntimePlannerDeps = {
   runCliAgent?: RunCliAgentFn;
-  runEmbeddedPiAgent?: RunEmbeddedPiAgentFn;
+  runEmbeddedAgent?: RunEmbeddedAgentFn;
   createTempDir?: () => Promise<string>;
   removeTempDir?: (dir: string) => Promise<void>;
 };
@@ -56,8 +61,11 @@ export type CrestodianPlannerDeps = CrestodianConfiguredModelPlannerDeps &
 export async function planCrestodianCommand(params: {
   input: string;
   overview: CrestodianOverview;
+  history?: CrestodianAssistantTurn[];
+  pendingOperation?: string;
   deps?: CrestodianPlannerDeps;
 }): Promise<CrestodianAssistantPlan | null> {
+  // Prefer the user's configured model; local runtime planners are only a fallback.
   const configured = await planCrestodianCommandWithConfiguredModel(params);
   if (configured) {
     return configured;
@@ -68,6 +76,8 @@ export async function planCrestodianCommand(params: {
 export async function planCrestodianCommandWithConfiguredModel(params: {
   input: string;
   overview: CrestodianOverview;
+  history?: CrestodianAssistantTurn[];
+  pendingOperation?: string;
   deps?: CrestodianConfiguredModelPlannerDeps;
 }): Promise<CrestodianAssistantPlan | null> {
   const input = params.input.trim();
@@ -108,6 +118,8 @@ export async function planCrestodianCommandWithConfiguredModel(params: {
             content: buildCrestodianAssistantUserPrompt({
               input,
               overview: params.overview,
+              ...(params.history ? { history: params.history } : {}),
+              ...(params.pendingOperation ? { pendingOperation: params.pendingOperation } : {}),
             }),
             timestamp: Date.now(),
           },
@@ -136,6 +148,8 @@ export async function planCrestodianCommandWithConfiguredModel(params: {
 export async function planCrestodianCommandWithLocalRuntime(params: {
   input: string;
   overview: CrestodianOverview;
+  history?: CrestodianAssistantTurn[];
+  pendingOperation?: string;
   deps?: CrestodianLocalRuntimePlannerDeps;
 }): Promise<CrestodianAssistantPlan | null> {
   const input = params.input.trim();
@@ -149,6 +163,8 @@ export async function planCrestodianCommandWithLocalRuntime(params: {
   const prompt = buildCrestodianAssistantUserPrompt({
     input,
     overview: params.overview,
+    ...(params.history ? { history: params.history } : {}),
+    ...(params.pendingOperation ? { pendingOperation: params.pendingOperation } : {}),
   });
 
   for (const backend of backends) {
@@ -180,6 +196,7 @@ async function runLocalRuntimePlanner(
 ): Promise<string | undefined> {
   const tempDir = await (params.deps?.createTempDir ?? createTempPlannerDir)();
   try {
+    // Planner sessions are isolated in a temp workspace and run with no tools for command planning.
     const runId = `crestodian-planner-${randomUUID()}`;
     const sessionFile = path.join(tempDir, "session.jsonl");
     const sessionId = `${runId}-session`;
@@ -204,13 +221,12 @@ async function runLocalRuntimePlanner(
           extraSystemPromptStatic: CRESTODIAN_ASSISTANT_SYSTEM_PROMPT,
           messageChannel: "crestodian",
           messageProvider: "crestodian",
-          senderIsOwner: true,
           cleanupCliLiveSessionOnRunEnd: true,
         });
         return extractPlannerResultText(result);
       }
       case "embedded": {
-        const runEmbedded = params.deps?.runEmbeddedPiAgent ?? (await loadRunEmbeddedPiAgent());
+        const runEmbedded = params.deps?.runEmbeddedAgent ?? (await loadRunEmbeddedAgent());
         const result = await runEmbedded({
           sessionId,
           sessionKey,
@@ -230,7 +246,6 @@ async function runLocalRuntimePlanner(
           extraSystemPrompt: CRESTODIAN_ASSISTANT_SYSTEM_PROMPT,
           messageChannel: "crestodian",
           messageProvider: "crestodian",
-          senderIsOwner: true,
           cleanupBundleMcpOnRunEnd: true,
         });
         return extractPlannerResultText(result);
@@ -254,8 +269,8 @@ async function loadRunCliAgent(): Promise<RunCliAgentFn> {
   return (await import("../agents/cli-runner.js")).runCliAgent;
 }
 
-async function loadRunEmbeddedPiAgent(): Promise<RunEmbeddedPiAgentFn> {
-  return (await import("../agents/pi-embedded.js")).runEmbeddedPiAgent;
+async function loadRunEmbeddedAgent(): Promise<RunEmbeddedAgentFn> {
+  return (await import("../agents/embedded-agent.js")).runEmbeddedAgent;
 }
 
 function extractPlannerResultText(result: {

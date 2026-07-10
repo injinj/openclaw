@@ -1,3 +1,4 @@
+// Browser tests cover pw tools core.interactions.navigation guard plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import {
   getPwToolsCoreNavigationGuardMocks,
@@ -118,6 +119,61 @@ describe("pw-tools-core interaction navigation guard", () => {
       await vi.advanceTimersByTimeAsync(10);
       await task;
       expect(completion).toHaveBeenCalledTimes(1);
+
+      expect(getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely).toHaveBeenCalledWith(
+        {
+          cdpUrl: "http://127.0.0.1:18792",
+          page,
+          response: null,
+          ssrfPolicy: { allowPrivateNetwork: false },
+          targetId: "T1",
+        },
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs the post-select navigation guard when navigation starts shortly after the select resolves", async () => {
+    vi.useFakeTimers();
+    try {
+      const listeners = new Set<() => void>();
+      let currentUrl = "https://example.com/form";
+      const selectOption = vi.fn(async () => {
+        setTimeout(() => {
+          currentUrl = "http://127.0.0.1:9222/private-target";
+          for (const listener of listeners) {
+            listener();
+          }
+        }, 10);
+      });
+      const page = {
+        on: vi.fn((event: string, listener: () => void) => {
+          if (event === "framenavigated") {
+            listeners.add(listener);
+          }
+        }),
+        off: vi.fn((event: string, listener: () => void) => {
+          if (event === "framenavigated") {
+            listeners.delete(listener);
+          }
+        }),
+        url: vi.fn(() => currentUrl),
+      };
+      setPwToolsCoreCurrentRefLocator({ selectOption });
+      setPwToolsCoreCurrentPage(page);
+
+      const task = mod.selectOptionViaPlaywright({
+        cdpUrl: "http://127.0.0.1:18792",
+        targetId: "T1",
+        ref: "1",
+        values: ["go"],
+        ssrfPolicy: { allowPrivateNetwork: false },
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(10);
+      await task;
 
       expect(getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely).toHaveBeenCalledWith(
         {
@@ -500,7 +556,20 @@ describe("pw-tools-core interaction navigation guard", () => {
       await rejection;
       expect(
         getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely,
-      ).not.toHaveBeenCalled();
+      ).toHaveBeenCalledTimes(1);
+      expect(getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely).toHaveBeenCalledWith(
+        {
+          cdpUrl: "http://127.0.0.1:18792",
+          page,
+          response: null,
+          ssrfPolicy: { allowPrivateNetwork: false },
+          targetId: "T1",
+        },
+      );
+      expect(
+        getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely.mock
+          .invocationCallOrder[0],
+      ).toBeLessThan(page.evaluate.mock.invocationCallOrder[0]);
     } finally {
       vi.useRealTimers();
     }
@@ -850,6 +919,52 @@ describe("pw-tools-core interaction navigation guard", () => {
     });
   });
 
+  it("runs statement-body page evaluate sources", async () => {
+    const page = {
+      evaluate: vi.fn(async (evaluateFn: (args: unknown) => unknown, args: unknown) =>
+        evaluateFn(args),
+      ),
+      url: vi.fn(() => "http://127.0.0.1:9222/json/version"),
+    };
+    setPwToolsCoreCurrentPage(page);
+
+    const result = await mod.evaluateViaPlaywright({
+      cdpUrl: "http://127.0.0.1:18792",
+      targetId: "T1",
+      fn: "const value = 41; return value + 1;",
+    });
+
+    expect(result).toBe(42);
+    expect(page.evaluate.mock.calls[0]?.[1]).toMatchObject({
+      fnSource: "async () => {\nconst value = 41; return value + 1;\n}",
+    });
+  });
+
+  it("runs statement-body ref evaluate sources", async () => {
+    const page = {
+      url: vi.fn(() => "http://127.0.0.1:9222/json/version"),
+    };
+    const locator = {
+      evaluate: vi.fn(async (evaluateFn: (el: Element, args: unknown) => unknown, args: unknown) =>
+        evaluateFn({ textContent: "Ada" } as Element, args),
+      ),
+    };
+    setPwToolsCoreCurrentPage(page);
+    setPwToolsCoreCurrentRefLocator(locator);
+
+    const result = await mod.evaluateViaPlaywright({
+      cdpUrl: "http://127.0.0.1:18792",
+      targetId: "T1",
+      ref: "1",
+      fn: "const text = el.textContent; return text;",
+    });
+
+    expect(result).toBe("Ada");
+    expect(locator.evaluate.mock.calls[0]?.[1]).toMatchObject({
+      fnSource: "async (el) => {\nconst text = el.textContent; return text;\n}",
+    });
+  });
+
   it("runs the post-keypress navigation guard when navigation starts shortly after the keypress resolves", async () => {
     vi.useFakeTimers();
     try {
@@ -899,6 +1014,35 @@ describe("pw-tools-core interaction navigation guard", () => {
           targetId: "T1",
         },
       );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("defaults non-finite keypress delays before calling Playwright", async () => {
+    vi.useFakeTimers();
+    try {
+      const press = vi.fn(async () => {});
+      const page = {
+        keyboard: { press },
+        on: vi.fn(),
+        off: vi.fn(),
+        url: vi.fn(() => "http://127.0.0.1:9222/json/version"),
+      };
+      setPwToolsCoreCurrentPage(page);
+
+      const task = mod.pressKeyViaPlaywright({
+        cdpUrl: "http://127.0.0.1:18792",
+        targetId: "T1",
+        key: "Enter",
+        delayMs: Number.NaN,
+        ssrfPolicy: { allowPrivateNetwork: false },
+      });
+
+      await vi.advanceTimersByTimeAsync(250);
+      await task;
+
+      expect(press).toHaveBeenCalledWith("Enter", { delay: 0 });
     } finally {
       vi.useRealTimers();
     }
@@ -1040,7 +1184,7 @@ describe("pw-tools-core interaction navigation guard", () => {
     });
   });
 
-  it("does not run the post-evaluate navigation guard when the url is unchanged", async () => {
+  it("checks the current page before evaluate and skips the post-evaluate guard when the url is unchanged", async () => {
     const page = {
       evaluate: vi.fn(async () => "ok"),
       url: vi.fn(() => "http://127.0.0.1:9222/json/version"),
@@ -1055,7 +1199,19 @@ describe("pw-tools-core interaction navigation guard", () => {
     });
 
     expect(result).toBe("ok");
-    expect(getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely).not.toHaveBeenCalled();
+    expect(getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely).toHaveBeenCalledWith({
+      cdpUrl: "http://127.0.0.1:18792",
+      page,
+      response: null,
+      ssrfPolicy: { allowPrivateNetwork: false },
+      targetId: "T1",
+    });
+    expect(
+      getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely.mock.invocationCallOrder[0],
+    ).toBeLessThan(page.evaluate.mock.invocationCallOrder[0]);
   });
 
   it("propagates the SSRF policy through batch interaction actions", async () => {
@@ -1112,9 +1268,9 @@ describe("pw-tools-core interaction navigation guard", () => {
       setPwToolsCoreCurrentPage(page);
 
       const blocked = new Error("blocked interaction navigation");
-      getPwToolsCoreSessionMocks().assertPageNavigationCompletedSafely.mockRejectedValueOnce(
-        blocked,
-      );
+      getPwToolsCoreSessionMocks()
+        .assertPageNavigationCompletedSafely.mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(blocked);
 
       const task = mod.evaluateViaPlaywright({
         cdpUrl: "http://127.0.0.1:18792",
@@ -1139,5 +1295,116 @@ describe("pw-tools-core interaction navigation guard", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("returns click downloads without adding a second policy grace", async () => {
+    const page = { url: vi.fn(() => "https://example.com") };
+    const click = vi.fn(async () => {});
+    const drain = vi.fn(async () => [
+      {
+        url: "https://example.com/report.pdf",
+        suggestedFilename: "report.pdf",
+        path: "/tmp/openclaw/downloads/report.pdf",
+      },
+    ]);
+    const dispose = vi.fn();
+    getPwToolsCoreSessionMocks().beginActionDownloadCaptureOnPage.mockReturnValueOnce({
+      drain,
+      dispose,
+    });
+    setPwToolsCoreCurrentPage(page);
+    setPwToolsCoreCurrentRefLocator({ click });
+
+    const result = await mod.executeActViaPlaywright({
+      cdpUrl: "http://127.0.0.1:18792",
+      targetId: "T1",
+      action: { kind: "click", ref: "1" },
+      ssrfPolicy: { allowPrivateNetwork: false },
+    });
+
+    expect(result.downloads).toEqual([
+      {
+        url: "https://example.com/report.pdf",
+        suggestedFilename: "report.pdf",
+        path: "/tmp/openclaw/downloads/report.pdf",
+      },
+    ]);
+    expect(drain).toHaveBeenCalledWith({
+      firstEventGraceMs: 0,
+      maxWaitMs: 1_000,
+      quietMs: 250,
+    });
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(getPwToolsCoreSessionMocks().beginActionDownloadCaptureOnPage).toHaveBeenCalledWith(
+      page,
+      { beforeSave: expect.any(Function) },
+    );
+  });
+
+  it("quarantines the target without closing it when an action download fails policy", async () => {
+    const page = { url: vi.fn(() => "https://example.com") };
+    const click = vi.fn(async () => {});
+    const blocked = new Error("blocked action download");
+    blocked.name = "InvalidBrowserNavigationUrlError";
+    const dispose = vi.fn();
+    getPwToolsCoreSessionMocks().beginActionDownloadCaptureOnPage.mockReturnValueOnce({
+      drain: vi.fn(async () => {
+        throw blocked;
+      }),
+      dispose,
+    });
+    setPwToolsCoreCurrentPage(page);
+    setPwToolsCoreCurrentRefLocator({ click });
+
+    await expect(
+      mod.executeActViaPlaywright({
+        cdpUrl: "http://127.0.0.1:18792",
+        targetId: "T1",
+        action: { kind: "click", ref: "1" },
+      }),
+    ).rejects.toBe(blocked);
+
+    expect(getPwToolsCoreSessionMocks().quarantineBlockedNavigationTarget).toHaveBeenCalledWith({
+      cdpUrl: "http://127.0.0.1:18792",
+      page,
+      targetId: "T1",
+    });
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("captures key-triggered downloads with a bounded event grace", async () => {
+    const page = {
+      keyboard: { press: vi.fn(async () => {}) },
+      url: vi.fn(() => "https://example.com"),
+    };
+    const drain = vi.fn(async () => [
+      {
+        url: "https://example.com/report.pdf",
+        suggestedFilename: "report.pdf",
+        path: "/tmp/openclaw/downloads/report.pdf",
+      },
+    ]);
+    const dispose = vi.fn();
+    getPwToolsCoreSessionMocks().beginActionDownloadCaptureOnPage.mockReturnValueOnce({
+      drain,
+      dispose,
+    });
+    setPwToolsCoreCurrentPage(page);
+
+    const result = await mod.executeActViaPlaywright({
+      cdpUrl: "http://127.0.0.1:18792",
+      targetId: "T1",
+      action: { kind: "press", key: "Enter" },
+    });
+
+    expect(result.downloads).toEqual([
+      expect.objectContaining({ suggestedFilename: "report.pdf" }),
+    ]);
+    expect(drain).toHaveBeenCalledWith({
+      firstEventGraceMs: 250,
+      maxWaitMs: 1_000,
+      quietMs: 250,
+    });
+    expect(dispose).toHaveBeenCalledOnce();
   });
 });

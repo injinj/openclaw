@@ -1,12 +1,18 @@
+// Whatsapp plugin module implements login behavior.
 import { formatCliCommand } from "openclaw/plugin-sdk/cli-runtime";
+import { logInfo } from "openclaw/plugin-sdk/logging-core";
 import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { danger, success } from "openclaw/plugin-sdk/runtime-env";
 import { defaultRuntime, type RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import { logInfo } from "openclaw/plugin-sdk/text-runtime";
 import { resolveWhatsAppAccount } from "./accounts.js";
 import { restoreCredsFromBackupIfNeeded } from "./auth-store.js";
 import { closeWaSocketSoon, waitForWhatsAppLoginResult } from "./connection-controller.js";
+import { renderQrTerminal } from "./qr-terminal.js";
 import { createWaSocket, waitForWaConnection } from "./session.js";
+import { resolveWhatsAppSocketTiming } from "./socket-timing.js";
+
+const QR_LINK_INSTRUCTION = "Open the WhatsApp app, go to Linked Devices, then scan this QR:";
+const CLEAR_TERMINAL = "\x1b[2J\x1b[H";
 
 export async function loginWeb(
   verbose: boolean,
@@ -16,9 +22,31 @@ export async function loginWeb(
 ) {
   const cfg = getRuntimeConfig();
   const account = resolveWhatsAppAccount({ cfg, accountId });
+  const socketTiming = resolveWhatsAppSocketTiming(cfg);
   const restoredFromBackup = await restoreCredsFromBackupIfNeeded(account.authDir);
-  let sock = await createWaSocket(true, verbose, {
+  let qrVersion = 0;
+  const onQr = (qr: string) => {
+    const currentQrVersion = ++qrVersion;
+    void renderQrTerminal(qr, { small: true })
+      .then((output) => {
+        if (currentQrVersion !== qrVersion) {
+          return;
+        }
+        const refreshPrefix = currentQrVersion > 1 && process.stdout.isTTY ? CLEAR_TERMINAL : "";
+        const renderedQr = output.endsWith("\n") ? output.slice(0, -1) : output;
+        runtime.log(`${refreshPrefix}${QR_LINK_INSTRUCTION}\n${renderedQr}`);
+      })
+      .catch((err: unknown) => {
+        if (currentQrVersion !== qrVersion) {
+          return;
+        }
+        runtime.error(`failed rendering WhatsApp QR: ${String(err)}`);
+      });
+  };
+  let sock = await createWaSocket(false, verbose, {
     authDir: account.authDir,
+    ...socketTiming,
+    onQr,
   });
   logInfo("Waiting for WhatsApp connection...", runtime);
   try {
@@ -29,12 +57,14 @@ export async function loginWeb(
       verbose,
       runtime,
       waitForConnection,
+      socketTiming,
+      onQr,
       onSocketReplaced: (replacementSock) => {
         sock = replacementSock;
       },
     });
     if (result.outcome === "connected") {
-      console.log(
+      runtime.log(
         success(
           result.restarted
             ? "✅ Linked after restart; web session ready."
@@ -47,7 +77,7 @@ export async function loginWeb(
     }
 
     if (result.outcome === "logged-out") {
-      console.error(
+      runtime.error(
         danger(
           `WhatsApp reported the session is logged out. Cleared cached web session; please rerun ${formatCliCommand("openclaw channels login")} and scan the QR again.`,
         ),
@@ -57,7 +87,7 @@ export async function loginWeb(
       });
     }
 
-    console.error(danger(`WhatsApp Web connection ended before fully opening. ${result.message}`));
+    runtime.error(danger(`WhatsApp Web connection ended before fully opening. ${result.message}`));
     throw new Error(result.message, { cause: result.error });
   } finally {
     // Let Baileys flush any final events before closing the socket.

@@ -1,8 +1,14 @@
+/** CLI runner for node-host stdin/stdout command dispatch. */
+import fs from "node:fs";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../../packages/gateway-protocol/src/client-info.js";
+import { ConnectErrorDetailCodes } from "../../packages/gateway-protocol/src/connect-error-details.js";
 import { getRuntimeConfig, type OpenClawConfig } from "../config/config.js";
+import { startGatewayClientWhenEventLoopReady } from "../gateway/client-start-readiness.js";
 import { GatewayClient, type GatewayReconnectPausedInfo } from "../gateway/client.js";
 import { resolveGatewayConnectionAuth } from "../gateway/connection-auth.js";
-import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../gateway/protocol/client-info.js";
-import { ConnectErrorDetailCodes } from "../gateway/protocol/connect-error-details.js";
 import { loadOrCreateDeviceIdentity } from "../infra/device-identity.js";
 import type { SkillBinTrustEntry } from "../infra/exec-approvals.js";
 import { resolveExecutableFromPathEnv } from "../infra/executable-path.js";
@@ -23,17 +29,46 @@ import {
 } from "./plugin-node-host.js";
 
 export { buildNodeInvokeResultParams };
+export { buildNodeEventParams } from "./invoke.js";
 
 type NodeHostRunOptions = {
   gatewayHost: string;
   gatewayPort: number;
   gatewayTls?: boolean;
   gatewayTlsFingerprint?: string;
+  /** Optional WebSocket context path (e.g. "/openclaw-gw"). */
+  gatewayContextPath?: string;
   nodeId?: string;
   displayName?: string;
 };
 
 const DEFAULT_NODE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+export function resolveNodeHostGatewayPlatform(platform: NodeJS.Platform): string {
+  switch (platform) {
+    case "darwin":
+      return "macos";
+    case "win32":
+      return "windows";
+    case "linux":
+      return "linux";
+    default:
+      return "unknown";
+  }
+}
+
+export function resolveNodeHostGatewayDeviceFamily(platform: NodeJS.Platform): string | undefined {
+  switch (platform) {
+    case "darwin":
+      return "Mac";
+    case "win32":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    default:
+      return undefined;
+  }
+}
 
 function writeStderrLine(message: string): void {
   process.stderr.write(`${message}\n`);
@@ -45,6 +80,7 @@ const NODE_HOST_EXIT_ON_RECONNECT_PAUSE_CODES: ReadonlySet<string> = new Set([
   ConnectErrorDetailCodes.AUTH_BOOTSTRAP_TOKEN_INVALID,
   ConnectErrorDetailCodes.AUTH_PASSWORD_MISSING,
   ConnectErrorDetailCodes.AUTH_PASSWORD_MISMATCH,
+  ConnectErrorDetailCodes.CLIENT_VERSION_MISMATCH,
 ]);
 
 type NodeHostReconnectPausedDeps = {
@@ -56,7 +92,7 @@ export function shouldExitNodeHostOnReconnectPaused(detailCode: string | null): 
   return detailCode !== null && NODE_HOST_EXIT_ON_RECONNECT_PAUSE_CODES.has(detailCode);
 }
 
-export function formatNodeHostReconnectPausedMessage(
+function formatNodeHostReconnectPausedMessage(
   info: GatewayReconnectPausedInfo,
   params?: { exiting?: boolean },
 ): string {
@@ -87,6 +123,18 @@ function resolveExecutablePathFromEnv(bin: string, pathEnv: string): string | nu
   return resolveExecutableFromPathEnv(bin, pathEnv) ?? null;
 }
 
+function resolveExecutableTrustPathFromEnv(bin: string, pathEnv: string): string | null {
+  const resolvedPath = resolveExecutablePathFromEnv(bin, pathEnv);
+  if (!resolvedPath) {
+    return null;
+  }
+  try {
+    return fs.realpathSync(resolvedPath);
+  } catch {
+    return resolvedPath;
+  }
+}
+
 function resolveSkillBinTrustEntries(bins: string[], pathEnv: string): SkillBinTrustEntry[] {
   const trustEntries: SkillBinTrustEntry[] = [];
   const seen = new Set<string>();
@@ -95,7 +143,7 @@ function resolveSkillBinTrustEntries(bins: string[], pathEnv: string): SkillBinT
     if (!name) {
       continue;
     }
-    const resolvedPath = resolveExecutablePathFromEnv(name, pathEnv);
+    const resolvedPath = resolveExecutableTrustPathFromEnv(name, pathEnv);
     if (!resolvedPath) {
       continue;
     }
@@ -200,6 +248,7 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
     port: opts.gatewayPort,
     tls: opts.gatewayTls ?? getRuntimeConfig().gateway?.tls?.enabled ?? false,
     tlsFingerprint: opts.gatewayTlsFingerprint,
+    contextPath: opts.gatewayContextPath,
   };
   config.gateway = gateway;
   await saveNodeHostConfig(config);
@@ -215,18 +264,25 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
   const host = gateway.host ?? "127.0.0.1";
   const port = gateway.port ?? 18789;
   const scheme = gateway.tls ? "wss" : "ws";
-  const url = `${scheme}://${host}:${port}`;
+  const contextPath = gateway.contextPath
+    ? gateway.contextPath.startsWith("/")
+      ? gateway.contextPath
+      : `/${gateway.contextPath}`
+    : "";
+  const url = `${scheme}://${host}:${port}${contextPath}`;
   const pathEnv = ensureNodePathEnv();
 
   const client = new GatewayClient({
     url,
     token: token || undefined,
     password: password || undefined,
+    preauthHandshakeTimeoutMs: cfg.gateway?.handshakeTimeoutMs,
     instanceId: nodeId,
     clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
     clientDisplayName: displayName,
     clientVersion: VERSION,
-    platform: process.platform,
+    platform: resolveNodeHostGatewayPlatform(process.platform),
+    deviceFamily: resolveNodeHostGatewayDeviceFamily(process.platform),
     mode: GATEWAY_CLIENT_MODES.NODE,
     role: "node",
     scopes: [],
@@ -254,6 +310,9 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
       // keep retrying (handled by GatewayClient)
       writeStderrLine(`node host gateway connect failed: ${err.message}`);
     },
+    onHelloOk: () => {
+      writeStderrLine(`node host gateway connected: ${url}`);
+    },
     onReconnectPaused: (info) => {
       handleNodeHostReconnectPaused(info);
     },
@@ -268,6 +327,11 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
     return bins;
   }, pathEnv);
 
-  client.start();
+  const readiness = await startGatewayClientWhenEventLoopReady(client, {
+    clientOptions: { preauthHandshakeTimeoutMs: cfg.gateway?.handshakeTimeoutMs },
+  });
+  if (!readiness.ready) {
+    throw new Error("node host gateway event loop readiness timeout");
+  }
   await new Promise(() => {});
 }

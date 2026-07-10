@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Foundation
 import Observation
+import OpenClawKit
 import SwiftUI
 
 /// Menu contents for the OpenClaw menu bar extra.
@@ -14,9 +15,9 @@ struct MenuContent: View {
     private let heartbeatStore = HeartbeatStore.shared
     private let controlChannel = ControlChannel.shared
     private let activityStore = WorkActivityStore.shared
+    private let nodesStore = NodesStore.shared
     @Bindable private var pairingPrompter = NodePairingApprovalPrompter.shared
     @Bindable private var devicePairingPrompter = DevicePairingApprovalPrompter.shared
-    @Environment(\.openSettings) private var openSettings
     @State private var availableMics: [AudioInputDevice] = []
     @State private var loadingMics = false
     @State private var micObserver = AudioInputDeviceObserver()
@@ -44,19 +45,18 @@ struct MenuContent: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(self.connectionLabel)
                     self.statusLine(label: self.healthStatus.label, color: self.healthStatus.color)
+                    if let macNodeStatus = self.macNodeStatus {
+                        self.statusLine(label: macNodeStatus.label, color: macNodeStatus.color)
+                    }
                     if self.pairingPrompter.pendingCount > 0 {
-                        let repairCount = self.pairingPrompter.pendingRepairCount
-                        let repairSuffix = repairCount > 0 ? " · \(repairCount) repair" : ""
-                        self.statusLine(
-                            label: "Pairing approval pending (\(self.pairingPrompter.pendingCount))\(repairSuffix)",
-                            color: .orange)
+                        self.pairingStatusLine(
+                            label: "Pairing approval pending (\(self.pairingPrompter.pendingCount))")
                     }
                     if self.devicePairingPrompter.pendingCount > 0 {
                         let repairCount = self.devicePairingPrompter.pendingRepairCount
                         let repairSuffix = repairCount > 0 ? " · \(repairCount) repair" : ""
-                        self.statusLine(
-                            label: "Device pairing pending (\(self.devicePairingPrompter.pendingCount))\(repairSuffix)",
-                            color: .orange)
+                        self.pairingStatusLine(
+                            label: "Device pairing pending (\(self.devicePairingPrompter.pendingCount))\(repairSuffix)")
                     }
                 }
             }
@@ -107,31 +107,18 @@ struct MenuContent: View {
             }
             Divider()
             Button {
-                Task { @MainActor in
-                    await self.openDashboard()
-                }
+                AppNavigationActions.openDashboard()
             } label: {
                 Label("Open Dashboard", systemImage: "gauge")
             }
             Button {
-                Task { @MainActor in
-                    let sessionKey = await WebChatManager.shared.preferredSessionKey()
-                    WebChatManager.shared.show(sessionKey: sessionKey)
-                }
+                AppNavigationActions.openChat()
             } label: {
                 Label("Open Chat", systemImage: "bubble.left.and.bubble.right")
             }
             if self.state.canvasEnabled {
                 Button {
-                    Task { @MainActor in
-                        if self.state.canvasPanelVisible {
-                            CanvasManager.shared.hideAll()
-                        } else {
-                            let sessionKey = await GatewayConnection.shared.mainSessionKey()
-                            // Don't force a navigation on re-open: preserve the current web view state.
-                            _ = try? CanvasManager.shared.show(sessionKey: sessionKey, path: nil)
-                        }
-                    }
+                    AppNavigationActions.toggleCanvas()
                 } label: {
                     Label(
                         self.state.canvasPanelVisible ? "Close Canvas" : "Open Canvas",
@@ -180,9 +167,6 @@ struct MenuContent: View {
             self.micRefreshTask?.cancel()
             self.micRefreshTask = nil
             self.micObserver.stop()
-        }
-        .task { @MainActor in
-            SettingsWindowOpener.shared.register(openSettings: self.openSettings)
         }
     }
 
@@ -245,6 +229,13 @@ struct MenuContent: View {
                 } label: {
                     Label("Send Test Heartbeat", systemImage: "waveform.path.ecg")
                 }
+                #if DEBUG
+                Button {
+                    DebugActions.showPairingPanelDemo()
+                } label: {
+                    Label("Show Pairing Panel (Demo)", systemImage: "checkmark.shield")
+                }
+                #endif
                 if self.state.connectionMode == .remote {
                     Button {
                         Task { @MainActor in
@@ -329,26 +320,33 @@ struct MenuContent: View {
     }
 
     private func open(tab: SettingsTab) {
-        SettingsTabRouter.request(tab)
-        NSApp.activate(ignoringOtherApps: true)
-        self.openSettings()
-        DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .openclawSelectSettingsTab, object: tab)
-        }
+        AppNavigationActions.openSettings(tab: tab)
     }
 
-    @MainActor
-    private func openDashboard() async {
-        do {
-            let config = try await GatewayEndpointStore.shared.requireConfig()
-            let url = try GatewayEndpointStore.dashboardURL(for: config, mode: self.state.connectionMode)
-            NSWorkspace.shared.open(url)
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Dashboard unavailable"
-            alert.informativeText = error.localizedDescription
-            alert.runModal()
+    private var macNodeStatus: (label: String, color: Color)? {
+        guard self.state.connectionMode != .unconfigured else { return nil }
+        guard case .connected = self.controlChannel.state else { return nil }
+
+        let deviceId = DeviceIdentityStore.loadOrCreate(
+            profile: MacNodeModeCoordinator.nodeIdentityProfile).deviceId
+        if let entry = self.nodesStore.nodes.first(where: { $0.nodeId == deviceId }) {
+            guard entry.isConnected else {
+                return ("Mac capabilities offline", .orange)
+            }
+            let commands = Set(entry.commands ?? [])
+            let missingRequiredCommands = [
+                OpenClawSystemCommand.notify.rawValue,
+                OpenClawSystemCommand.run.rawValue,
+                OpenClawSystemCommand.which.rawValue,
+            ].filter { !commands.contains($0) }
+            if !missingRequiredCommands.isEmpty {
+                return ("Mac capabilities incomplete", .orange)
+            }
+            return nil
         }
+
+        guard !self.nodesStore.isLoading, !self.nodesStore.nodes.isEmpty else { return nil }
+        return ("Mac capabilities offline", .orange)
     }
 
     private var healthStatus: (label: String, color: Color) {
@@ -418,6 +416,17 @@ struct MenuContent: View {
                 .layoutPriority(1)
         }
         .padding(.top, 2)
+    }
+
+    /// Pending-pairing status lines reopen the approval panel (e.g. after "Not Now").
+    private func pairingStatusLine(label: String) -> some View {
+        Button {
+            PairingApprovalCenter.shared.showPanel()
+        } label: {
+            self.statusLine(label: label, color: .orange)
+        }
+        .buttonStyle(.plain)
+        .help("Show pairing requests")
     }
 
     private var activeBinding: Binding<Bool> {

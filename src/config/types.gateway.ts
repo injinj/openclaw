@@ -1,5 +1,7 @@
+// Defines gateway runtime and networking configuration types.
 import type { SecretInput } from "./types.secrets.js";
 
+/** Gateway bind-address policy for local server startup. */
 export type GatewayBindMode = "auto" | "lan" | "loopback" | "custom" | "tailnet";
 
 export type GatewayTlsConfig = {
@@ -16,11 +18,13 @@ export type GatewayTlsConfig = {
 };
 
 export type WideAreaDiscoveryConfig = {
+  /** Enable DNS-SD style wide-area discovery. */
   enabled?: boolean;
   /** Optional unicast DNS-SD domain (e.g. "openclaw.internal"). */
   domain?: string;
 };
 
+/** mDNS/Bonjour metadata exposure level for local gateway discovery. */
 export type MdnsDiscoveryMode = "off" | "minimal" | "full";
 
 export type MdnsDiscoveryConfig = {
@@ -34,18 +38,10 @@ export type MdnsDiscoveryConfig = {
 };
 
 export type DiscoveryConfig = {
+  /** Wide-area DNS-SD discovery settings. */
   wideArea?: WideAreaDiscoveryConfig;
+  /** Local mDNS/Bonjour discovery settings. */
   mdns?: MdnsDiscoveryConfig;
-};
-
-export type CanvasHostConfig = {
-  enabled?: boolean;
-  /** Directory to serve (default: ~/.openclaw/workspace/canvas). */
-  root?: string;
-  /** HTTP port to listen on (default: 18793). */
-  port?: number;
-  /** Enable live-reload file watching + WS reloads (default: true). */
-  liveReload?: boolean;
 };
 
 export type TalkProviderConfig = {
@@ -53,6 +49,39 @@ export type TalkProviderConfig = {
   apiKey?: SecretInput;
   /** Provider-owned Talk config fields. */
   [key: string]: unknown;
+};
+
+export type TalkRealtimeConfig = {
+  /** Active realtime voice provider. */
+  provider?: string;
+  /** Provider-specific realtime voice config keyed by provider id. */
+  providers?: Record<string, TalkProviderConfig>;
+  /** Provider model override for realtime sessions. */
+  model?: string;
+  /** Provider speaker voice name override for realtime sessions. */
+  speakerVoice?: string;
+  /** Provider speaker voice id override for realtime sessions. */
+  speakerVoiceId?: string;
+  /** @deprecated Use speakerVoice. */
+  voice?: string;
+  /** Additional system instructions appended to realtime Talk sessions. */
+  instructions?: string;
+  /** Realtime execution mode. */
+  mode?: "realtime" | "stt-tts" | "transcription";
+  /** Byte/session transport. */
+  transport?: "webrtc" | "provider-websocket" | "gateway-relay" | "managed-room";
+  /** Voice activity detection threshold from 0 (most sensitive) to 1 (least sensitive). */
+  vadThreshold?: number;
+  /** Milliseconds of silence before the current user turn is committed. */
+  silenceDurationMs?: number;
+  /** Milliseconds of audio retained before detected speech begins. */
+  prefixPaddingMs?: number;
+  /** Provider-specific realtime reasoning effort. */
+  reasoningEffort?: string;
+  /** Tool/agent strategy for realtime sessions. */
+  brain?: "agent-consult" | "direct-tools" | "none";
+  /** How Gateway relay handles final user transcripts when the provider skips a consult. */
+  consultRouting?: "provider-direct" | "force-agent-consult";
 };
 
 export type ResolvedTalkConfig = {
@@ -67,6 +96,20 @@ export type TalkConfig = {
   provider?: string;
   /** Provider-specific Talk config keyed by provider id. */
   providers?: Record<string, TalkProviderConfig>;
+  /** Realtime Talk provider, model, voice, mode, transport, and brain config. */
+  realtime?: TalkRealtimeConfig;
+  /** Optional thinking level override for the agent run behind Talk realtime consults. */
+  consultThinkingLevel?:
+    | "off"
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "adaptive"
+    | "max";
+  /** Optional fast mode override for the agent run behind Talk realtime consults. */
+  consultFastMode?: boolean;
   /** BCP 47 locale id used for Talk speech recognition on device nodes. */
   speechLocale?: string;
   /** Stop speaking when user starts talking (default: true). */
@@ -99,6 +142,8 @@ export type GatewayControlUiConfig = {
    * Default off; prefer hosted /__openclaw__/canvas or /__openclaw__/a2ui content.
    */
   allowExternalEmbedUrls?: boolean;
+  /** Optional max-width for grouped Control UI chat messages (default: min(900px, 68%)). */
+  chatMessageMaxWidth?: string;
   /** Allowed browser origins for Control UI/WebChat websocket connections. */
   allowedOrigins?: string[];
   /**
@@ -116,6 +161,7 @@ export type GatewayControlUiConfig = {
   dangerouslyDisableDeviceAuth?: boolean;
 };
 
+/** Gateway authentication strategy for WebSocket and HTTP clients. */
 export type GatewayAuthMode = "none" | "token" | "password" | "trusted-proxy";
 
 /**
@@ -178,6 +224,7 @@ export type GatewayAuthRateLimitConfig = {
   exemptLoopback?: boolean;
 };
 
+/** Tailscale exposure mode for gateway HTTP/WebSocket surfaces. */
 export type GatewayTailscaleMode = "off" | "serve" | "funnel";
 
 export type GatewayTailscaleConfig = {
@@ -185,6 +232,15 @@ export type GatewayTailscaleConfig = {
   mode?: GatewayTailscaleMode;
   /** Reset serve/funnel configuration on shutdown. */
   resetOnExit?: boolean;
+  /** Optional Tailscale Service name, such as `svc:openclaw`, for Serve mode. */
+  serviceName?: string;
+  /**
+   * When `mode="serve"` and an externally configured Tailscale Funnel route
+   * already covers the gateway port, skip re-applying `tailscale serve` on
+   * startup. Lets operators manage Funnel exposure outside OpenClaw without
+   * losing it across gateway restarts.
+   */
+  preserveFunnel?: boolean;
 };
 
 export type GatewayRemoteConfig = {
@@ -194,6 +250,8 @@ export type GatewayRemoteConfig = {
   url?: string;
   /** Transport for macOS remote connections (ssh tunnel or direct WS). */
   transport?: "ssh" | "direct";
+  /** Gateway port on the remote SSH host. Defaults to 18789. */
+  remotePort?: number;
   /** Token for remote auth (when the gateway requires token auth). */
   token?: SecretInput;
   /** Password for remote auth (when the gateway requires password auth). */
@@ -204,8 +262,37 @@ export type GatewayRemoteConfig = {
   sshTarget?: string;
   /** SSH identity file path for tunneling remote Gateway. */
   sshIdentity?: string;
+  /** macOS SSH host-key policy. Defaults to strict; openssh delegates to effective SSH config. */
+  sshHostKeyPolicy?: "strict" | "openssh";
 };
 
+/**
+ * Operator terminal surface served to Control UI and mobile clients.
+ *
+ * The terminal opens a PTY-backed shell on the gateway host, gated to
+ * admin-scope operator sessions. It starts in the target agent's workspace; if
+ * that agent is fully sandboxed (`sandbox.mode: "all"`) the terminal is refused
+ * rather than handed an unconfined host shell (workspace isolation is
+ * fail-closed). Under "non-main" the agent's main session runs on the host, so a
+ * host terminal is allowed.
+ */
+export type GatewayTerminalConfig = {
+  /** Master switch for the operator terminal. Default: false. */
+  enabled?: boolean;
+  /**
+   * Shell executable to launch. When unset the host login shell is used
+   * ($SHELL on Unix, %ComSpec% on Windows).
+   */
+  shell?: string;
+  /**
+   * How long (seconds) a session survives after its connection drops, staying
+   * reattachable via terminal.attach. 0 kills sessions on disconnect
+   * immediately. Default: 300.
+   */
+  detachedSessionTimeoutSeconds?: number;
+};
+
+/** Gateway config reload strategy for managed installs. */
 export type GatewayReloadMode = "off" | "restart" | "hot" | "hybrid";
 
 export type GatewayReloadConfig = {
@@ -215,8 +302,8 @@ export type GatewayReloadConfig = {
   debounceMs?: number;
   /**
    * Optional maximum time (ms) to wait for in-flight operations to complete
-   * before forcing a restart. Absent or 0 waits indefinitely and logs periodic
-   * still-pending warnings.
+   * before forcing a restart. Absent uses the gateway's default bounded wait;
+   * 0 waits indefinitely and logs periodic still-pending warnings.
    * Lower positive values risk aborting active subagent LLM calls.
    * @see https://github.com/openclaw/openclaw/issues/65485
    */
@@ -338,7 +425,9 @@ export type GatewayHttpResponsesImagesConfig = {
 };
 
 export type GatewayHttpEndpointsConfig = {
+  /** OpenAI-compatible chat completions endpoint controls. */
   chatCompletions?: GatewayHttpChatCompletionsConfig;
+  /** OpenResponses-compatible responses endpoint controls. */
   responses?: GatewayHttpResponsesConfig;
 };
 
@@ -353,7 +442,9 @@ export type GatewayHttpSecurityHeadersConfig = {
 };
 
 export type GatewayHttpConfig = {
+  /** Per-endpoint HTTP API controls. */
   endpoints?: GatewayHttpEndpointsConfig;
+  /** HTTP security header overrides. */
   securityHeaders?: GatewayHttpSecurityHeadersConfig;
 };
 
@@ -365,10 +456,12 @@ export type GatewayPushApnsRelayConfig = {
 };
 
 export type GatewayPushApnsConfig = {
+  /** External APNs relay used by iOS/mobile notification flows. */
   relay?: GatewayPushApnsRelayConfig;
 };
 
 export type GatewayPushConfig = {
+  /** Apple Push Notification Service settings. */
   apns?: GatewayPushApnsConfig;
 };
 
@@ -404,11 +497,6 @@ export type GatewayToolsConfig = {
   allow?: string[];
 };
 
-export type GatewayWebchatConfig = {
-  /** Max characters per text field in chat.history responses before truncation (default: 12000). */
-  chatHistoryMaxChars?: number;
-};
-
 export type GatewayConfig = {
   /** Single multiplexed port for Gateway WS + HTTP (default: 18789). */
   port?: number;
@@ -420,16 +508,18 @@ export type GatewayConfig = {
   /**
    * Bind address policy for the Gateway WebSocket + Control UI HTTP server.
    * - auto: Loopback (127.0.0.1) if available, else 0.0.0.0 (fallback to all interfaces)
-   * - lan: 0.0.0.0 (all interfaces, no fallback)
+   * - lan: 0.0.0.0 (all interfaces, no fallback, current BYOH path is IPv4-only)
    * - loopback: 127.0.0.1 (local-only)
    * - tailnet: Tailnet IPv4 if available (100.64.0.0/10), else loopback
-   * - custom: User-specified IP, fallback to 0.0.0.0 if unavailable (requires customBindHost)
+   * - custom: User-specified IPv4 address, fallback to 0.0.0.0 if unavailable (requires customBindHost)
+   * IPv6-only BYOH is not natively supported on this path today. Use an IPv4 sidecar or proxy.
    * Default: loopback (127.0.0.1).
    */
   bind?: GatewayBindMode;
-  /** Custom IP address for bind="custom" mode. Fallback: 0.0.0.0. */
+  /** Custom IPv4 address for bind="custom" mode. IPv6-only BYOH requires an IPv4 sidecar or proxy. */
   customBindHost?: string;
   controlUi?: GatewayControlUiConfig;
+  terminal?: GatewayTerminalConfig;
   auth?: GatewayAuthConfig;
   tailscale?: GatewayTailscaleConfig;
   remote?: GatewayRemoteConfig;
@@ -451,8 +541,11 @@ export type GatewayConfig = {
   allowRealIpFallback?: boolean;
   /** Tool access restrictions for HTTP /tools/invoke endpoint. */
   tools?: GatewayToolsConfig;
-  /** WebChat display/history settings. */
-  webchat?: GatewayWebchatConfig;
+  /**
+   * Pre-auth Gateway WebSocket handshake timeout in milliseconds.
+   * Env var OPENCLAW_HANDSHAKE_TIMEOUT_MS takes precedence. Default: 15000.
+   */
+  handshakeTimeoutMs?: number;
   /**
    * Channel health monitor interval in minutes.
    * Periodically checks channel health and restarts unhealthy channels.

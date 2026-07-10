@@ -1,3 +1,4 @@
+// Normalizes error objects for codes, names, messages, and redacted logs.
 import { redactSensitiveText } from "../logging/redact.js";
 
 export function extractErrorCode(err: unknown): string | undefined {
@@ -72,15 +73,26 @@ export function formatErrorMessage(err: unknown): string {
     // Traverse .cause chain to include nested error messages (e.g. grammY HttpError wraps network errors in .cause)
     let cause: unknown = err.cause;
     const seen = new Set<unknown>([err]);
+    // Skip causes that repeat a message already emitted (e.g. coerceToFailoverError).
+    const seenMessages = new Set<string>([formatted]);
+    const appendCauseMessage = (message: string): void => {
+      if (!message || seenMessages.has(message)) {
+        return;
+      }
+      formatted += ` | ${message}`;
+      seenMessages.add(message);
+    };
     while (cause && !seen.has(cause)) {
       seen.add(cause);
       if (cause instanceof Error) {
-        if (cause.message) {
-          formatted += ` | ${cause.message}`;
+        appendCauseMessage(cause.message);
+        const code = extractErrorCode(cause);
+        if (code) {
+          appendCauseMessage(code);
         }
         cause = cause.cause;
       } else if (typeof cause === "string") {
-        formatted += ` | ${cause}`;
+        appendCauseMessage(cause);
         break;
       } else {
         break;
@@ -100,6 +112,29 @@ export function formatErrorMessage(err: unknown): string {
   // Security: best-effort token redaction before returning/logging.
   return redactSensitiveText(formatted);
 }
+
+/**
+ * Render a non-Error `cause` value (string, number, plain object, etc.) for inclusion in
+ * a flattened error chain. Returns `[object Object]`-free text without throwing.
+ */
+export function stringifyNonErrorCause(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value) ?? Object.prototype.toString.call(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
+
+export { toErrorObject } from "@openclaw/normalization-core/error-coercion";
 
 export function formatUncaughtError(err: unknown): string {
   if (extractErrorCode(err) === "INVALID_CONFIG") {
@@ -129,9 +164,6 @@ export function detectErrorKind(err: unknown): ErrorKind | undefined {
   ) {
     return "refusal";
   }
-  if (message.includes("timeout") || code === "etimedout" || code === "timeout") {
-    return "timeout";
-  }
   if (
     message.includes("rate limit") ||
     message.includes("too many requests") ||
@@ -139,6 +171,9 @@ export function detectErrorKind(err: unknown): ErrorKind | undefined {
     code === "429"
   ) {
     return "rate_limit";
+  }
+  if (message.includes("timeout") || code === "etimedout" || code === "timeout") {
+    return "timeout";
   }
   if (
     message.includes("context length") ||

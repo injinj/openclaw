@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import OpenClawKit
 import OSLog
 import Speech
 import SwabbleKit
@@ -187,8 +188,8 @@ actor VoiceWakeRuntime {
             }
             input.removeTap(onBus: 0)
             input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self, weak request] buffer, _ in
-                request?.append(buffer)
-                guard let rms = Self.rmsLevel(buffer: buffer) else { return }
+                request?.append(SpeechAudioBufferNormalizer.speechCompatibleBuffer(from: buffer))
+                let rms = TalkAudioLevel.rms(buffer: buffer)
                 Task.detached { [weak self] in
                     await self?.noteAudioLevel(rms: rms)
                     await self?.noteAudioTap(rms: rms)
@@ -517,12 +518,10 @@ actor VoiceWakeRuntime {
     }
 
     private static func isTriggerOnlyText(transcript: String, triggers: [String]) -> Bool {
-        guard WakeWordGate.matchesTextOnly(text: transcript, triggers: triggers) else { return false }
-        guard
-            VoiceWakeTextUtils.startsWithTrigger(transcript: transcript, triggers: triggers)
-            || VoiceWakeTextUtils.hasOnlyFillerBeforeTrigger(transcript: transcript, triggers: triggers)
-        else { return false }
-        return self.trimmedAfterTrigger(transcript, triggers: triggers).isEmpty
+        VoiceWakeTextUtils.isTriggerOnly(
+            transcript: transcript,
+            triggers: triggers,
+            trimWake: self.trimmedAfterTrigger)
     }
 
     private static func matchedTriggerWordText(transcript: String, triggers: [String]) -> String? {
@@ -696,9 +695,9 @@ actor VoiceWakeRuntime {
                 await MainActor.run { VoiceWakeChimePlayer.play(sendChime, reason: "voicewake.send") }
             }
             Task.detached {
-                await VoiceWakeForwarder.forward(
+                await VoiceWakeForwarder.forwardToSelectedSession(
                     transcript: finalTranscript,
-                    options: .init(voiceWakeTrigger: triggerWord))
+                    voiceWakeTrigger: triggerWord)
             }
         }
         self.overlayToken = nil
@@ -726,18 +725,6 @@ actor VoiceWakeRuntime {
                 VoiceSessionCoordinator.shared.updateLevel(token: token, clamped)
             }
         }
-    }
-
-    private static func rmsLevel(buffer: AVAudioPCMBuffer) -> Double? {
-        guard let channelData = buffer.floatChannelData?.pointee else { return nil }
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return nil }
-        var sum: Double = 0
-        for i in 0..<frameCount {
-            let sample = Double(channelData[i])
-            sum += sample * sample
-        }
-        return sqrt(sum / Double(frameCount))
     }
 
     private func restartRecognizer() {

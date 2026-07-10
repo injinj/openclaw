@@ -29,11 +29,12 @@ private final class FakeWebSocketTask: WebSocketTasking, @unchecked Sendable {
                 {"type":"event","event":"connect.challenge","payload":{"nonce":"test-nonce"}}
                 """)
             }
-            if let request = self.latestUnrespondedRequest() {
+            if let request = latestUnrespondedRequest() {
                 self.respondedRequestIds.insert(request.id)
                 if request.method == "connect" {
                     return .string("""
-                    {"type":"res","id":"\(request.id)","ok":true,"payload":{"type":"hello","protocol":3,"server":{},"features":{},"snapshot":{"presence":[],"health":{},"stateVersion":{"presence":0,"health":0},"uptimeMs":0},"auth":{},"policy":{}}}
+                    {"type":"res","id":"\(request
+                        .id)","ok":true,"payload":{"type":"hello","protocol":3,"server":{},"features":{},"snapshot":{"presence":[],"health":{},"stateVersion":{"presence":0,"health":0},"uptimeMs":0},"auth":{},"policy":{}}}
                     """)
                 }
                 return .string("""
@@ -75,7 +76,11 @@ private final class FakeWebSocketTask: WebSocketTasking, @unchecked Sendable {
 private final class FakeWebSocketSession: WebSocketSessioning, @unchecked Sendable {
     let task = FakeWebSocketTask()
 
-    func makeWebSocketTask(url _: URL) -> WebSocketTaskBox {
+    func makeWebSocketTask(url: URL) -> WebSocketTaskBox {
+        self.makeWebSocketTask(request: URLRequest(url: url))
+    }
+
+    func makeWebSocketTask(request _: URLRequest) -> WebSocketTaskBox {
         WebSocketTaskBox(task: self.task)
     }
 }
@@ -173,7 +178,86 @@ private func makeTestGatewayConnection() -> (GatewayConnection, FakeWebSocketSes
 
         let json = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
         let params = json?["params"] as? [String: Any]
+        #expect(params?["thinking"] == nil)
         #expect(params?["voiceWakeTrigger"] as? String == "")
+    }
+
+    @Test func `chat send carries routing precondition and omits inherited thinking`() async throws {
+        let recorder = WebSocketMessageRecorder()
+        let session = GatewayTestWebSocketSession(taskFactory: {
+            GatewayTestWebSocketTask(sendHook: { task, message, sendIndex in
+                recorder.append(message)
+                guard sendIndex > 0,
+                      let data = Self.messageData(message),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let id = json["id"] as? String
+                else { return }
+                task.emitReceiveSuccess(.data(Self.chatSendOkResponseData(id: id)))
+            })
+        })
+        let connection = GatewayConnection(
+            configProvider: {
+                (url: URL(string: "ws://127.0.0.1:1")!, token: nil, password: nil)
+            },
+            sessionBox: WebSocketSessionBox(session: session))
+
+        _ = try await connection.chatSend(
+            sessionKey: "main",
+            expectedSessionRoutingContract: "per-sender|main|main",
+            message: "hello",
+            thinking: nil,
+            idempotencyKey: "chat-1",
+            attachments: [])
+        await connection.shutdown()
+
+        guard let chatMessage = recorder.snapshot().reversed().first(where: { message in
+            guard let data = Self.messageData(message),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return false }
+            return json["method"] as? String == "chat.send"
+        }) else {
+            Issue.record("expected chat.send websocket payload")
+            return
+        }
+
+        guard let payloadData = Self.messageData(chatMessage) else {
+            Issue.record("unexpected chat.send websocket message type")
+            return
+        }
+
+        let json = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
+        let params = json?["params"] as? [String: Any]
+        #expect(params?["thinking"] == nil)
+        #expect(params?["expectedSessionRoutingContract"] as? String == "per-sender|main|main")
+    }
+
+    @Test func `routing identity decodes agent and contract from one response`() throws {
+        let data = Data(#"{"defaultId":"Work","mainKey":"Primary","scope":"global","agents":[]}"#.utf8)
+        let identity = try GatewayConnection.decodeSessionRoutingIdentity(data)
+
+        #expect(identity.defaultAgentID == "Work")
+        #expect(identity.contract == "global|primary|work")
+    }
+
+    @Test(arguments: [
+        (
+            #"{"defaultId":"main","mainKey":"main","scope":"per-sender","agents":[{"id":"main","model":{"primary":"openai/gpt-5.5"}}]}"#,
+            "openai/gpt-5.5"),
+        (
+            #"{"defaultId":"work","mainKey":"main","scope":"per-sender","agents":[{"id":"main","model":{"primary":"openai/gpt-5.5"}},{"id":"work","model":{"primary":"anthropic/claude-opus-4-8"}}]}"#,
+            "anthropic/claude-opus-4-8"),
+        (
+            #"{"defaultId":"main","mainKey":"main","scope":"per-sender","agents":[{"id":"main"},{"id":"work","model":{"primary":"openai/gpt-5.5"}}]}"#,
+            nil),
+        (
+            #"{"defaultId":"main","mainKey":"main","scope":"per-sender","agents":[{"id":"main","model":{"primary":"   "}}]}"#,
+            nil),
+    ])
+    func `configured inference model follows the default agent`(
+        json: String,
+        expected: String?) throws
+    {
+        #expect(try GatewayConnection.decodeConfiguredInferenceModel(Data(json.utf8)) == expected)
     }
 
     private static func messageData(_ message: URLSessionWebSocketTask.Message) -> Data? {
@@ -185,5 +269,16 @@ private func makeTestGatewayConnection() -> (GatewayConnection, FakeWebSocketSes
         @unknown default:
             nil
         }
+    }
+
+    private static func chatSendOkResponseData(id: String) -> Data {
+        Data("""
+        {
+          "type": "res",
+          "id": "\(id)",
+          "ok": true,
+          "payload": { "runId": "chat-1", "status": "ok" }
+        }
+        """.utf8)
     }
 }

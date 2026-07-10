@@ -14,11 +14,13 @@ import (
 )
 
 const (
-	translateMaxAttempts       = 3
-	translateBaseDelay         = 15 * time.Second
-	defaultPromptTimeout       = 2 * time.Minute
-	envDocsI18nPromptTimeout   = "OPENCLAW_DOCS_I18N_PROMPT_TIMEOUT"
-	envDocsI18nCodexExecutable = "OPENCLAW_DOCS_I18N_CODEX_EXECUTABLE"
+	translateMaxAttempts        = 3
+	translateBaseDelay          = 15 * time.Second
+	defaultPromptTimeout        = 2 * time.Minute
+	defaultCommandWaitDelay     = 15 * time.Second
+	envDocsI18nPromptTimeout    = "OPENCLAW_DOCS_I18N_PROMPT_TIMEOUT"
+	envDocsI18nCommandWaitDelay = "OPENCLAW_DOCS_I18N_COMMAND_WAIT_DELAY"
+	envDocsI18nCodexExecutable  = "OPENCLAW_DOCS_I18N_CODEX_EXECUTABLE"
 )
 
 var errEmptyTranslation = errors.New("empty translation")
@@ -28,9 +30,10 @@ var translateRetryDelay = func(attempt int) time.Duration {
 }
 
 type CodexTranslator struct {
-	systemPrompt string
-	thinking     string
-	runPrompt    codexPromptRunner
+	systemPrompt          string
+	exactGlossaryMappings map[string]string
+	thinking              string
+	runPrompt             codexPromptRunner
 }
 
 type docsTranslator interface {
@@ -52,9 +55,10 @@ type codexPromptRequest struct {
 
 func NewCodexTranslator(srcLang, tgtLang string, glossary []GlossaryEntry, thinking string) (*CodexTranslator, error) {
 	return &CodexTranslator{
-		systemPrompt: translationPrompt(srcLang, tgtLang, glossary),
-		thinking:     normalizeThinking(thinking),
-		runPrompt:    runCodexExecPrompt,
+		systemPrompt:          translationPrompt(srcLang, tgtLang, glossary),
+		exactGlossaryMappings: exactGlossaryMappings(glossary),
+		thinking:              normalizeThinking(thinking),
+		runPrompt:             runCodexExecPrompt,
 	}, nil
 }
 
@@ -71,6 +75,9 @@ func (t *CodexTranslator) translate(ctx context.Context, text string, run func(c
 	if core == "" {
 		return text, nil
 	}
+	if translated, ok := t.exactGlossaryMappings[core]; ok {
+		return prefix + translated + suffix, nil
+	}
 	translated, err := t.translateWithRetry(ctx, func(ctx context.Context) (string, error) {
 		return run(ctx, core)
 	})
@@ -78,6 +85,19 @@ func (t *CodexTranslator) translate(ctx context.Context, text string, run func(c
 		return "", err
 	}
 	return prefix + translated + suffix, nil
+}
+
+func exactGlossaryMappings(glossary []GlossaryEntry) map[string]string {
+	mappings := map[string]string{}
+	for _, entry := range glossary {
+		source := strings.TrimSpace(entry.Source)
+		target := strings.TrimSpace(entry.Target)
+		if source == "" || target == "" {
+			continue
+		}
+		mappings[source] = target
+	}
+	return mappings
 }
 
 func (t *CodexTranslator) translateWithRetry(ctx context.Context, run func(context.Context) (string, error)) (string, error) {
@@ -187,7 +207,9 @@ func runCodexExecPrompt(ctx context.Context, req codexPromptRequest) (string, er
 	}
 	outputPath := outputFile.Name()
 	_ = outputFile.Close()
-	defer os.Remove(outputPath)
+	defer func() {
+		_ = os.Remove(outputPath)
+	}()
 
 	codexHomeBase, err := isolatedCodexHomeBase()
 	if err != nil {
@@ -197,7 +219,9 @@ func runCodexExecPrompt(ctx context.Context, req codexPromptRequest) (string, er
 	if err != nil {
 		return "", err
 	}
-	defer os.RemoveAll(codexHome)
+	defer func() {
+		_ = os.RemoveAll(codexHome)
+	}()
 	if err := writeCodexAuthFile(codexHome); err != nil {
 		return "", err
 	}
@@ -214,6 +238,7 @@ func runCodexExecPrompt(ctx context.Context, req codexPromptRequest) (string, er
 		"-",
 	}
 	command := exec.CommandContext(ctx, docsCodexExecutable(), args...)
+	configureCodexPromptCommand(command)
 	command.Stdin = strings.NewReader(buildCodexTranslationPrompt(req.SystemPrompt, req.Message))
 	command.Env = append(os.Environ(), "CODEX_HOME="+codexHome)
 	var stdout bytes.Buffer
@@ -221,9 +246,16 @@ func runCodexExecPrompt(ctx context.Context, req codexPromptRequest) (string, er
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
+		if translated, readErr := readCodexOutputLastMessage(outputPath); readErr == nil {
+			return translated, nil
+		}
 		return "", fmt.Errorf("codex exec failed: %w (%s)", err, previewCommandOutput(stdout.String(), stderr.String()))
 	}
 
+	return readCodexOutputLastMessage(outputPath)
+}
+
+func readCodexOutputLastMessage(outputPath string) (string, error) {
 	data, err := os.ReadFile(outputPath)
 	if err != nil {
 		return "", err
@@ -287,11 +319,16 @@ func previewCommandOutput(stdout, stderr string) string {
 		return "no output"
 	}
 	combined = strings.Join(strings.Fields(combined), " ")
-	const limit = 500
+	const (
+		limit      = 1200
+		headLength = 300
+		tailLength = 800
+	)
 	if len(combined) <= limit {
 		return combined
 	}
-	return combined[:limit] + "..."
+	// Codex prints API failures after its header and prompt, so the tail carries the actionable error.
+	return combined[:headLength] + " ... [truncated] ... " + combined[len(combined)-tailLength:]
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
@@ -324,6 +361,18 @@ func docsI18nPromptTimeout() time.Duration {
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed <= 0 {
 		return defaultPromptTimeout
+	}
+	return parsed
+}
+
+func docsI18nCommandWaitDelay() time.Duration {
+	value := strings.TrimSpace(os.Getenv(envDocsI18nCommandWaitDelay))
+	if value == "" {
+		return defaultCommandWaitDelay
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return defaultCommandWaitDelay
 	}
 	return parsed
 }

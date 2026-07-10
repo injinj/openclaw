@@ -1,17 +1,40 @@
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+// Slack plugin module implements message action dispatch behavior.
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-resolution";
+import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
+import { readBooleanParam } from "openclaw/plugin-sdk/boolean-param";
+import { resolveReactionMessageId } from "openclaw/plugin-sdk/channel-actions";
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";
 import {
   normalizeInteractiveReply,
   normalizeMessagePresentation,
+  renderMessagePresentationFallbackText,
 } from "openclaw/plugin-sdk/interactive-runtime";
-import { readNumberParam, readStringParam } from "openclaw/plugin-sdk/param-readers";
-import { buildSlackInteractiveBlocks, buildSlackPresentationBlocks } from "./blocks-render.js";
+import { readPositiveIntegerParam, readStringParam } from "openclaw/plugin-sdk/param-readers";
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveDefaultSlackAccountId } from "./accounts.js";
+import {
+  buildSlackInteractiveBlocks,
+  buildSlackPresentationBlocks,
+  resolveSlackBlockOffsets,
+} from "./blocks-render.js";
 
 type SlackActionInvoke = (
   action: Record<string, unknown>,
   cfg: ChannelMessageActionContext["cfg"],
   toolContext?: ChannelMessageActionContext["toolContext"],
 ) => Promise<AgentToolResult<unknown>>;
+
+function resolveSlackPresentationText(
+  content: string | undefined,
+  presentation: ReturnType<typeof normalizeMessagePresentation>,
+): string {
+  return presentation?.blocks.some((block) => block.type === "chart")
+    ? renderMessagePresentationFallbackText({ text: content, presentation })
+    : (content ?? "");
+}
 
 /** Translate generic channel action requests into Slack-specific tool invocations and payload shapes. */
 export async function handleSlackMessageAction(params: {
@@ -40,27 +63,36 @@ export async function handleSlackMessageAction(params: {
     const mediaUrl = readStringParam(actionParams, "media", { trim: false });
     const presentation = normalizeMessagePresentation(actionParams.presentation);
     const interactive = normalizeInteractiveReply(actionParams.interactive);
-    const interactiveBlocks = interactive ? buildSlackInteractiveBlocks(interactive) : undefined;
     const presentationBlocks = presentation
       ? buildSlackPresentationBlocks(presentation)
       : undefined;
-    const blocks = presentationBlocks?.length ? presentationBlocks : interactiveBlocks;
-    if (!content && !mediaUrl && !blocks) {
+    const interactiveBlocks = interactive
+      ? buildSlackInteractiveBlocks(interactive, resolveSlackBlockOffsets(presentationBlocks))
+      : undefined;
+    const mergedBlocks = [...(presentationBlocks ?? []), ...(interactiveBlocks ?? [])];
+    const blocks = mergedBlocks.length > 0 ? mergedBlocks : undefined;
+    const accessibleContent = resolveSlackPresentationText(content, presentation);
+    if (!accessibleContent && !mediaUrl && !blocks) {
       throw new Error("Slack send requires message, blocks, or media.");
     }
-    if (mediaUrl && blocks) {
-      throw new Error("Slack send does not support blocks with media.");
+    const replyBroadcast = readBooleanParam(actionParams, "replyBroadcast");
+    if (replyBroadcast && mediaUrl) {
+      throw new Error("Slack replyBroadcast is only supported for text or block thread replies.");
     }
     const threadId = readStringParam(actionParams, "threadId");
     const replyTo = readStringParam(actionParams, "replyTo");
+    const topLevel =
+      readBooleanParam(actionParams, "topLevel") === true || actionParams.threadId === null;
     return await invoke(
       {
         action: "sendMessage",
         to,
-        content: content ?? "",
+        content: accessibleContent,
         mediaUrl: mediaUrl ?? undefined,
         accountId,
         threadTs: threadId ?? replyTo ?? undefined,
+        ...(topLevel ? { topLevel: true } : {}),
+        ...(replyBroadcast ? { replyBroadcast } : {}),
         ...(blocks ? { blocks } : {}),
       },
       cfg,
@@ -69,9 +101,16 @@ export async function handleSlackMessageAction(params: {
   }
 
   if (action === "react") {
-    const messageId = readStringParam(actionParams, "messageId", {
-      required: true,
+    const messageIdRaw = resolveReactionMessageId({
+      args: actionParams,
+      toolContext: ctx.toolContext,
     });
+    if (messageIdRaw == null) {
+      throw new Error(
+        "messageId required. Provide messageId explicitly or react to the current inbound message.",
+      );
+    }
+    const messageId = String(messageIdRaw);
     const emoji = readStringParam(actionParams, "emoji", { allowEmpty: true });
     const remove = typeof actionParams.remove === "boolean" ? actionParams.remove : undefined;
     return await invoke(
@@ -91,7 +130,9 @@ export async function handleSlackMessageAction(params: {
     const messageId = readStringParam(actionParams, "messageId", {
       required: true,
     });
-    const limit = readNumberParam(actionParams, "limit", { integer: true });
+    const limit = readPositiveIntegerParam(actionParams, "limit", {
+      message: "limit must be a positive integer.",
+    });
     return await invoke(
       {
         action: "reactions",
@@ -105,13 +146,16 @@ export async function handleSlackMessageAction(params: {
   }
 
   if (action === "read") {
-    const limit = readNumberParam(actionParams, "limit", { integer: true });
+    const limit = readPositiveIntegerParam(actionParams, "limit", {
+      message: "limit must be a positive integer.",
+    });
     const readAction: Record<string, unknown> = {
       action: "readMessages",
       channelId: resolveChannelId(),
       limit,
       before: readStringParam(actionParams, "before"),
       after: readStringParam(actionParams, "after"),
+      messageId: readStringParam(actionParams, "messageId"),
       accountId,
     };
     if (includeReadThreadId) {
@@ -127,7 +171,8 @@ export async function handleSlackMessageAction(params: {
     const content = readStringParam(actionParams, "message", { allowEmpty: true });
     const presentation = normalizeMessagePresentation(actionParams.presentation);
     const blocks = presentation ? buildSlackPresentationBlocks(presentation) : undefined;
-    if (!content && !blocks) {
+    const accessibleContent = resolveSlackPresentationText(content, presentation);
+    if (!accessibleContent && !blocks) {
       throw new Error("Slack edit requires message or blocks.");
     }
     return await invoke(
@@ -135,7 +180,7 @@ export async function handleSlackMessageAction(params: {
         action: "editMessage",
         channelId: resolveChannelId(),
         messageId,
-        content: content ?? "",
+        content: accessibleContent,
         blocks,
         accountId,
       },
@@ -175,16 +220,39 @@ export async function handleSlackMessageAction(params: {
   }
 
   if (action === "member-info") {
-    const userId = readStringParam(actionParams, "userId", { required: true });
+    const requesterAccountId = ctx.requesterAccountId
+      ? normalizeAccountId(ctx.requesterAccountId)
+      : undefined;
+    const targetAccountId = normalizeAccountId(accountId ?? resolveDefaultSlackAccountId(cfg));
+    const requesterUserId =
+      normalizeOptionalLowercaseString(ctx.toolContext?.currentChannelProvider) === "slack" &&
+      requesterAccountId !== undefined &&
+      requesterAccountId === targetAccountId
+        ? normalizeOptionalString(ctx.requesterSenderId)
+        : undefined;
+    const userId = readStringParam(actionParams, "userId") ?? requesterUserId;
+    if (!userId) {
+      throw new Error("member-info requires a userId outside a current Slack conversation.");
+    }
     return await invoke({ action: "memberInfo", userId, accountId }, cfg);
   }
 
   if (action === "emoji-list") {
-    const limit = readNumberParam(actionParams, "limit", { integer: true });
+    const limit = readPositiveIntegerParam(actionParams, "limit", {
+      message: "limit must be a positive integer.",
+    });
     return await invoke({ action: "emojiList", limit, accountId }, cfg);
   }
 
   if (action === "download-file") {
+    const fileIdParam = readStringParam(actionParams, "fileId");
+    const messageIdParam =
+      readStringParam(actionParams, "messageId") ?? readStringParam(actionParams, "message_id");
+    if (!fileIdParam && messageIdParam) {
+      throw new Error(
+        "download-file requires fileId (the Slack file id, for example F0B0LTT8M36 from event.files[].id), not messageId. Did you mean to pass fileId? messageId is the Slack message timestamp and is used by react / reactions / edit / delete / pin / unpin actions, not download-file.",
+      );
+    }
     const fileId = readStringParam(actionParams, "fileId", { required: true });
     const channelId =
       readStringParam(actionParams, "channelId") ?? readStringParam(actionParams, "to");
@@ -199,10 +267,15 @@ export async function handleSlackMessageAction(params: {
         accountId,
       },
       cfg,
+      ctx.toolContext,
     );
   }
 
   if (action === "upload-file") {
+    const replyBroadcast = readBooleanParam(actionParams, "replyBroadcast");
+    if (replyBroadcast) {
+      throw new Error("Slack replyBroadcast is only supported for text or block thread replies.");
+    }
     const to = readStringParam(actionParams, "to") ?? resolveChannelId();
     const filePath =
       readStringParam(actionParams, "filePath", { trim: false }) ??
@@ -213,6 +286,8 @@ export async function handleSlackMessageAction(params: {
     }
     const threadId =
       readStringParam(actionParams, "threadId") ?? readStringParam(actionParams, "replyTo");
+    const topLevel =
+      readBooleanParam(actionParams, "topLevel") === true || actionParams.threadId === null;
     return await invoke(
       {
         action: "uploadFile",
@@ -225,6 +300,7 @@ export async function handleSlackMessageAction(params: {
         filename: readStringParam(actionParams, "filename"),
         title: readStringParam(actionParams, "title"),
         threadTs: threadId ?? undefined,
+        ...(topLevel ? { topLevel: true } : {}),
         accountId,
       },
       cfg,

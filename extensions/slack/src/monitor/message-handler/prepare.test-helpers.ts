@@ -1,7 +1,10 @@
+// Slack helper module supports prepare helpers behavior.
 import fs from "node:fs";
 import path from "node:path";
 import type { App } from "@slack/bolt";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 import type { ResolvedSlackAccount } from "../../accounts.js";
@@ -15,6 +18,8 @@ export function createInboundSlackTestContext(params: {
   replyToMode?: "off" | "all" | "first" | "batched";
   channelsConfig?: SlackChannelConfigEntries;
   threadRequireExplicitMention?: boolean;
+  dmHistoryLimit?: number;
+  channelRuntime?: ChannelRuntimeSurface;
 }) {
   return createSlackMonitorContext({
     cfg: params.cfg,
@@ -22,16 +27,18 @@ export function createInboundSlackTestContext(params: {
     botToken: "token",
     app: { client: params.appClient ?? {} } as App,
     runtime: {} as RuntimeEnv,
+    channelRuntime: params.channelRuntime ?? createPluginRuntimeMock().channel,
     botUserId: "B1",
     botId: "B1",
     teamId: "T1",
     apiAppId: "A1",
     historyLimit: 0,
+    dmHistoryLimit: params.dmHistoryLimit,
     sessionScope: "per-sender",
     mainKey: "main",
     dmEnabled: true,
     dmPolicy: "open",
-    allowFrom: [],
+    allowFrom: ["*"],
     allowNameMatching: false,
     groupDmEnabled: true,
     groupDmChannels: [],

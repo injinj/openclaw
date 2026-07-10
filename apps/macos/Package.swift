@@ -19,9 +19,10 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-subprocess.git", from: "0.4.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.10.1"),
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.0"),
-        .package(url: "https://github.com/steipete/Peekaboo.git", exact: "3.0.0-beta4"),
+        .package(url: "https://github.com/steipete/Peekaboo.git", exact: "3.5.2"),
+        .package(url: "https://github.com/pointfreeco/swift-concurrency-extras", from: "1.3.1"),
         .package(path: "../shared/OpenClawKit"),
-        .package(path: "../../Swabble"),
+        .package(path: "../swabble"),
     ],
     targets: [
         .target(
@@ -54,9 +55,11 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "PeekabooBridge", package: "Peekaboo"),
                 .product(name: "PeekabooAutomationKit", package: "Peekaboo"),
+                .product(name: "ConcurrencyExtras", package: "swift-concurrency-extras"),
             ],
             exclude: [
                 "Resources/Info.plist",
+                "Resources/Localizable.xcstrings",
             ],
             resources: [
                 .copy("Resources/OpenClaw.icns"),
@@ -81,7 +84,9 @@ let package = Package(
             dependencies: [
                 "OpenClawIPC",
                 "OpenClaw",
+                "OpenClawMacCLI",
                 "OpenClawDiscovery",
+                .product(name: "OpenClawKit", package: "OpenClawKit"),
                 .product(name: "OpenClawProtocol", package: "OpenClawKit"),
                 .product(name: "SwabbleKit", package: "swabble"),
             ],

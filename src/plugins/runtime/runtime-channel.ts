@@ -1,3 +1,5 @@
+// Runtime channel helpers adapt channel plugin APIs into core channel send and reply flows.
+import { convertMarkdownTables } from "../../../packages/markdown-core/src/tables.js";
 import { resolveEffectiveMessagesConfig, resolveHumanDelayConfig } from "../../agents/identity.js";
 import {
   chunkByNewline,
@@ -14,7 +16,7 @@ import {
   shouldComputeCommandAuthorized,
 } from "../../auto-reply/command-detection.js";
 import { shouldHandleTextCommands } from "../../auto-reply/commands-registry.js";
-import { withReplyDispatcher } from "../../auto-reply/dispatch.js";
+import { settleReplyDispatcher, withReplyDispatcher } from "../../auto-reply/dispatch.js";
 import {
   formatAgentEnvelope,
   formatInboundEnvelope,
@@ -40,6 +42,7 @@ import {
   shouldAckReaction,
 } from "../../channels/ack-reactions.js";
 import { resolveCommandAuthorizedFromAuthorizers } from "../../channels/command-gating.js";
+import { buildChannelInboundEventContext } from "../../channels/inbound-event/context.js";
 import {
   implicitMentionKindWhen,
   resolveInboundMentionDecision,
@@ -51,19 +54,29 @@ import {
 import { loadChannelOutboundAdapter } from "../../channels/plugins/outbound/load.js";
 import { recordInboundSession } from "../../channels/session.js";
 import {
+  dispatchChannelInboundReply,
+  runChannelInboundEvent,
+  runPreparedInboundReply,
+} from "../../channels/turn/kernel.js";
+import {
   resolveChannelGroupPolicy,
   resolveChannelGroupRequireMention,
 } from "../../config/group-policy.js";
 import { resolveMarkdownTableMode } from "../../config/markdown-tables.js";
+import { resolveStorePath } from "../../config/sessions.js";
+import { resolveSessionEntryResetFreshness } from "../../config/sessions/entry-freshness.js";
 import {
   readSessionUpdatedAt,
-  recordSessionMetaFromInbound,
-  resolveStorePath,
-  updateLastRoute,
-} from "../../config/sessions.js";
+  recordInboundSessionMeta,
+  updateSessionLastRoute,
+} from "../../config/sessions/session-accessor.js";
 import { getChannelActivity, recordChannelActivity } from "../../infra/channel-activity.js";
-import { convertMarkdownTables } from "../../markdown/tables.js";
-import { fetchRemoteMedia } from "../../media/fetch.js";
+import {
+  fetchRemoteMedia,
+  readRemoteMediaBuffer,
+  saveRemoteMedia,
+  saveResponseMedia,
+} from "../../media/fetch.js";
 import { saveMediaBuffer } from "../../media/store.js";
 import { buildPairingReply } from "../../pairing/pairing-messages.js";
 import {
@@ -75,6 +88,16 @@ import { createChannelRuntimeContextRegistry } from "./channel-runtime-contexts.
 import type { PluginRuntime } from "./types.js";
 
 export function createRuntimeChannel(): PluginRuntime["channel"] {
+  const sessionRuntime = {
+    resolveStorePath,
+    readSessionUpdatedAt,
+    // Plugin runtime property names are a shipped contract; the implementations
+    // route through the session accessor boundary.
+    recordSessionMetaFromInbound: recordInboundSessionMeta,
+    recordInboundSession,
+    updateLastRoute: updateSessionLastRoute,
+    resolveEntryResetFreshness: resolveSessionEntryResetFreshness,
+  };
   const channelRuntime = {
     text: {
       chunkByNewline,
@@ -95,6 +118,7 @@ export function createRuntimeChannel(): PluginRuntime["channel"] {
       resolveHumanDelayConfig,
       dispatchReplyFromConfig,
       withReplyDispatcher,
+      settleReplyDispatcher,
       finalizeInboundContext,
       formatAgentEnvelope,
       /** @deprecated Prefer `BodyForAgent` + structured user-context blocks (do not build plaintext envelopes for prompts). */
@@ -120,20 +144,17 @@ export function createRuntimeChannel(): PluginRuntime["channel"] {
         }),
     },
     media: {
+      readRemoteMediaBuffer,
       fetchRemoteMedia,
+      saveRemoteMedia,
+      saveResponseMedia,
       saveMediaBuffer,
     },
     activity: {
       record: recordChannelActivity,
       get: getChannelActivity,
     },
-    session: {
-      resolveStorePath,
-      readSessionUpdatedAt,
-      recordSessionMetaFromInbound,
-      recordInboundSession,
-      updateLastRoute,
-    },
+    session: sessionRuntime,
     mentions: {
       buildMentionRegexes,
       matchesMentionPatterns,
@@ -163,6 +184,12 @@ export function createRuntimeChannel(): PluginRuntime["channel"] {
     },
     outbound: {
       loadAdapter: loadChannelOutboundAdapter,
+    },
+    inbound: {
+      buildContext: buildChannelInboundEventContext,
+      run: runChannelInboundEvent,
+      runPreparedReply: runPreparedInboundReply,
+      dispatchReply: dispatchChannelInboundReply,
     },
     threadBindings: {
       setIdleTimeoutBySessionKey: ({ channelId, targetSessionKey, accountId, idleTimeoutMs }) =>

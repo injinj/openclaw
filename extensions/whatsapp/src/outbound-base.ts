@@ -1,16 +1,17 @@
+// Whatsapp plugin module implements outbound base behavior.
 import {
   DEFAULT_ACCOUNT_ID,
   listCombinedAccountIds,
   normalizeOptionalAccountId,
   resolveListedDefaultAccountId,
 } from "openclaw/plugin-sdk/account-core";
+import { resolveOutboundSendDep } from "openclaw/plugin-sdk/channel-outbound";
 import {
+  attachChannelToResult,
   createAttachedChannelResultAdapter,
   type ChannelOutboundAdapter,
 } from "openclaw/plugin-sdk/channel-send-result";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
-import { sanitizeForPlainText } from "openclaw/plugin-sdk/outbound-runtime";
-import { resolveOutboundSendDep } from "openclaw/plugin-sdk/outbound-send-deps";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { sendTextMediaPayload } from "openclaw/plugin-sdk/reply-payload";
 import {
   normalizeWhatsAppOutboundPayload,
@@ -33,6 +34,7 @@ type WhatsAppSendTextOptions = {
   mediaReadFile?: (filePath: string) => Promise<Buffer>;
   gifPlayback?: boolean;
   audioAsVoice?: boolean;
+  forceDocument?: boolean;
   accountId?: string;
   quotedMessageKey?: {
     id: string;
@@ -42,6 +44,8 @@ type WhatsAppSendTextOptions = {
     messageText?: string;
   };
   preserveLeadingWhitespace?: boolean;
+  /** Report each accepted internal platform send before the next fallible send. */
+  onDeliveryResult?: (result: { messageId: string; toJid: string }) => Promise<void> | void;
 };
 type WhatsAppSendMessage = (
   to: string,
@@ -90,6 +94,7 @@ type WhatsAppOutboundBaseCore = Pick<
   | "chunkerMode"
   | "textChunkLimit"
   | "sanitizeText"
+  | "deliveryCapabilities"
   | "pollMaxOptions"
   | "resolveTarget"
   | "sendText"
@@ -112,6 +117,7 @@ export function createWhatsAppOutboundBase({
   | "chunkerMode"
   | "textChunkLimit"
   | "sanitizeText"
+  | "deliveryCapabilities"
   | "pollMaxOptions"
   | "resolveTarget"
   | "sendPayload"
@@ -144,32 +150,56 @@ export function createWhatsAppOutboundBase({
     chunker,
     chunkerMode: "text",
     textChunkLimit: 4000,
-    sanitizeText: ({ text }) => sanitizeForPlainText(text),
+    sanitizeText: ({ text }) => normalizeText(text),
+    deliveryCapabilities: {
+      durableFinal: {
+        text: true,
+        replyTo: true,
+        messageSendingHooks: true,
+      },
+    },
     pollMaxOptions: 12,
     resolveTarget,
     ...createAttachedChannelResultAdapter({
       channel: "whatsapp",
-      sendText: async ({ cfg, to, text, accountId, deps, gifPlayback, replyToId }) => {
+      sendText: async ({
+        cfg,
+        to,
+        text,
+        accountId,
+        deps,
+        gifPlayback,
+        replyToId,
+        onDeliveryResult,
+      }) => {
         const normalizedText = normalizeText(text);
         if (skipEmptyText && !normalizedText) {
           return { messageId: "" };
         }
-        const send =
-          resolveOutboundSendDep<WhatsAppSendMessage>(deps, "whatsapp", {
-            legacyKeys: WHATSAPP_LEGACY_OUTBOUND_SEND_DEP_KEYS,
-          }) ?? sendMessageWhatsApp;
         const lookupAccountId = resolveQuoteLookupAccountId(cfg, accountId);
         const quotedMessageKey = resolveQuotedMessageKey({
           accountId: lookupAccountId,
           to,
           replyToId,
         });
+        const send = quotedMessageKey
+          ? sendMessageWhatsApp
+          : (resolveOutboundSendDep<WhatsAppSendMessage>(deps, "whatsapp", {
+              legacyKeys: WHATSAPP_LEGACY_OUTBOUND_SEND_DEP_KEYS,
+            }) ?? sendMessageWhatsApp);
         return await send(to, normalizedText, {
           verbose: false,
           cfg,
           accountId: accountId ?? undefined,
           gifPlayback,
-          quotedMessageKey,
+          ...(quotedMessageKey ? { quotedMessageKey } : {}),
+          ...(onDeliveryResult
+            ? {
+                onDeliveryResult: async (result) => {
+                  await onDeliveryResult(attachChannelToResult("whatsapp", result));
+                },
+              }
+            : {}),
         });
       },
       sendMedia: async ({
@@ -184,18 +214,21 @@ export function createWhatsAppOutboundBase({
         accountId,
         deps,
         gifPlayback,
+        forceDocument,
         replyToId,
+        onDeliveryResult,
       }) => {
-        const send =
-          resolveOutboundSendDep<WhatsAppSendMessage>(deps, "whatsapp", {
-            legacyKeys: WHATSAPP_LEGACY_OUTBOUND_SEND_DEP_KEYS,
-          }) ?? sendMessageWhatsApp;
         const lookupAccountId = resolveQuoteLookupAccountId(cfg, accountId);
         const quotedMessageKey = resolveQuotedMessageKey({
           accountId: lookupAccountId,
           to,
           replyToId,
         });
+        const send = quotedMessageKey
+          ? sendMessageWhatsApp
+          : (resolveOutboundSendDep<WhatsAppSendMessage>(deps, "whatsapp", {
+              legacyKeys: WHATSAPP_LEGACY_OUTBOUND_SEND_DEP_KEYS,
+            }) ?? sendMessageWhatsApp);
         return await send(to, normalizeText(text), {
           verbose: false,
           cfg,
@@ -206,7 +239,15 @@ export function createWhatsAppOutboundBase({
           ...(audioAsVoice === undefined ? {} : { audioAsVoice }),
           accountId: accountId ?? undefined,
           gifPlayback,
-          quotedMessageKey,
+          forceDocument,
+          ...(quotedMessageKey ? { quotedMessageKey } : {}),
+          ...(onDeliveryResult
+            ? {
+                onDeliveryResult: async (result) => {
+                  await onDeliveryResult(attachChannelToResult("whatsapp", result));
+                },
+              }
+            : {}),
         });
       },
       sendPoll: async ({ cfg, to, poll, accountId }) =>
@@ -220,6 +261,9 @@ export function createWhatsAppOutboundBase({
   return {
     ...outbound,
     sendPayload: async (ctx) => {
+      if (ctx.payload.isError === true) {
+        return { channel: "whatsapp", messageId: "" };
+      }
       const payload = normalizeWhatsAppOutboundPayload(ctx.payload, { normalizeText });
       if (!payload.text && !(payload.mediaUrl || payload.mediaUrls?.length)) {
         if (ctx.payload.interactive || ctx.payload.presentation || ctx.payload.channelData) {

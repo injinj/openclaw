@@ -1,3 +1,5 @@
+// Unit-fast test discovery and classification helpers for fast local routing.
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -14,6 +16,7 @@ const unitFastCandidateGlobs = [
   "packages/plugin-package-contract/**/*.test.ts",
   "src/acp/**/*.test.ts",
   "src/agents/**/*.test.ts",
+  "src/skills/**/*.test.ts",
   "src/auto-reply/**/*.test.ts",
   "src/bootstrap/**/*.test.ts",
   "src/channels/**/*.test.ts",
@@ -29,7 +32,9 @@ const unitFastCandidateGlobs = [
   "src/interactive/**/*.test.ts",
   "src/link-understanding/**/*.test.ts",
   "src/logging/**/*.test.ts",
-  "src/markdown/**/*.test.ts",
+  "packages/markdown-core/src/**/*.test.ts",
+  "packages/media-core/src/**/*.test.ts",
+  "packages/terminal-core/src/**/*.test.ts",
   "src/media/**/*.test.ts",
   "src/media-generation/**/*.test.ts",
   "src/media-understanding/**/*.test.ts",
@@ -46,7 +51,6 @@ const unitFastCandidateGlobs = [
   "src/routing/**/*.test.ts",
   "src/sessions/**/*.test.ts",
   "src/shared/**/*.test.ts",
-  "src/terminal/**/*.test.ts",
   "src/test-utils/**/*.test.ts",
   "src/tasks/**/*.test.ts",
   "src/tts/**/*.test.ts",
@@ -65,7 +69,12 @@ export const forcedUnitFastTestFiles = [
   "packages/memory-host-sdk/src/host/qmd-process.test.ts",
   "packages/memory-host-sdk/src/host/session-files.test.ts",
   "src/acp/client.test.ts",
+  "src/acp/control-plane/manager.backend-failover.test.ts",
+  "src/acp/control-plane/manager.failover.test.ts",
+  "src/acp/control-plane/manager.runtime-config.test.ts",
+  "src/acp/control-plane/manager.runtime-handles.test.ts",
   "src/acp/control-plane/manager.test.ts",
+  "src/acp/control-plane/manager.turn-results.test.ts",
   "src/acp/session-mapper.test.ts",
   "src/acp/persistent-bindings.lifecycle.test.ts",
   "src/acp/translator.prompt-prefix.test.ts",
@@ -73,10 +82,18 @@ export const forcedUnitFastTestFiles = [
   "src/acp/translator.stop-reason.test.ts",
   "src/acp/persistent-bindings.test.ts",
   "src/acp/server.startup.test.ts",
+  "src/acp/translator.final-snapshots.test.ts",
+  "src/acp/translator.prompt-size.test.ts",
+  "src/acp/translator.replay.test.ts",
+  "src/acp/translator.session-config.test.ts",
+  "src/acp/translator.session-list.test.ts",
   "src/acp/translator.session-rate-limit.test.ts",
+  "src/acp/translator.session-setup.test.ts",
+  "src/acp/translator.session-snapshot.test.ts",
   "src/acp/translator.set-session-mode.test.ts",
+  "src/acp/translator.tool-streaming.test.ts",
   "src/browser-lifecycle-cleanup.test.ts",
-  "src/canvas-host/server.test.ts",
+  "extensions/canvas/src/host/server.test.ts",
   "src/crestodian/audit.test.ts",
   "src/crestodian/assistant.configured.test.ts",
   "src/crestodian/crestodian.test.ts",
@@ -85,13 +102,13 @@ export const forcedUnitFastTestFiles = [
   "src/crestodian/rescue-policy.test.ts",
   "src/crestodian/rescue-message.test.ts",
   "src/crestodian/tui-backend.test.ts",
-  "src/flows/channel-setup.test.ts",
   "src/flows/channel-setup.status.test.ts",
-  "src/flows/doctor-health-contributions.test.ts",
   "src/flows/provider-flow.test.ts",
   "src/context-engine/context-engine.test.ts",
-  "src/canvas-host/server.state-dir.test.ts",
+  "extensions/canvas/src/host/server.state-dir.test.ts",
   "src/docs/clawhub-plugin-docs.test.ts",
+  "src/docs/channel-config-examples.test.ts",
+  "src/docs/plugin-doc-examples.test.ts",
   "src/docs/install-cloud-secrets.test.ts",
   "src/docker-build-cache.test.ts",
   "src/docker-image-digests.test.ts",
@@ -108,14 +125,6 @@ export const forcedUnitFastTestFiles = [
   "src/install-sh-version.test.ts",
   "src/logger.test.ts",
   "src/library.test.ts",
-  "src/memory-host-sdk/host/embeddings.test.ts",
-  "src/memory-host-sdk/host/internal.test.ts",
-  "src/memory-host-sdk/host/batch-http.test.ts",
-  "src/memory-host-sdk/host/backend-config.test.ts",
-  "src/memory-host-sdk/host/embeddings-remote-fetch.test.ts",
-  "src/memory-host-sdk/host/mirror.test.ts",
-  "src/memory-host-sdk/host/post-json.test.ts",
-  "src/memory-host-sdk/host/session-files.test.ts",
   "src/media-generation/provider-capabilities.contract.test.ts",
   "src/music-generation/runtime.test.ts",
   "src/mcp/channel-server.shutdown-unhandled-rejection.test.ts",
@@ -125,8 +134,6 @@ export const forcedUnitFastTestFiles = [
   "src/node-host/invoke-system-run-plan.test.ts",
   "src/node-host/invoke-system-run.test.ts",
   "src/pairing/pairing-challenge.test.ts",
-  "src/pairing/allow-from-store-read.test.ts",
-  "src/pairing/pairing-store.test.ts",
   "src/pairing/setup-code.test.ts",
   "src/plugin-activation-boundary.test.ts",
   "src/plugin-sdk/memory-host-events.test.ts",
@@ -134,8 +141,8 @@ export const forcedUnitFastTestFiles = [
   "src/proxy-capture/runtime.test.ts",
   "src/proxy-capture/proxy-server.test.ts",
   "src/proxy-capture/store.sqlite.test.ts",
-  "src/realtime-voice/agent-consult-runtime.test.ts",
-  "src/realtime-voice/session-runtime.test.ts",
+  "src/talk/agent-consult-runtime.test.ts",
+  "src/talk/session-runtime.test.ts",
   "src/security/audit-channel-account-metadata.test.ts",
   "src/security/audit-channel-source-config-discord.test.ts",
   "src/security/audit-config-basics.test.ts",
@@ -167,19 +174,19 @@ export const forcedUnitFastTestFiles = [
   "src/security/audit-summary.test.ts",
   "src/security/audit-synced-folder.test.ts",
   "src/security/audit-trust-model.test.ts",
-  "src/security/dm-policy-shared.test.ts",
+  "src/channels/message-access/message-access.test.ts",
   "src/security/audit-plugins-trust.test.ts",
   "src/security/audit-plugin-readonly-scope.test.ts",
   "src/security/audit-loopback-logging.test.ts",
-  "src/security/audit-workspace-skill-escape.test.ts",
+  "src/skills/security/workspace-audit.test.ts",
   "src/security/external-content.test.ts",
   "src/security/fix.test.ts",
   "src/security/scan-paths.test.ts",
-  "src/security/skill-scanner.test.ts",
+  "src/skills/security/scanner.test.ts",
   "src/security/audit-config-include-perms.test.ts",
   "src/security/context-visibility.test.ts",
   "src/realtime-transcription/websocket-session.test.ts",
-  "src/realtime-voice/agent-consult-tool.test.ts",
+  "src/talk/agent-consult-tool.test.ts",
   "src/routing/resolve-route.test.ts",
   "src/sessions/transcript-events.test.ts",
   "src/status/status-message.test.ts",
@@ -193,11 +200,11 @@ export const forcedUnitFastTestFiles = [
   "src/tts/provider-registry.test.ts",
   "src/tts/status-config.test.ts",
   "src/tts/tts-config.test.ts",
-  "src/ui-app-settings.agents-files-refresh.test.ts",
-  "src/terminal/restore.test.ts",
-  "src/terminal/table.test.ts",
+  "packages/terminal-core/src/restore.test.ts",
+  "packages/terminal-core/src/table.test.ts",
   "src/test-helpers/state-dir-env.test.ts",
   "src/test-utils/env.test.ts",
+  "src/test-utils/openclaw-test-state.test.ts",
   "src/test-utils/temp-home.test.ts",
   "src/utils.test.ts",
   "src/version.test.ts",
@@ -205,6 +212,11 @@ export const forcedUnitFastTestFiles = [
 ];
 const forcedUnitFastTestFileSet = new Set(forcedUnitFastTestFiles);
 const unitFastCandidateExactFiles = [...pluginSdkLightTestFiles, ...commandsLightTestFiles];
+const unitFastCandidateExactFileSet = new Set(unitFastCandidateExactFiles);
+const unitFastSourceExactFileSet = new Set([
+  ...pluginSdkLightSourceFiles,
+  ...commandsLightSourceFiles,
+]);
 const broadUnitFastCandidateGlobs = [
   "src/**/*.test.ts",
   "packages/**/*.test.ts",
@@ -223,7 +235,9 @@ const broadUnitFastCandidateSkipGlobs = [
   "src/media-generation/runtime-shared.test.ts",
   "src/music-generation/runtime.test.ts",
   "src/proxy-capture/runtime.test.ts",
+  "src/plugins/install.npm-spec.test.ts",
   "src/plugins/contracts/**/*.test.ts",
+  "src/pairing/pairing-store.test.ts",
   "src/plugin-sdk/browser-subpaths.test.ts",
   "src/security/**/*.test.ts",
   "src/secrets/**/*.test.ts",
@@ -244,7 +258,7 @@ const disqualifyingPatterns = [
   },
   {
     code: "module-mocking-helper",
-    pattern: /(?:runtime-module-mocks|plugins-cli-test-helpers)/u,
+    pattern: /(?:plugins-cli-test-helpers|manager\.test-helpers)/u,
   },
   {
     code: "vitest-mock-api",
@@ -286,6 +300,15 @@ function matchesAnyGlob(file, patterns) {
   return patterns.some((pattern) => path.matchesGlob(file, pattern));
 }
 
+function isUnitFastCandidateFile(file) {
+  return (
+    forcedUnitFastTestFileSet.has(file) ||
+    unitFastCandidateExactFileSet.has(file) ||
+    (matchesAnyGlob(file, unitFastCandidateGlobs) &&
+      !matchesAnyGlob(file, broadUnitFastCandidateSkipGlobs))
+  );
+}
+
 function walkFiles(directory, files = []) {
   let entries;
   try {
@@ -312,15 +335,32 @@ function walkFiles(directory, files = []) {
 
 const walkedTestFilesByCwd = new Map();
 
+function collectRepoTestFilesFromGit(cwd) {
+  const result = spawnSync("git", ["ls-files", "--", "src", "packages", "test"], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+  return result.stdout
+    .split("\n")
+    .map((file) => normalizeRepoPath(file.trim()))
+    .filter((file) => file.endsWith(".test.ts"));
+}
+
 function collectRepoTestFiles(cwd) {
   const normalizedCwd = normalizeRepoPath(cwd);
   const cached = walkedTestFilesByCwd.get(normalizedCwd);
   if (cached) {
     return cached;
   }
-  const files = ["src", "packages", "test"]
-    .flatMap((directory) => walkFiles(path.join(cwd, directory)))
-    .map((file) => normalizeRepoPath(path.relative(cwd, file)));
+  const files =
+    collectRepoTestFilesFromGit(cwd) ??
+    ["src", "packages", "test"]
+      .flatMap((directory) => walkFiles(path.join(cwd, directory)))
+      .map((file) => normalizeRepoPath(path.relative(cwd, file)));
   walkedTestFilesByCwd.set(normalizedCwd, files);
   return files;
 }
@@ -335,29 +375,69 @@ export function classifyUnitFastTestFileContent(source) {
   return reasons;
 }
 
-export function collectUnitFastTestCandidates(cwd = process.cwd()) {
+const unitFastCandidatesByKey = new Map();
+
+function collectUnitFastCandidates(cwd, scope) {
+  const cacheKey = `${normalizeRepoPath(cwd)}\0${scope}`;
+  const cached = unitFastCandidatesByKey.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const broad = scope === "broad";
   const discovered = collectRepoTestFiles(cwd).filter(
     (file) =>
-      matchesAnyGlob(file, unitFastCandidateGlobs) &&
+      matchesAnyGlob(file, broad ? broadUnitFastCandidateGlobs : unitFastCandidateGlobs) &&
       !matchesAnyGlob(file, broadUnitFastCandidateSkipGlobs),
   );
-  return [
+  const candidates = [
     ...new Set([...discovered, ...unitFastCandidateExactFiles, ...forcedUnitFastTestFiles]),
   ].toSorted((a, b) => a.localeCompare(b));
+  // Candidate discovery is immutable for the lifetime of a Vitest/audit process.
+  unitFastCandidatesByKey.set(cacheKey, candidates);
+  return candidates;
+}
+
+export function collectUnitFastTestCandidates(cwd = process.cwd()) {
+  return collectUnitFastCandidates(cwd, "default");
 }
 
 export function collectBroadUnitFastTestCandidates(cwd = process.cwd()) {
-  const discovered = collectRepoTestFiles(cwd).filter(
-    (file) =>
-      matchesAnyGlob(file, broadUnitFastCandidateGlobs) &&
-      !matchesAnyGlob(file, broadUnitFastCandidateSkipGlobs),
-  );
-  return [
-    ...new Set([...discovered, ...unitFastCandidateExactFiles, ...forcedUnitFastTestFiles]),
-  ].toSorted((a, b) => a.localeCompare(b));
+  return collectUnitFastCandidates(cwd, "broad");
 }
 
 const unitFastAnalysisByKey = new Map();
+const unitFastFileAnalysisByKey = new Map();
+
+function analyzeUnitFastTestFile(cwd, file) {
+  const cacheKey = `${normalizeRepoPath(cwd)}\0${file}`;
+  const cached = unitFastFileAnalysisByKey.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  let analysis;
+  try {
+    const source = fs.readFileSync(path.join(cwd, file), "utf8");
+    const reasons = classifyUnitFastTestFileContent(source);
+    const forced = forcedUnitFastTestFileSet.has(file);
+    analysis = {
+      file,
+      unitFast: forced || reasons.length === 0,
+      forced,
+      reasons,
+    };
+  } catch {
+    analysis = {
+      file,
+      unitFast: false,
+      reasons: ["missing-file"],
+    };
+  }
+
+  // Discovery is a process-start snapshot; default and broad audits overlap heavily.
+  unitFastFileAnalysisByKey.set(cacheKey, analysis);
+  return analysis;
+}
 
 export function collectUnitFastTestFileAnalysis(cwd = process.cwd(), options = {}) {
   const cacheKey = `${normalizeRepoPath(cwd)}\0${options.scope ?? "default"}`;
@@ -369,34 +449,15 @@ export function collectUnitFastTestFileAnalysis(cwd = process.cwd(), options = {
     options.scope === "broad"
       ? collectBroadUnitFastTestCandidates(cwd)
       : collectUnitFastTestCandidates(cwd);
-  const analysis = candidates.map((file) => {
-    const absolutePath = path.join(cwd, file);
-    let source = "";
-    try {
-      source = fs.readFileSync(absolutePath, "utf8");
-    } catch {
-      return {
-        file,
-        unitFast: false,
-        reasons: ["missing-file"],
-      };
-    }
-    const reasons = classifyUnitFastTestFileContent(source);
-    const forced = forcedUnitFastTestFileSet.has(file);
-    return {
-      file,
-      unitFast: forced || reasons.length === 0,
-      forced,
-      reasons,
-    };
-  });
+  const analysis = candidates.map((file) => analyzeUnitFastTestFile(cwd, file));
   unitFastAnalysisByKey.set(cacheKey, analysis);
   return analysis;
 }
 
 let cachedUnitFastTestFiles = null;
 let cachedUnitFastTestFileSet = null;
-let cachedSourceToUnitFastTestFile = null;
+let cachedUnitFastTimerTestFiles = null;
+let cachedUnitFastTimerTestFileSet = null;
 
 export function getUnitFastTestFiles() {
   if (cachedUnitFastTestFiles !== null) {
@@ -408,6 +469,16 @@ export function getUnitFastTestFiles() {
   return cachedUnitFastTestFiles;
 }
 
+export function getUnitFastTimerTestFiles() {
+  if (cachedUnitFastTimerTestFiles !== null) {
+    return cachedUnitFastTimerTestFiles;
+  }
+  cachedUnitFastTimerTestFiles = collectUnitFastTestFileAnalysis()
+    .filter((entry) => entry.unitFast && entry.reasons.includes("fake-timers"))
+    .map((entry) => entry.file);
+  return cachedUnitFastTimerTestFiles;
+}
+
 function getUnitFastTestFileSet() {
   if (cachedUnitFastTestFileSet !== null) {
     return cachedUnitFastTestFileSet;
@@ -416,33 +487,57 @@ function getUnitFastTestFileSet() {
   return cachedUnitFastTestFileSet;
 }
 
-function getSourceToUnitFastTestFile() {
-  if (cachedSourceToUnitFastTestFile !== null) {
-    return cachedSourceToUnitFastTestFile;
+function getUnitFastTimerTestFileSet() {
+  if (cachedUnitFastTimerTestFileSet !== null) {
+    return cachedUnitFastTimerTestFileSet;
   }
-  const unitFastTestFileSet = getUnitFastTestFileSet();
-  cachedSourceToUnitFastTestFile = new Map(
-    [...pluginSdkLightSourceFiles, ...commandsLightSourceFiles].flatMap((sourceFile) => {
-      const testFile = sourceFile.replace(/\.ts$/u, ".test.ts");
-      return unitFastTestFileSet.has(testFile) ? [[sourceFile, testFile]] : [];
-    }),
-  );
-  return cachedSourceToUnitFastTestFile;
+  cachedUnitFastTimerTestFileSet = new Set(getUnitFastTimerTestFiles());
+  return cachedUnitFastTimerTestFileSet;
+}
+
+function isUnitFastTestFileOnDemand(file, cwd = process.cwd()) {
+  const normalized = normalizeRepoPath(file);
+  if (!isUnitFastCandidateFile(normalized)) {
+    return false;
+  }
+  return analyzeUnitFastTestFile(cwd, normalized).unitFast;
 }
 
 export function isUnitFastTestFile(file) {
   return getUnitFastTestFileSet().has(normalizeRepoPath(file));
 }
 
+export function isUnitFastTimerTestFile(file) {
+  return getUnitFastTimerTestFileSet().has(normalizeRepoPath(file));
+}
+
 export function resolveUnitFastTestIncludePattern(file) {
   const normalized = normalizeRepoPath(file);
-  const unitFastTestFileSet = getUnitFastTestFileSet();
-  if (unitFastTestFileSet.has(normalized)) {
+  if (isUnitFastTimerTestFile(normalized)) {
+    return null;
+  }
+  if (isUnitFastTestFileOnDemand(normalized)) {
     return normalized;
   }
   const siblingTestFile = normalized.replace(/\.ts$/u, ".test.ts");
-  if (unitFastTestFileSet.has(siblingTestFile)) {
+  if (isUnitFastTimerTestFile(siblingTestFile)) {
+    return null;
+  }
+  if (isUnitFastTestFileOnDemand(siblingTestFile)) {
     return siblingTestFile;
   }
-  return getSourceToUnitFastTestFile().get(normalized) ?? null;
+  if (unitFastSourceExactFileSet.has(normalized)) {
+    const exactTestFile = normalized.replace(/\.ts$/u, ".test.ts");
+    return isUnitFastTestFileOnDemand(exactTestFile) ? exactTestFile : null;
+  }
+  return null;
+}
+
+export function resolveUnitFastTimerTestIncludePattern(file) {
+  const normalized = normalizeRepoPath(file);
+  if (isUnitFastTimerTestFile(normalized)) {
+    return normalized;
+  }
+  const siblingTestFile = normalized.replace(/\.ts$/u, ".test.ts");
+  return isUnitFastTimerTestFile(siblingTestFile) ? siblingTestFile : null;
 }

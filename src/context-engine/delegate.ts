@@ -1,21 +1,13 @@
-import type { CompactEmbeddedPiSessionDirect } from "../agents/pi-embedded-runner/compact.runtime.types.js";
-import { normalizeStructuredPromptSection } from "../agents/prompt-cache-stability.js";
+// Context-engine delegates bridge custom engines to built-in compaction and memory prompt paths.
+import { normalizeStructuredPromptSection } from "@openclaw/ai/internal/shared";
 import type { MemoryCitationsMode } from "../config/types.memory.js";
 import { buildMemoryPromptSection } from "../plugins/memory-state.js";
+import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import type { ContextEngine, CompactResult, ContextEngineRuntimeContext } from "./types.js";
 
-type CompactRuntimeModule = {
-  compactEmbeddedPiSessionDirect: CompactEmbeddedPiSessionDirect;
-};
-
-let compactRuntimePromise: Promise<CompactRuntimeModule> | null = null;
-
-function loadCompactRuntime(): Promise<CompactRuntimeModule> {
-  // Use a literal specifier so the bundler rewrites the runtime chunk path
-  // instead of resolving a source-tree path at runtime.
-  compactRuntimePromise ??= import("../agents/pi-embedded-runner/compact.runtime.js");
-  return compactRuntimePromise;
-}
+const loadCompactRuntime = createLazyRuntimeModule(
+  () => import("../agents/embedded-agent-runner/compact.runtime.js"),
+);
 
 /**
  * Delegate a context-engine compaction request to OpenClaw's built-in runtime compaction path.
@@ -35,10 +27,10 @@ export async function delegateCompactionToRuntime(
 ): Promise<CompactResult> {
   // Load through the dedicated runtime boundary without introducing another
   // source-level static edge into the embedded runner graph.
-  const { compactEmbeddedPiSessionDirect } = await loadCompactRuntime();
-  type RuntimeCompactionParams = Parameters<typeof compactEmbeddedPiSessionDirect>[0];
+  const { compactEmbeddedAgentSessionDirect } = await loadCompactRuntime();
+  type RuntimeCompactionParams = Parameters<typeof compactEmbeddedAgentSessionDirect>[0];
 
-  // runtimeContext carries the full CompactEmbeddedPiSessionParams fields set
+  // runtimeContext carries the full CompactEmbeddedAgentSessionParams fields set
   // by runtime callers. We spread them and override the fields that come from
   // the public ContextEngine compact() signature directly.
   const runtimeContext = (params.runtimeContext ?? {}) as ContextEngineRuntimeContext &
@@ -51,7 +43,7 @@ export async function delegateCompactionToRuntime(
       ? Math.floor(runtimeContext.currentTokenCount)
       : undefined);
 
-  const result = await compactEmbeddedPiSessionDirect({
+  const result = await compactEmbeddedAgentSessionDirect({
     ...runtimeContext,
     sessionId: params.sessionId,
     sessionFile: params.sessionFile,
@@ -59,9 +51,17 @@ export async function delegateCompactionToRuntime(
     ...(currentTokenCount !== undefined ? { currentTokenCount } : {}),
     force: params.force,
     customInstructions: params.customInstructions,
+    abortSignal: params.abortSignal,
     workspaceDir:
       typeof runtimeContext.workspaceDir === "string" ? runtimeContext.workspaceDir : process.cwd(),
   });
+
+  // Post-compaction live session: the runtime reports rotation through the
+  // result sessionId/sessionFile pair; otherwise the input session stays live.
+  const successorSessionId = result.result?.sessionId ?? params.sessionId;
+  const successorSessionFile = result.result?.sessionFile ?? params.sessionFile;
+  const agentId = runtimeContext.sessionTarget?.agentId ?? runtimeContext.agentId;
+  const sessionKey = params.sessionKey ?? runtimeContext.sessionKey;
 
   return {
     ok: result.ok,
@@ -75,7 +75,16 @@ export async function delegateCompactionToRuntime(
           tokensAfter: result.result.tokensAfter,
           details: result.result.details,
           sessionId: result.result.sessionId,
+          // Deprecated raw path stays populated for shipped plugin-sdk readers
+          // of the delegate result; sessionTarget is the canonical successor.
           sessionFile: result.result.sessionFile,
+          sessionTarget: {
+            kind: "file",
+            ...(agentId ? { agentId } : {}),
+            sessionId: successorSessionId,
+            ...(sessionKey ? { sessionKey } : {}),
+            sessionFile: successorSessionFile,
+          },
         }
       : undefined,
   };
@@ -90,10 +99,16 @@ export async function delegateCompactionToRuntime(
 export function buildMemorySystemPromptAddition(params: {
   availableTools: Set<string>;
   citationsMode?: MemoryCitationsMode;
+  agentId?: string;
+  agentSessionKey?: string;
+  sandboxed?: boolean;
 }): string | undefined {
   const lines = buildMemoryPromptSection({
     availableTools: params.availableTools,
     citationsMode: params.citationsMode,
+    agentId: params.agentId,
+    agentSessionKey: params.agentSessionKey,
+    sandboxed: params.sandboxed,
   });
   if (lines.length === 0) {
     return undefined;

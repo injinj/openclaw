@@ -1,10 +1,11 @@
+// Matrix plugin module implements legacy crypto inspector behavior.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { ensureMatrixCryptoRuntime } from "./deps.js";
 
-export type MatrixLegacyCryptoInspectionResult = {
+type MatrixLegacyCryptoInspectionResult = {
   deviceId: string | null;
   roomKeyCounts: {
     total: number;
@@ -13,6 +14,8 @@ export type MatrixLegacyCryptoInspectionResult = {
   backupVersion: string | null;
   decryptionKeyBase64: string | null;
 };
+
+const MATRIX_CRYPTO_STORE_SQLITE = 0;
 
 function resolveLegacyMachineStorePath(params: {
   cryptoRootDir: string;
@@ -56,7 +59,7 @@ export async function inspectLegacyMatrixCryptoStore(params: {
     log: params.log,
   });
 
-  const { DeviceId, OlmMachine, StoreType, UserId } = requireFn(
+  const { DeviceId, OlmMachine, UserId } = requireFn(
     "@matrix-org/matrix-sdk-crypto-nodejs",
   ) as typeof import("@matrix-org/matrix-sdk-crypto-nodejs");
   const machine = await OlmMachine.initialize(
@@ -64,7 +67,7 @@ export async function inspectLegacyMatrixCryptoStore(params: {
     new DeviceId(params.deviceId),
     machineStorePath,
     "",
-    StoreType.Sqlite,
+    MATRIX_CRYPTO_STORE_SQLITE,
   );
 
   try {

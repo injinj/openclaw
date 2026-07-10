@@ -1,10 +1,11 @@
+// Browser tests cover browser utils plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import {
   appendCdpPath,
   getHeadersWithAuth,
   normalizeCdpHttpBaseForJsonEndpoints,
 } from "./cdp.helpers.js";
-import { __test } from "./client-fetch.js";
+import { testApi } from "./client-fetch.js";
 import { resolveBrowserConfig, resolveProfile } from "./config.js";
 import { shouldRejectBrowserMutation } from "./csrf.js";
 import { toBoolean } from "./routes/utils.js";
@@ -198,6 +199,13 @@ describe("cdp.helpers", () => {
     expect(headers.Authorization).toBe(`Basic ${Buffer.from("user:pass").toString("base64")}`);
   });
 
+  it("decodes percent-encoded basic auth credentials from URLs", () => {
+    const headers = getHeadersWithAuth("https://alice:p%40ss%20word@example.com");
+    expect(headers.Authorization).toBe(
+      `Basic ${Buffer.from("alice:p@ss word").toString("base64")}`,
+    );
+  });
+
   it("keeps preexisting authorization headers", () => {
     const headers = getHeadersWithAuth("https://user:pass@example.com", {
       Authorization: "Bearer token",
@@ -206,17 +214,17 @@ describe("cdp.helpers", () => {
   });
 
   it("does not add custom headers when none are required", () => {
-    expect(getHeadersWithAuth("http://127.0.0.1:19444/json/version")).toEqual({});
+    expect(getHeadersWithAuth("http://127.0.0.1:19444/json/version")).toStrictEqual({});
   });
 });
 
 describe("fetchBrowserJson loopback auth (bridge auth registry)", () => {
-  it("falls back to per-port bridge auth when config auth is not available", async () => {
+  it("falls back to per-port bridge auth when config auth is not available", () => {
     const port = 18765;
     const getBridgeAuthForPort = vi.fn((candidate: number) =>
       candidate === port ? { token: "registry-token" } : undefined,
     );
-    const init = __test.withLoopbackBrowserAuth(`http://127.0.0.1:${port}/`, undefined, {
+    const init = testApi.withLoopbackBrowserAuth(`http://127.0.0.1:${port}/`, undefined, {
       getRuntimeConfig: () => ({}),
       resolveBrowserControlAuth: () => ({}),
       getBridgeAuthForPort,
@@ -255,6 +263,12 @@ describe("browser server-context listKnownProfileNames", () => {
       ]),
     };
 
-    expect(listKnownProfileNames(state).toSorted()).toEqual(["openclaw", "stale-removed", "user"]);
+    // "chrome" is the built-in Chrome extension-relay profile.
+    expect(listKnownProfileNames(state).toSorted()).toEqual([
+      "chrome",
+      "openclaw",
+      "stale-removed",
+      "user",
+    ]);
   });
 });

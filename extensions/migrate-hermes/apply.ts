@@ -1,8 +1,15 @@
+// Migrate Hermes plugin module implements apply behavior.
+import fs from "node:fs/promises";
 import path from "node:path";
-import { markMigrationItemSkipped, summarizeMigrationItems } from "openclaw/plugin-sdk/migration";
+import {
+  markMigrationItemError,
+  markMigrationItemSkipped,
+  summarizeMigrationItems,
+} from "openclaw/plugin-sdk/migration";
 import {
   archiveMigrationItem,
   copyMigrationFileItem,
+  withCachedMigrationConfigRuntime,
   writeMigrationReport,
 } from "openclaw/plugin-sdk/migration-runtime";
 import type {
@@ -11,6 +18,8 @@ import type {
   MigrationPlan,
   MigrationProviderContext,
 } from "openclaw/plugin-sdk/plugin-entry";
+import { resolvePreferredOpenClawTmpDir, withTempWorkspace } from "openclaw/plugin-sdk/temp-path";
+import { applyAuthItem } from "./auth.js";
 import { applyConfigItem, applyManualItem } from "./config.js";
 import { appendItem } from "./helpers.js";
 import { applyModelItem } from "./model.js";
@@ -19,53 +28,59 @@ import { applySecretItem } from "./secrets.js";
 import { resolveTargets } from "./targets.js";
 
 const HERMES_REASON_BLOCKED_BY_APPLY_CONFLICT = "blocked by earlier apply conflict";
+const HERMES_STATE_DB_ARCHIVE_ITEM_ID = "archive:state.db";
+const HERMES_STATE_DB_SNAPSHOT_PREFIX = "openclaw-migrate-hermes-state-";
 
-function withCachedConfigRuntime(
-  runtime: MigrationProviderContext["runtime"] | undefined,
-  fallbackConfig: MigrationProviderContext["config"],
-): MigrationProviderContext["runtime"] | undefined {
-  if (!runtime) {
-    return undefined;
+async function archiveHermesItem(item: MigrationItem, reportDir: string): Promise<MigrationItem> {
+  if (item.id !== HERMES_STATE_DB_ARCHIVE_ITEM_ID || !item.source) {
+    return await archiveMigrationItem(item, reportDir);
   }
-  const configApi = runtime.config;
-  if (!configApi?.current || !configApi.mutateConfigFile) {
-    return runtime;
+  const sourcePath = item.source;
+
+  let sourceStat: import("node:fs").Stats;
+  try {
+    sourceStat = await fs.lstat(sourcePath);
+  } catch {
+    return await archiveMigrationItem(item, reportDir);
   }
-  let cachedConfig: MigrationProviderContext["config"] | undefined;
-  const current = (): ReturnType<typeof configApi.current> => {
-    cachedConfig ??= structuredClone(
-      (configApi.current() ?? fallbackConfig) as MigrationProviderContext["config"],
-    );
-    return cachedConfig;
-  };
-  return {
-    ...runtime,
-    config: {
-      ...runtime.config,
-      current,
-      mutateConfigFile: async (params) => {
-        const result = await configApi.mutateConfigFile({
-          ...params,
-          mutate: async (draft, context) => {
-            const mutationResult = await params.mutate(draft, context);
-            cachedConfig = structuredClone(draft);
-            return mutationResult;
-          },
-        });
-        cachedConfig = structuredClone(result.nextConfig);
-        return result;
+  if (!sourceStat.isFile()) {
+    return await archiveMigrationItem(item, reportDir);
+  }
+
+  try {
+    // A raw state.db copy can omit committed rows that still live in state.db-wal.
+    // Snapshot the live database into one self-contained archive artifact.
+    return await withTempWorkspace(
+      { rootDir: resolvePreferredOpenClawTmpDir(), prefix: HERMES_STATE_DB_SNAPSHOT_PREFIX },
+      async ({ dir: tempDir }) => {
+        const snapshotPath = path.join(tempDir, "state.db");
+        const { DatabaseSync } = await import("node:sqlite");
+        const source = new DatabaseSync(sourcePath, { readOnly: true });
+        try {
+          source.exec("PRAGMA busy_timeout = 30000;");
+          source.prepare("VACUUM INTO ?").run(snapshotPath);
+        } finally {
+          source.close();
+        }
+        await fs.chmod(snapshotPath, 0o600);
+        const archived = await archiveMigrationItem({ ...item, source: snapshotPath }, reportDir);
+        return { ...archived, source: sourcePath };
       },
-      ...(configApi.replaceConfigFile
-        ? {
-            replaceConfigFile: async (params) => {
-              const result = await configApi.replaceConfigFile(params);
-              cachedConfig = structuredClone(result.nextConfig);
-              return result;
-            },
-          }
-        : {}),
-    },
-  };
+    );
+  } catch (err) {
+    const snapshotReason = err instanceof Error ? err.message : String(err);
+    const rawArchive = await archiveMigrationItem(item, reportDir);
+    if (rawArchive.status === "migrated") {
+      return markMigrationItemError(
+        rawArchive,
+        `SQLite snapshot failed; raw state.db preserved for manual review: ${snapshotReason}`,
+      );
+    }
+    return markMigrationItemError(
+      rawArchive,
+      `SQLite snapshot failed: ${snapshotReason}; raw archive failed: ${rawArchive.reason ?? rawArchive.status}`,
+    );
+  }
 }
 
 export async function applyHermesPlan(params: {
@@ -77,7 +92,10 @@ export async function applyHermesPlan(params: {
   const reportDir = params.ctx.reportDir ?? path.join(params.ctx.stateDir, "migration", "hermes");
   const targets = resolveTargets(params.ctx);
   const items: MigrationItem[] = [];
-  const runtime = withCachedConfigRuntime(params.ctx.runtime ?? params.runtime, params.ctx.config);
+  const runtime = withCachedMigrationConfigRuntime(
+    params.ctx.runtime ?? params.runtime,
+    params.ctx.config,
+  );
   const applyCtx = { ...params.ctx, runtime };
   let blockedByApplyConflict = false;
   for (const item of plan.items) {
@@ -97,9 +115,11 @@ export async function applyHermesPlan(params: {
     } else if (item.kind === "manual") {
       appliedItem = applyManualItem(item);
     } else if (item.action === "archive") {
-      appliedItem = await archiveMigrationItem(item, reportDir);
+      appliedItem = await archiveHermesItem(item, reportDir);
+    } else if (item.kind === "auth") {
+      appliedItem = await applyAuthItem(applyCtx, item, targets);
     } else if (item.kind === "secret") {
-      appliedItem = await applySecretItem(params.ctx, item, targets);
+      appliedItem = await applySecretItem(applyCtx, item, targets);
     } else if (item.action === "append") {
       appliedItem = await appendItem(item);
     } else {

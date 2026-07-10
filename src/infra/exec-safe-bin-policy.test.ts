@@ -1,3 +1,4 @@
+// Covers safe-bin policy profiles, validation, and generated docs text.
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -26,14 +27,21 @@ function normalizeGeneratedDocBlock(block: string): string {
   while (lines.at(-1)?.trim() === "") {
     lines.pop();
   }
-  const indents = lines
-    .filter((line) => line.trim().length > 0)
-    .map((line) => line.match(/^ */)?.[0].length ?? 0);
-  const commonIndent = Math.min(...indents);
+  let commonIndent = Infinity;
+  for (const line of lines) {
+    if (line.trim().length === 0) {
+      continue;
+    }
+    commonIndent = Math.min(commonIndent, line.match(/^ */)?.[0].length ?? 0);
+  }
   if (commonIndent <= 0) {
     return lines.join("\n");
   }
-  return lines.map((line) => line.slice(Math.min(line.length, commonIndent))).join("\n");
+  const normalizedLines: string[] = [];
+  for (const line of lines) {
+    normalizedLines.push(line.slice(Math.min(line.length, commonIndent)));
+  }
+  return normalizedLines.join("\n");
 }
 
 function buildDeniedFlagArgvVariants(flag: string): string[][] {
@@ -70,9 +78,9 @@ describe("exec safe bin policy grep", () => {
 describe("exec safe bin policy jq", () => {
   const jqProfile = SAFE_BIN_PROFILES.jq;
 
-  it("allows normal jq field filters", () => {
-    expect(validateSafeBinArgv([".foo"], jqProfile, { binName: "jq" })).toBe(true);
-    expect(validateSafeBinArgv([".env"], jqProfile, { binName: "jq" })).toBe(true);
+  it("blocks normal jq field filters in safe-bin mode", () => {
+    expect(validateSafeBinArgv([".foo"], jqProfile, { binName: "jq" })).toBe(false);
+    expect(validateSafeBinArgv([".env"], jqProfile, { binName: "jq" })).toBe(false);
   });
 
   it("blocks jq env builtin filters in safe-bin mode", () => {
