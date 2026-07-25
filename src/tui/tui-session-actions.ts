@@ -13,6 +13,7 @@ import {
 import type { ChatLog } from "./components/chat-log.js";
 import type { TuiAgentsList, TuiBackend, TuiSessionMutationResult } from "./tui-backend.js";
 import { asString, extractTextFromMessage, isCommandMessage } from "./tui-formatters.js";
+import { fingerprintHistory } from "./tui-history-fingerprint.js";
 import { TUI_SESSION_LOOKUP_LIMIT } from "./tui-session-list-policy.js";
 import * as submit from "./tui-submit-state.js";
 import type { SessionInfo, TuiHistoryLoadResult, TuiOptions, TuiStateAccess } from "./tui-types.js";
@@ -458,57 +459,9 @@ export function createSessionActions(context: SessionActionContext) {
     return true;
   };
 
-  /* Fingerprint of the last fully rendered history payload.  loadHistory()
-   * clears the chat log and re-renders every message; because the TUI
-   * renders into normal terminal scrollback, that re-prints the entire
-   * session.  Server-side history mutations that do not change the rendered
-   * transcript (session compaction, duplicate reload triggers) would spam
-   * the whole conversation again — so when the incoming payload renders
-   * identically to what is already displayed, skip the re-render. */
+  /* Fingerprint of the last fully rendered history payload; see
+   * tui-history-fingerprint.ts for why identical payloads skip re-render. */
   let lastHistoryFingerprint: string | null = null;
-
-  const fingerprintHistory = (
-    messages: unknown[],
-    showTools: boolean,
-    showThinking: boolean,
-  ): string => {
-    /* FNV-1a over the fields that influence rendering; cheap + stable */
-    let h = 0x811c9dc5;
-    const mix = (s: string) => {
-      for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i);
-        h = Math.imul(h, 0x01000193);
-      }
-      h ^= 0x1f;
-      h = Math.imul(h, 0x01000193);
-    };
-    mix(`${state.currentSessionKey}|${showTools ? "t" : ""}${showThinking ? "k" : ""}`);
-    let count = 0;
-    for (const entry of messages) {
-      if (!entry || typeof entry !== "object") {
-        continue;
-      }
-      const message = entry as Record<string, unknown>;
-      const role = asString(message.role, "");
-      if (role === "toolResult") {
-        if (!showTools) {
-          continue;
-        }
-        mix(`r|${asString(message.toolCallId, "")}|${asString(message.toolName, "")}`);
-        count++;
-        continue;
-      }
-      const text = extractTextFromMessage(message, {
-        includeThinking: showThinking,
-      });
-      if (!text) {
-        continue;
-      }
-      mix(`${role}|${text}`);
-      count++;
-    }
-    return `${count}:${(h >>> 0).toString(16)}`;
-  };
 
   const loadHistory = async (): Promise<TuiHistoryLoadResult> => {
     // History rebuilds mutate shared UI state after multiple awaits. Only the
@@ -576,7 +529,12 @@ export function createSessionActions(context: SessionActionContext) {
       const showTools = (state.sessionInfo.verboseLevel ?? "off") !== "off";
       const inFlightEarly = record.inFlightRun;
       const inFlightEarlyRunId = asString(inFlightEarly?.runId, "");
-      const fingerprint = fingerprintHistory(record.messages ?? [], showTools, state.showThinking);
+      const fingerprint = fingerprintHistory({
+        messages: record.messages ?? [],
+        sessionKey: state.currentSessionKey,
+        showTools,
+        showThinking: state.showThinking,
+      });
       if (state.historyLoaded && fingerprint === lastHistoryFingerprint) {
         /* identical transcript already on screen: skip the clearAll + full
          * re-render (avoids re-printing the whole session into scrollback
