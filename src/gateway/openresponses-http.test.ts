@@ -10,6 +10,9 @@ import { HISTORY_CONTEXT_MARKER } from "../auto-reply/reply/history.js";
 import { CURRENT_MESSAGE_MARKER } from "../auto-reply/reply/mentions.js";
 import { resetConfigRuntimeState } from "../config/config.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
+import { enqueueCommandInLane } from "../process/command-queue.js";
+import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import { createDeferred } from "../test-utils/deferred.js";
 import { IMAGE_ONLY_USER_MESSAGE } from "./agent-prompt.js";
 import { buildAssistantDeltaResult } from "./test-helpers.agent-results.js";
 import {
@@ -348,6 +351,23 @@ describe("OpenResponses HTTP API (e2e)", () => {
       };
       expect(reservedSessionJson.error?.type).toBe("invalid_request_error");
       expect(reservedSessionJson.error?.message).toBe(
+        "`x-openclaw-session-key` cannot use reserved internal session namespaces.",
+      );
+      expect(agentCommand).toHaveBeenCalledTimes(0);
+
+      const resHarnessSessionOverride = await postResponses(
+        port,
+        { model: "openclaw", input: "hi" },
+        {
+          "x-openclaw-session-key": "agent:main:harness:codex:supervision:spoofed-native-thread",
+        },
+      );
+      expect(resHarnessSessionOverride.status).toBe(400);
+      const harnessSessionJson = (await resHarnessSessionOverride.json()) as {
+        error?: { type?: string; message?: string };
+      };
+      expect(harnessSessionJson.error?.type).toBe("invalid_request_error");
+      expect(harnessSessionJson.error?.message).toBe(
         "`x-openclaw-session-key` cannot use reserved internal session namespaces.",
       );
       expect(agentCommand).toHaveBeenCalledTimes(0);
@@ -1076,6 +1096,36 @@ describe("OpenResponses HTTP API (e2e)", () => {
     } finally {
       await server.close({ reason: "openresponses token auth owner test done" });
     }
+  });
+
+  it("keeps streamed agent work admitted after the HTTP handler returns", async () => {
+    const idleRootCount = getActiveGatewayRootWorkCount();
+    const continueAgent = createDeferred();
+    agentCommand.mockClear();
+    agentCommand.mockImplementationOnce((async () => {
+      await continueAgent.promise;
+      const queued = await enqueueCommandInLane(
+        "openresponses-http-admission-probe",
+        async () => true,
+      );
+      return { payloads: [{ text: queued ? "answer queued" : "unreachable" }] };
+    }) as never);
+
+    const res = await postResponses(enabledPort, {
+      stream: true,
+      model: "openclaw",
+      input: "hi",
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    continueAgent.resolve();
+
+    const events = parseSseEvents(await res.text());
+    expect(collectSseEventTypes(events)).toContain("response.completed");
+    expect(collectSseEventTypes(events)).not.toContain("response.failed");
+    expect(findSseEvent(events, "response.completed").data).toContain("answer queued");
+    await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(idleRootCount));
   });
 
   it("preserves assistant text alongside non-stream function_call output", async () => {
@@ -2100,3 +2150,4 @@ describe("OpenResponses HTTP API (e2e)", () => {
     },
   );
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

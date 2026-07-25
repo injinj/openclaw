@@ -1,21 +1,22 @@
 // Covers safe-bin audit decisions for exec commands.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { collectExecRuntimeFindings } from "./audit.js";
+import { collectSecurityAuditFindings } from "./audit.test-support.js";
+import type { SecurityAuditFinding } from "./audit.types.js";
 
 function hasFinding(
   checkId:
     | "tools.exec.safe_bins_interpreter_unprofiled"
     | "tools.exec.safe_bins_broad_behavior"
     | "tools.exec.safe_bin_trusted_dirs_risky",
-  findings: ReturnType<typeof collectExecRuntimeFindings>,
+  findings: SecurityAuditFinding[],
 ) {
   return findings.some((finding) => finding.checkId === checkId && finding.severity === "warn");
 }
 
 function requireFinding(
   checkId: "tools.exec.safe_bin_trusted_dirs_risky",
-  findings: ReturnType<typeof collectExecRuntimeFindings>,
+  findings: SecurityAuditFinding[],
 ) {
   const finding = findings.find((entry) => entry.checkId === checkId);
   if (!finding) {
@@ -38,6 +39,7 @@ describe("security audit exec safe-bin findings", () => {
           list: [
             {
               id: "ops",
+              default: true,
               tools: {
                 exec: {
                   safeBins: ["node"],
@@ -66,6 +68,7 @@ describe("security audit exec safe-bin findings", () => {
           list: [
             {
               id: "ops",
+              default: true,
               tools: {
                 exec: {
                   safeBins: ["node"],
@@ -84,9 +87,12 @@ describe("security audit exec safe-bin findings", () => {
     },
   ])(
     "warns for interpreter safeBins only when explicit profiles are missing: $name",
-    ({ cfg, expected }) => {
+    async ({ cfg, expected }) => {
       expect(
-        hasFinding("tools.exec.safe_bins_interpreter_unprofiled", collectExecRuntimeFindings(cfg)),
+        hasFinding(
+          "tools.exec.safe_bins_interpreter_unprofiled",
+          await collectSecurityAuditFindings(cfg),
+        ),
       ).toBe(expected);
     },
   );
@@ -95,6 +101,7 @@ describe("security audit exec safe-bin findings", () => {
     {
       name: "jq configured globally",
       cfg: {
+        agents: { list: [{ id: "main", default: true }] },
         tools: {
           exec: {
             safeBins: ["jq"],
@@ -106,6 +113,7 @@ describe("security audit exec safe-bin findings", () => {
     {
       name: "jq not configured",
       cfg: {
+        agents: { list: [{ id: "main", default: true }] },
         tools: {
           exec: {
             safeBins: ["cut"],
@@ -116,19 +124,19 @@ describe("security audit exec safe-bin findings", () => {
     },
   ])(
     "warns when risky broad-behavior bins are explicitly added to safeBins: $name",
-    ({ cfg, expected }) => {
+    async ({ cfg, expected }) => {
       expect(
-        hasFinding("tools.exec.safe_bins_broad_behavior", collectExecRuntimeFindings(cfg)),
+        hasFinding("tools.exec.safe_bins_broad_behavior", await collectSecurityAuditFindings(cfg)),
       ).toBe(expected);
     },
   );
 
-  it("evaluates safeBinTrustedDirs risk findings", () => {
+  it("evaluates safeBinTrustedDirs risk findings", async () => {
     const riskyGlobalTrustedDirs =
       process.platform === "win32"
         ? [String.raw`C:\Users\ci-user\bin`, String.raw`C:\Users\ci-user\.local\bin`]
         : ["/usr/local/bin", "/tmp/openclaw-safe-bins"];
-    const findings = collectExecRuntimeFindings({
+    const findings = await collectSecurityAuditFindings({
       tools: {
         exec: {
           safeBinTrustedDirs: riskyGlobalTrustedDirs,
@@ -138,6 +146,7 @@ describe("security audit exec safe-bin findings", () => {
         list: [
           {
             id: "ops",
+            default: true,
             tools: {
               exec: {
                 safeBinTrustedDirs: ["./relative-bin-dir"],
@@ -155,11 +164,12 @@ describe("security audit exec safe-bin findings", () => {
     expect(riskyFinding.detail).toContain("agents.list.ops.tools.exec");
   });
 
-  it("ignores non-risky absolute dirs", () => {
+  it("ignores non-risky absolute dirs", async () => {
     expect(
       hasFinding(
         "tools.exec.safe_bin_trusted_dirs_risky",
-        collectExecRuntimeFindings({
+        await collectSecurityAuditFindings({
+          agents: { list: [{ id: "main", default: true }] },
           tools: {
             exec: {
               safeBinTrustedDirs: ["/usr/libexec"],

@@ -15,6 +15,9 @@ import { HISTORY_CONTEXT_MARKER } from "../auto-reply/reply/history.js";
 import { CURRENT_MESSAGE_MARKER } from "../auto-reply/reply/mentions.js";
 import { resetConfigRuntimeState } from "../config/config.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
+import { enqueueCommandInLane } from "../process/command-queue.js";
+import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import { createDeferred } from "../test-utils/deferred.js";
 import { buildAssistantDeltaResult } from "./test-helpers.agent-results.js";
 import {
   agentCommand,
@@ -261,6 +264,24 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         const json = (await res.json()) as { error?: { type?: string; message?: string } };
         expect(json.error?.type).toBe("invalid_request_error");
         expect(json.error?.message).toBe("Unknown agent 'missing-agent'.");
+        expect(agentCommand).toHaveBeenCalledTimes(0);
+      }
+
+      {
+        agentCommand.mockClear();
+        const res = await postChatCompletions(
+          port,
+          { model: "openclaw", messages: [{ role: "user", content: "hi" }] },
+          {
+            "x-openclaw-session-key": "agent:main:harness:codex:supervision:spoofed-native-thread",
+          },
+        );
+        expect(res.status).toBe(400);
+        const json = (await res.json()) as { error?: { type?: string; message?: string } };
+        expect(json.error?.type).toBe("invalid_request_error");
+        expect(json.error?.message).toBe(
+          "`x-openclaw-session-key` cannot use reserved internal session namespaces.",
+        );
         expect(agentCommand).toHaveBeenCalledTimes(0);
       }
 
@@ -1812,7 +1833,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
       mode: "token",
       token: "secret",
       rateLimit: { maxAttempts: 1, windowMs: 60_000, lockoutMs: 60_000, exemptLoopback: false },
-    } as any;
+    };
     await withGatewayServer(
       async ({ port }) => {
         const headers = {
@@ -2313,6 +2334,32 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
     },
   );
 
+  it("keeps streamed agent work admitted after the HTTP handler returns", async () => {
+    const idleRootCount = getActiveGatewayRootWorkCount();
+    const continueAgent = createDeferred();
+    agentCommand.mockClear();
+    agentCommand.mockImplementationOnce((async () => {
+      await continueAgent.promise;
+      const queued = await enqueueCommandInLane("openai-http-admission-probe", async () => true);
+      return { payloads: [{ text: queued ? "answer queued" : "unreachable" }] };
+    }) as never);
+
+    const res = await postChatCompletions(enabledPort, {
+      stream: true,
+      model: "openclaw",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    continueAgent.resolve();
+
+    const streamed = parseSseDataLines(await res.text()).join("\n");
+    expect(streamed).toContain("answer queued");
+    expect(streamed).not.toContain("Error: internal error");
+    await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(idleRootCount));
+  });
+
   it("buffers replaceable assistant events for streaming chat completions", async () => {
     const port = enabledPort;
     agentCommand.mockClear();
@@ -2743,3 +2790,4 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
     },
   );
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

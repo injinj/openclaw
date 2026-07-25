@@ -3,9 +3,11 @@
 import { estimateBase64DecodedBytes } from "@openclaw/media-core/base64";
 import { MAX_IMAGE_BYTES } from "@openclaw/media-core/constants";
 import { extensionForMime, mimeTypeFromFilePath } from "@openclaw/media-core/mime";
+import { expectDefined } from "@openclaw/normalization-core";
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import type { MediaFact } from "../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
 import { sniffMimeFromBase64 } from "../media/sniff-mime-from-base64.js";
 import { deleteMediaBuffer, saveMediaBuffer, type SavedMedia } from "../media/store.js";
@@ -34,8 +36,10 @@ export type OffloadedRef = {
 
 type ParsedMessageWithImages = {
   message: string;
+  messageWithoutOffloadedImageRefs: string;
   images: ChatImageContent[];
   imageOrder: PromptImageOrderEntry[];
+  media: MediaFact[];
   offloadedRefs: OffloadedRef[];
 };
 
@@ -58,7 +62,7 @@ type SavedMediaRef = {
 const OFFLOAD_THRESHOLD_BYTES = 2_000_000;
 const TEXT_ONLY_OFFLOAD_LIMIT = 10;
 
-export const DEFAULT_CHAT_ATTACHMENT_MAX_MB = 20;
+const DEFAULT_CHAT_ATTACHMENT_MAX_MB = 20;
 
 export async function persistInboundImagesForTranscript(params: {
   images: ChatImageContent[];
@@ -295,7 +299,7 @@ function normalizeAttachment(
   if (opts.stripDataUrlPrefix) {
     const dataUrlMatch = /^data:[^;]+;base64,(.*)$/.exec(base64);
     if (dataUrlMatch) {
-      base64 = dataUrlMatch[1];
+      base64 = expectDefined(dataUrlMatch[1], "data url match capture group 1");
     }
   }
   return { label, mime, base64 };
@@ -319,13 +323,21 @@ export async function parseMessageWithAttachments(
   const acceptNonImage = opts?.acceptNonImage !== false;
 
   if (!attachments || attachments.length === 0) {
-    return { message, images: [], imageOrder: [], offloadedRefs: [] };
+    return {
+      message,
+      messageWithoutOffloadedImageRefs: message,
+      images: [],
+      imageOrder: [],
+      media: [],
+      offloadedRefs: [],
+    };
   }
 
   const images: ChatImageContent[] = [];
   const imageOrder: PromptImageOrderEntry[] = [];
   const offloadedRefs: OffloadedRef[] = [];
   let updatedMessage = message;
+  let messageWithoutOffloadedImageRefs = message;
   let textOnlyImageOffloadCount = 0;
   const savedMediaIds: string[] = [];
 
@@ -401,7 +413,7 @@ export async function parseMessageWithAttachments(
       // would offload a file the runner later drops to null — a successful
       // response with a silently missing image. Reject here so the client
       // sees an explicit 4xx. Non-image attachments keep the full maxBytes
-      // ceiling because their host path (ctx.MediaPaths → Read/Bash) doesn't
+      // ceiling because their host path (media facts → Read/Bash) doesn't
       // load into the model.
       if (isImage && sizeBytes > MAX_IMAGE_BYTES) {
         throw new Error(
@@ -419,6 +431,8 @@ export async function parseMessageWithAttachments(
             `${TEXT_ONLY_OFFLOAD_LIMIT} was reached`,
         );
         updatedMessage += "\n[image attachment omitted: text-only attachment limit reached]";
+        messageWithoutOffloadedImageRefs +=
+          "\n[image attachment omitted: text-only attachment limit reached]";
         continue;
       }
 
@@ -455,8 +469,10 @@ export async function parseMessageWithAttachments(
       savedMediaIds.push(savedMedia.id);
 
       const mediaRef = `media://inbound/${savedMedia.id}`;
-      if (isImage) {
-        updatedMessage += `\n[media attached: ${mediaRef}]`;
+      const mediaLine = `\n[media attached: ${mediaRef}]`;
+      updatedMessage += mediaLine;
+      if (!isImage) {
+        messageWithoutOffloadedImageRefs += mediaLine;
       }
       log?.info?.(
         shouldForceImageOffload && isImage
@@ -488,8 +504,17 @@ export async function parseMessageWithAttachments(
 
   return {
     message: updatedMessage !== message ? updatedMessage.trimEnd() : message,
+    messageWithoutOffloadedImageRefs:
+      messageWithoutOffloadedImageRefs !== message
+        ? messageWithoutOffloadedImageRefs.trimEnd()
+        : message,
     images,
     imageOrder,
+    media: offloadedRefs.map((ref) => ({
+      path: ref.path,
+      url: ref.mediaRef,
+      contentType: ref.mimeType,
+    })),
     offloadedRefs,
   };
 }

@@ -82,7 +82,23 @@ describe("cron listPage sort guards", () => {
     expect(page.jobs.map((job) => job.id)).toEqual(["job-ops", "job-unset"]);
   });
 
-  it("matches omitted job agent ids to main when no default agent is configured", async () => {
+  it("matches scoped session owners before the configured default", async () => {
+    const jobs = [
+      createBaseJob({
+        id: "job-scoped",
+        agentId: undefined,
+        sessionKey: "agent:ops:main",
+      }),
+    ];
+    const state = createMockCronStateForJobs({ jobs });
+    state.deps.defaultAgentId = "main";
+
+    const page = await listPage(state, { agentId: "ops" });
+
+    expect(page.jobs.map((job) => job.id)).toEqual(["job-scoped"]);
+  });
+
+  it("matches omitted job agent ids to the prepared main default", async () => {
     const jobs = [
       createBaseJob({ id: "job-main", agentId: "main", name: "main" }),
       createBaseJob({ id: "job-ops", agentId: "ops", name: "ops" }),
@@ -105,6 +121,38 @@ describe("cron listPage sort guards", () => {
     const page = await listPage(state);
 
     expect(page.jobs.map((job) => job.id)).toEqual(["job-main", "job-ops"]);
+  });
+
+  it("keeps one revision across pages and changes it for same-count store churn", async () => {
+    const jobs = [
+      createBaseJob({ id: "job-a", name: "alpha" }),
+      createBaseJob({ id: "job-b", name: "beta" }),
+    ];
+    const state = createMockCronStateForJobs({ jobs });
+
+    const firstPage = await listPage(state, { limit: 1, offset: 0, sortBy: "name" });
+    const secondPage = await listPage(state, { limit: 1, offset: 1, sortBy: "name" });
+    expect(secondPage.snapshotRevision).toBe(firstPage.snapshotRevision);
+
+    if (!state.store) {
+      throw new Error("expected loaded cron store");
+    }
+    state.store.jobs = [jobs[1]!, createBaseJob({ id: "job-c", name: "gamma" })];
+    const changedPage = await listPage(state, { limit: 1, offset: 0, sortBy: "name" });
+
+    expect(changedPage.total).toBe(firstPage.total);
+    expect(changedPage.snapshotRevision).not.toBe(firstPage.snapshotRevision);
+  });
+
+  it("detaches returned pages from later in-place store mutations", async () => {
+    const job = createBaseJob({ id: "job-a", name: "alpha" });
+    const state = createMockCronStateForJobs({ jobs: [job] });
+
+    const page = await listPage(state);
+    job.state.lastStatus = "ok";
+
+    expect(page.jobs[0]).not.toBe(job);
+    expect(page.jobs[0]?.state.lastStatus).toBeUndefined();
   });
 
   it("matches job ids in listPage text search", async () => {

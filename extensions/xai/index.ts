@@ -2,7 +2,7 @@ import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 // Xai plugin entrypoint registers its OpenClaw integration.
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
-import { OPENAI_COMPATIBLE_REPLAY_HOOKS } from "openclaw/plugin-sdk/provider-model-shared";
+import { buildProviderReplayFamilyHooks } from "openclaw/plugin-sdk/provider-model-shared";
 import { defaultToolStreamExtraParams } from "openclaw/plugin-sdk/provider-stream-shared";
 import { jsonResult } from "openclaw/plugin-sdk/provider-web-search";
 import {
@@ -21,9 +21,11 @@ import {
   buildLiveXaiProvider,
   buildXaiProvider,
 } from "./provider-catalog.js";
+import { isXaiProviderId } from "./provider-id.js";
 import { isModernXaiModel, resolveXaiForwardCompatModel } from "./provider-models.js";
 import { resolveThinkingProfile } from "./provider-policy-api.js";
 import { buildXaiRealtimeTranscriptionProvider } from "./realtime-transcription-provider.js";
+import { buildXaiRealtimeVoiceProvider } from "./realtime-voice-provider.js";
 import { buildXaiSpeechProvider } from "./speech-provider.js";
 import {
   readPluginCodeExecutionConfig,
@@ -103,7 +105,7 @@ function shouldExposeXaiBilledTool(params: {
   }
   // Cross-provider billing requires explicit consent; xAI models retain the
   // credential-backed default. Unknown providers fail closed.
-  return activeProvider === PROVIDER_ID || params.enabled === true;
+  return isXaiProviderId(activeProvider) || params.enabled === true;
 }
 
 function createLazyCodeExecutionTool(ctx: OpenClawPluginToolContext) {
@@ -247,7 +249,7 @@ export default defineSingleProviderPluginEntry({
         provider: buildXaiProvider(),
       }),
     },
-    ...OPENAI_COMPATIBLE_REPLAY_HOOKS,
+    ...buildProviderReplayFamilyHooks({ family: "openai-compatible" }),
     prepareExtraParams: (ctx) => defaultToolStreamExtraParams(ctx.extraParams),
     wrapStreamFn: wrapXaiProviderStream,
     // Provider-specific fallback auth stays owned by the xAI plugin so core
@@ -282,6 +284,7 @@ export default defineSingleProviderPluginEntry({
     api.registerImageGenerationProvider(buildXaiImageGenerationProvider());
     api.registerSpeechProvider(buildXaiSpeechProvider());
     api.registerRealtimeTranscriptionProvider(buildXaiRealtimeTranscriptionProvider());
+    api.registerRealtimeVoiceProvider(buildXaiRealtimeVoiceProvider());
     api.registerTool((ctx) => createLazyCodeExecutionTool(ctx), { name: "code_execution" });
     api.registerTool((ctx) => createLazyXSearchTool(ctx), { name: "x_search" });
   },

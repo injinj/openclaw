@@ -122,6 +122,81 @@ xAI Responses.
 | [SearXNG](/tools/searxng-search)                 | Structured snippets                                            | Categories, language                             | None (self-hosted)                                                                      |
 | [Tavily](/tools/tavily)                          | Structured snippets                                            | Via `tavily_search` tool                         | `TAVILY_API_KEY`                                                                        |
 
+## Result shape
+
+`web_search` normalizes every bundled and external plugin provider at the core
+tool boundary. Callers receive exactly one of these closed shapes:
+
+```typescript
+type WebSearchOutput =
+  | {
+      kind: "error";
+      provider: string;
+      error: "provider_error";
+      message: string;
+      docs?: string;
+    }
+  | {
+      kind: "results";
+      provider: string;
+      query: string;
+      count: number;
+      tookMs?: number;
+      results: Array<{
+        title: string;
+        url: string;
+        snippet?: string;
+        published?: string;
+        siteName?: string;
+      }>;
+      externalContent: {
+        untrusted: true;
+        source: "web_search";
+        wrapped: true;
+        provider: string;
+      };
+      cached?: true;
+    }
+  | {
+      kind: "answer";
+      provider: string;
+      query: string;
+      tookMs?: number;
+      content: string;
+      citations?: Array<{ url: string; title?: string }>;
+      externalContent: {
+        untrusted: true;
+        source: "web_search";
+        wrapped: true;
+        provider: string;
+      };
+      cached?: true;
+    }
+  | {
+      kind: "raw";
+      provider: string;
+      data: unknown;
+    };
+```
+
+Structured providers use `kind: "results"`; synthesized providers use
+`kind: "answer"`. External plugin providers whose payloads match neither shape
+pass through verbatim as `kind: "raw"` for compatibility. Provider-specific
+fields such as raw scores, excerpts, related searches, inline-citation
+offsets, model ids, or session metadata are not passed through on normalized
+branches. Use a provider's dedicated tool when its richer response is part of
+your workflow.
+
+`externalContent.wrapped: true` is a trust marker the boundary itself makes
+true: provider prose (`title`, `snippet`, `siteName`, `content`, citation
+titles, error `message`) is stripped of any pre-existing envelope lines and
+re-wrapped exactly once at the core boundary, so no provider metadata can spoof
+the marker. `query` is always the requested query, citation and result URLs
+must parse as http(s), `published` must be ISO-date shaped, URLs are emitted canonicalized, and a
+payload carrying an `error` key is always reported as `kind: "error"` with the
+raw provider code preserved inside the wrapped message. Raw passthrough
+payloads keep whatever markers the provider set.
+
 ## Auto-detection
 
 Provider lists in docs and setup flows are alphabetical. Auto-detection uses a
@@ -470,20 +545,21 @@ every provider. xAI credentials are always required.
 `x_search` posts to `<baseUrl>/responses` when
 `plugins.entries.xai.config.xSearch.baseUrl` is set. If that field is omitted,
 it falls back to `plugins.entries.xai.config.webSearch.baseUrl`, then the
-legacy `tools.web.search.grok.baseUrl`, and finally the public xAI endpoint
-(`https://api.x.ai/v1`).
+public xAI endpoint (`https://api.x.ai/v1`).
 
 ### x_search parameters
 
 | Parameter                    | Description                                            |
 | ---------------------------- | ------------------------------------------------------ |
 | `query`                      | Search query (required)                                |
-| `allowed_x_handles`          | Restrict results to specific X handles                 |
-| `excluded_x_handles`         | Exclude specific X handles                             |
+| `allowed_x_handles`          | Restrict results to at most 20 X handles               |
+| `excluded_x_handles`         | Exclude at most 20 X handles                           |
 | `from_date`                  | Only include posts on or after this date (YYYY-MM-DD)  |
 | `to_date`                    | Only include posts on or before this date (YYYY-MM-DD) |
 | `enable_image_understanding` | Let xAI inspect images attached to matching posts      |
 | `enable_video_understanding` | Let xAI inspect videos attached to matching posts      |
+
+`allowed_x_handles` and `excluded_x_handles` are mutually exclusive.
 
 ### x_search example
 
