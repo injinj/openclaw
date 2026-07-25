@@ -1,4 +1,5 @@
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+// Discord plugin module implements runtime.moderation behavior.
+import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
 import {
   type ActionGate,
   jsonResult,
@@ -6,31 +7,20 @@ import {
   type DiscordActionConfig,
   type OpenClawConfig,
 } from "../runtime-api.js";
-import {
-  banMemberDiscord,
-  hasAnyGuildPermissionDiscord,
-  kickMemberDiscord,
-  timeoutMemberDiscord,
-} from "../send.js";
+import { discordModerationActionRuntime } from "./runtime-deps.js";
 import {
   isDiscordModerationAction,
   readDiscordModerationCommand,
   requiredGuildPermissionForModerationAction,
 } from "./runtime.moderation-shared.js";
-
-export const discordModerationActionRuntime = {
-  banMemberDiscord,
-  hasAnyGuildPermissionDiscord,
-  kickMemberDiscord,
-  timeoutMemberDiscord,
-};
+import { createDiscordActionOptions } from "./runtime.shared.js";
 
 async function verifySenderModerationPermission(params: {
   guildId: string;
   senderUserId?: string;
   requiredPermission: bigint;
   accountId?: string;
-  cfgOptions: { cfg: OpenClawConfig };
+  cfg: OpenClawConfig;
 }) {
   // CLI/manual flows may not have sender context; enforce only when present.
   if (!params.senderUserId) {
@@ -40,10 +30,7 @@ async function verifySenderModerationPermission(params: {
     params.guildId,
     params.senderUserId,
     [params.requiredPermission],
-    {
-      ...params.cfgOptions,
-      ...(params.accountId ? { accountId: params.accountId } : {}),
-    },
+    createDiscordActionOptions({ cfg: params.cfg, accountId: params.accountId }),
   );
   if (!hasPermission) {
     throw new Error("Sender does not have required permissions for this moderation action.");
@@ -65,20 +52,16 @@ export async function handleDiscordModerationAction(
   if (!cfg) {
     throw new Error("Discord moderation actions require a resolved runtime config.");
   }
-  const cfgOptions = { cfg };
-  const command = readDiscordModerationCommand(action, params);
   const accountId = readStringParam(params, "accountId");
+  const command = readDiscordModerationCommand(action, params);
   const senderUserId = readStringParam(params, "senderUserId");
-  const withOpts = () => ({
-    ...cfgOptions,
-    ...(accountId ? { accountId } : {}),
-  });
+  const withOpts = () => createDiscordActionOptions({ cfg, accountId });
   await verifySenderModerationPermission({
     guildId: command.guildId,
     senderUserId,
     requiredPermission: requiredGuildPermissionForModerationAction(command.action),
     accountId,
-    cfgOptions,
+    cfg,
   });
   switch (command.action) {
     case "timeout": {

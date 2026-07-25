@@ -160,7 +160,8 @@ actor VoicePushToTalk {
         self.isCapturing = true
         self.triggerChimePlayed = false
         self.finalized = false
-        self.timeoutTask?.cancel(); self.timeoutTask = nil
+        self.timeoutTask?.cancel()
+        self.timeoutTask = nil
         let snapshot = await MainActor.run { VoiceSessionCoordinator.shared.snapshot() }
         self.adoptedPrefix = snapshot.visible ? snapshot.text.trimmingCharacters(in: .whitespacesAndNewlines) : ""
         self.logger.info("ptt begin adopted_prefix_len=\(self.adoptedPrefix.count, privacy: .public)")
@@ -237,8 +238,8 @@ actor VoicePushToTalk {
         }
 
         self.recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        self.recognitionRequest?.shouldReportPartialResults = true
         guard let request = self.recognitionRequest else { return }
+        SpeechRecognitionRequestPolicy.configureInteractiveTranscription(request)
 
         // Lazily create the engine here so app launch doesn't grab audio resources / trigger Bluetooth HFP.
         if self.audioEngine == nil {
@@ -260,9 +261,9 @@ actor VoicePushToTalk {
             input.removeTap(onBus: 0)
             self.tapInstalled = false
         }
-        // Pipe raw mic buffers into the Speech request while the chord is held.
+        // Pipe Speech-compatible mic buffers into the request while the chord is held.
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak request] buffer, _ in
-            request?.append(buffer)
+            request?.append(SpeechAudioBufferNormalizer.speechCompatibleBuffer(from: buffer))
         }
         self.tapInstalled = true
 
@@ -321,7 +322,8 @@ actor VoicePushToTalk {
         }
         self.finalized = true
         self.isCapturing = false
-        self.timeoutTask?.cancel(); self.timeoutTask = nil
+        self.timeoutTask?.cancel()
+        self.timeoutTask = nil
 
         let finalRecognized: String = {
             if let override = transcriptOverride?.trimmingCharacters(in: .whitespacesAndNewlines) {
@@ -348,7 +350,7 @@ actor VoicePushToTalk {
                     VoiceWakeChimePlayer.play(chime, reason: "ptt.fallback_send")
                 }
                 Task.detached {
-                    await VoiceWakeForwarder.forward(transcript: finalText)
+                    await VoiceWakeForwarder.forwardToSelectedSession(transcript: finalText)
                 }
             }
         }

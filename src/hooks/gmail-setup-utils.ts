@@ -1,17 +1,17 @@
+// Gmail setup utilities write helper files and normalize Gmail setup settings.
 import fs from "node:fs";
 import path from "node:path";
-import { hasBinary } from "../agents/skills.js";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { formatErrorMessage } from "../infra/errors.js";
+import { resolveExecutable } from "../infra/executable-path.js";
 import { runCommandWithTimeout, type SpawnResult } from "../process/exec.js";
+import { hasBinary } from "../skills/loading/config.js";
 import { resolveUserPath } from "../utils.js";
 import { normalizeServePath } from "./gmail.js";
 
 let cachedPythonPath: string | null | undefined;
+let gcloudBin: string | undefined;
 const MAX_OUTPUT_CHARS = 800;
-
-export function resetGmailSetupUtilsCachesForTest(): void {
-  cachedPythonPath = undefined;
-}
 
 function trimOutput(value: string): string {
   const trimmed = value.trim();
@@ -21,7 +21,7 @@ function trimOutput(value: string): string {
   if (trimmed.length <= MAX_OUTPUT_CHARS) {
     return trimmed;
   }
-  return `${trimmed.slice(0, MAX_OUTPUT_CHARS)}…`;
+  return `${truncateUtf16Safe(trimmed, MAX_OUTPUT_CHARS)}…`;
 }
 
 function formatCommandResultInternal(
@@ -116,7 +116,7 @@ function ensureGcloudOnPath(): boolean {
   return false;
 }
 
-export async function resolvePythonExecutablePath(): Promise<string | undefined> {
+async function resolvePythonExecutablePath(): Promise<string | undefined> {
   if (cachedPythonPath !== undefined) {
     return cachedPythonPath ?? undefined;
   }
@@ -145,22 +145,18 @@ export async function resolvePythonExecutablePath(): Promise<string | undefined>
   return undefined;
 }
 
-async function gcloudEnv(): Promise<NodeJS.ProcessEnv | undefined> {
-  if (process.env.CLOUDSDK_PYTHON) {
-    return undefined;
-  }
+async function gcloudEnv(): Promise<NodeJS.ProcessEnv> {
   const pythonPath = await resolvePythonExecutablePath();
-  if (!pythonPath) {
-    return undefined;
-  }
-  return { CLOUDSDK_PYTHON: pythonPath };
+  // Always override inherited gcloud Python controls so the launcher cannot
+  // select a workspace-controlled interpreter or word-split injected args.
+  return { CLOUDSDK_PYTHON: pythonPath, CLOUDSDK_PYTHON_ARGS: undefined };
 }
 
 async function runGcloudCommand(
   args: string[],
   timeoutMs: number,
 ): Promise<Awaited<ReturnType<typeof runCommandWithTimeout>>> {
-  return await runCommandWithTimeout(["gcloud", ...args], {
+  return await runCommandWithTimeout([(gcloudBin ??= resolveExecutable("gcloud")), ...args], {
     timeoutMs,
     env: await gcloudEnv(),
   });
@@ -266,6 +262,7 @@ export async function ensureTailscaleEndpoint(params: {
   mode: "off" | "serve" | "funnel";
   path: string;
   port?: number;
+  signal?: AbortSignal;
   target?: string;
   token?: string;
 }): Promise<string> {
@@ -273,10 +270,12 @@ export async function ensureTailscaleEndpoint(params: {
     return "";
   }
 
+  const tailscaleBin = resolveExecutable("tailscale");
   const statusArgs = ["status", "--json"];
   const statusCommand = formatCommand("tailscale", statusArgs);
-  const status = await runCommandWithTimeout(["tailscale", ...statusArgs], {
+  const status = await runCommandWithTimeout([tailscaleBin, ...statusArgs], {
     timeoutMs: 30_000,
+    signal: params.signal,
   });
   if (status.code !== 0) {
     throw new Error(formatCommandFailure(statusCommand, status));
@@ -304,8 +303,9 @@ export async function ensureTailscaleEndpoint(params: {
   const pathArg = normalizeServePath(params.path);
   const funnelArgs = [params.mode, "--bg", "--set-path", pathArg, "--yes", target];
   const funnelCommand = formatCommand("tailscale", funnelArgs);
-  const funnelResult = await runCommandWithTimeout(["tailscale", ...funnelArgs], {
+  const funnelResult = await runCommandWithTimeout([tailscaleBin, ...funnelArgs], {
     timeoutMs: 30_000,
+    signal: params.signal,
   });
   if (funnelResult.code !== 0) {
     throw new Error(formatCommandFailure(funnelCommand, funnelResult));

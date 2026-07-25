@@ -1,13 +1,15 @@
 ---
+doc-schema-version: 1
 summary: "Overview of automation mechanisms: tasks, cron, hooks, standing orders, and Task Flow"
 read_when:
   - Deciding how to automate work with OpenClaw
   - Choosing between heartbeat, cron, hooks, and standing orders
   - Looking for the right automation entry point
-title: "Automation & tasks"
+title: "Automation"
 ---
 
-OpenClaw runs work in the background through tasks, scheduled jobs, event hooks, and standing instructions. This page helps you choose the right mechanism and understand how they fit together.
+OpenClaw runs work in the background through tasks, scheduled jobs, event hooks,
+and standing instructions. Use this page to pick the right mechanism.
 
 ## Quick decision guide
 
@@ -85,22 +87,22 @@ See [Standing Orders](/automation/standing-orders).
 
 Internal hooks are event-driven scripts triggered by agent lifecycle events
 (`/new`, `/reset`, `/stop`), session compaction, gateway startup, and message
-flow. They are automatically discovered from directories and can be managed
-with `openclaw hooks`. For in-process tool-call interception, use
+flow. They are discovered from hook directories and managed with
+`openclaw hooks`. For in-process tool-call interception, use
 [Plugin hooks](/plugins/hooks).
 
 See [Hooks](/automation/hooks).
 
 ### Heartbeat
 
-Heartbeat is a periodic main-session turn (default every 30 minutes). It batches multiple checks (inbox, calendar, notifications) in one agent turn with full session context. Heartbeat turns do not create task records and do not extend daily/idle session reset freshness. Use `HEARTBEAT.md` for a small checklist, or a `tasks:` block when you want due-only periodic checks inside heartbeat itself. Empty heartbeat files skip as `empty-heartbeat-file`; due-only task mode skips as `no-tasks-due`.
+Heartbeat is a periodic main-session turn (default every 30 minutes). It batches checklist-style monitoring (inbox, calendar, notifications) in one agent turn with full session context. Heartbeat turns do not create task records and do not extend daily/idle session reset freshness. Heartbeat scratch is small prompt context; schedule recurring work as cron jobs. Empty heartbeat scratch skips as `empty-heartbeat-file`. Heartbeats defer while cron work is active or queued, and `heartbeat.skipWhenBusy` can also defer an agent while that same agent's session-keyed subagent or nested lanes are busy.
 
 See [Heartbeat](/gateway/heartbeat).
 
 ## How they work together
 
 - **Cron** handles precise schedules (daily reports, weekly reviews) and one-shot reminders. All cron executions create task records.
-- **Heartbeat** handles routine monitoring (inbox, calendar, notifications) in one batched turn every 30 minutes.
+- **Heartbeat** handles one batched monitoring checklist every 30 minutes; cron owns checks that need independent cadences.
 - **Hooks** react to specific events (session resets, compaction, message flow) with custom scripts. Plugin hooks cover tool calls.
 - **Standing orders** give the agent persistent context and authority boundaries.
 - **Task Flow** coordinates multi-step flows above individual tasks.

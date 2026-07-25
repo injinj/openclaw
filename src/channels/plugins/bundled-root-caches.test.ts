@@ -1,8 +1,18 @@
+// Bundled root cache tests cover cached bundled channel root resolution.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../../plugins/bundled-dir.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../plugins/bundled-dir.js")>();
+  return {
+    ...actual,
+    resolveBundledPluginsDir: (env: NodeJS.ProcessEnv = process.env) =>
+      env.OPENCLAW_BUNDLED_PLUGINS_DIR ?? actual.resolveBundledPluginsDir(env),
+  };
+});
 
 const tempDirs: string[] = [];
 const originalBundledPluginsDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
@@ -41,11 +51,10 @@ afterEach(() => {
   vi.resetModules();
   vi.doUnmock("../../plugins/channel-catalog-registry.js");
   vi.doUnmock("./bundled.js");
-  vi.doUnmock("./bundled-ids.js");
 });
 
-describe("bundled root-aware caches", () => {
-  it("partitions bundled channel ids by active bundled root without re-importing", async () => {
+describe("bundled root-aware plugin lookups", () => {
+  it("reads bundled channel ids from the active bundled root without re-importing", async () => {
     const rootA = makeBundledRoot("openclaw-bundled-ids-a-");
     const rootB = makeBundledRoot("openclaw-bundled-ids-b-");
 
@@ -53,10 +62,10 @@ describe("bundled root-aware caches", () => {
       listChannelCatalogEntries: (params?: { env?: NodeJS.ProcessEnv }) => {
         const activeRoot = params?.env?.OPENCLAW_BUNDLED_PLUGINS_DIR;
         if (activeRoot === rootA.pluginsDir) {
-          return [{ pluginId: "alpha" }];
+          return [{ pluginId: "alpha", channel: { id: "alpha-chat" } }];
         }
         if (activeRoot === rootB.pluginsDir) {
-          return [{ pluginId: "beta" }];
+          return [{ pluginId: "beta", channel: { id: "beta-chat" } }];
         }
         return [];
       },
@@ -68,27 +77,15 @@ describe("bundled root-aware caches", () => {
     );
 
     process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = rootA.pluginsDir;
-    expect(bundledIds.listBundledChannelPluginIds()).toEqual(["alpha"]);
+    expect(bundledIds.listBundledChannelIds()).toEqual(["alpha-chat"]);
 
     process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = rootB.pluginsDir;
-    expect(bundledIds.listBundledChannelPluginIds()).toEqual(["beta"]);
+    expect(bundledIds.listBundledChannelIds()).toEqual(["beta-chat"]);
   });
 
-  it("partitions bootstrap plugin caches by active bundled root without re-importing", async () => {
+  it("reads bootstrap plugins from the active bundled root without re-importing", async () => {
     const rootA = makeBundledRoot("openclaw-bootstrap-a-");
     const rootB = makeBundledRoot("openclaw-bootstrap-b-");
-
-    vi.doMock("./bundled-ids.js", () => ({
-      listBundledChannelPluginIdsForRoot: (cacheKey: string) => {
-        if (cacheKey === rootA.pluginsDir) {
-          return ["alpha"];
-        }
-        if (cacheKey === rootB.pluginsDir) {
-          return ["beta"];
-        }
-        return [];
-      },
-    }));
 
     vi.doMock("./bundled.js", () => ({
       getBundledChannelPlugin: (id: string) => ({
@@ -131,28 +128,19 @@ describe("bundled root-aware caches", () => {
     );
 
     process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = rootA.pluginsDir;
-    expect(bootstrapRegistry.listBootstrapChannelPluginIds()).toEqual(["alpha"]);
     expect(bootstrapRegistry.getBootstrapChannelPlugin("alpha")?.meta.label).toBe("setup-A");
     expect(
       bootstrapRegistry.getBootstrapChannelSecrets("alpha")?.secretTargetRegistryEntries?.[0]?.id,
     ).toBe("setup-alpha-A");
 
     process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = rootB.pluginsDir;
-    expect(bootstrapRegistry.listBootstrapChannelPluginIds()).toEqual(["beta"]);
     expect(bootstrapRegistry.getBootstrapChannelPlugin("beta")?.meta.label).toBe("setup-B");
     expect(
       bootstrapRegistry.getBootstrapChannelSecrets("beta")?.secretTargetRegistryEntries?.[0]?.id,
     ).toBe("setup-beta-B");
   });
 
-  it("marks bundled plugin ids missing when bootstrap plugin loading throws", async () => {
-    const root = makeBundledRoot("openclaw-bootstrap-plugin-throw-");
-
-    vi.doMock("./bundled-ids.js", () => ({
-      listBundledChannelPluginIdsForRoot: (cacheKey: string) =>
-        cacheKey === root.pluginsDir ? ["alpha"] : [],
-    }));
-
+  it("retries bootstrap plugin loading after an error", async () => {
     const getBundledChannelPluginMock = vi.fn(() => {
       throw new Error("Cannot find module 'nostr-tools'");
     });
@@ -172,23 +160,14 @@ describe("bundled root-aware caches", () => {
       "./bootstrap-registry.js?scope=bootstrap-plugin-load-guard",
     );
 
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = root.pluginsDir;
-    expect(bootstrapRegistry.listBootstrapChannelPluginIds()).toEqual(["alpha"]);
     expect(bootstrapRegistry.getBootstrapChannelPlugin("alpha")).toBeUndefined();
     expect(bootstrapRegistry.getBootstrapChannelPlugin("alpha")).toBeUndefined();
     expect(bootstrapRegistry.getBootstrapChannelSecrets("alpha")).toBeUndefined();
-    expect(getBundledChannelPluginMock).toHaveBeenCalledTimes(1);
-    expect(getBundledChannelSecretsMock).not.toHaveBeenCalled();
+    expect(getBundledChannelPluginMock).toHaveBeenCalledTimes(2);
+    expect(getBundledChannelSecretsMock).toHaveBeenCalledTimes(1);
   });
 
-  it("marks bundled plugin ids missing when bootstrap secrets loading throws", async () => {
-    const root = makeBundledRoot("openclaw-bootstrap-secrets-throw-");
-
-    vi.doMock("./bundled-ids.js", () => ({
-      listBundledChannelPluginIdsForRoot: (cacheKey: string) =>
-        cacheKey === root.pluginsDir ? ["alpha"] : [],
-    }));
-
+  it("keeps plugin loading independent from bootstrap secrets loading errors", async () => {
     const getBundledChannelSecretsMock = vi.fn(() => {
       throw new Error("Cannot find module '@larksuiteoapi/node-sdk'");
     });
@@ -211,11 +190,15 @@ describe("bundled root-aware caches", () => {
       "./bootstrap-registry.js?scope=bootstrap-secrets-load-guard",
     );
 
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = root.pluginsDir;
     expect(bootstrapRegistry.getBootstrapChannelSecrets("alpha")).toBeUndefined();
     expect(bootstrapRegistry.getBootstrapChannelSecrets("alpha")).toBeUndefined();
-    expect(bootstrapRegistry.getBootstrapChannelPlugin("alpha")).toBeUndefined();
-    expect(getBundledChannelSecretsMock).toHaveBeenCalledTimes(1);
-    expect(getBundledChannelPluginMock).not.toHaveBeenCalled();
+    expect(bootstrapRegistry.getBootstrapChannelPlugin("alpha")).toEqual({
+      id: "alpha",
+      meta: { id: "alpha", label: "Alpha" },
+      capabilities: {},
+      config: {},
+    });
+    expect(getBundledChannelSecretsMock).toHaveBeenCalledTimes(2);
+    expect(getBundledChannelPluginMock).toHaveBeenCalledTimes(1);
   });
 });

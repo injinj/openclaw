@@ -1,3 +1,4 @@
+// Line plugin module implements webhook node behavior.
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { webhook } from "@line/bot-sdk";
 import { danger, logVerbose, type RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
@@ -98,12 +99,10 @@ export function createLineNodeWebhookHandler(params: {
       }
 
       params.onRequestAuthenticated?.();
-
       if (body.events && body.events.length > 0) {
         logVerbose(`line: received ${body.events.length} webhook events`);
         await params.bot.handleWebhook(body);
       }
-
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ status: "ok" }));

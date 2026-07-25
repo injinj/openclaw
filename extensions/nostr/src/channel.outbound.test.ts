@@ -1,7 +1,10 @@
+// Nostr tests cover channel.outbound plugin behavior.
+import { verifyChannelMessageAdapterCapabilityProofs } from "openclaw/plugin-sdk/channel-outbound";
 import { createStartAccountContext } from "openclaw/plugin-sdk/channel-test-helpers";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginRuntime } from "../runtime-api.js";
+import { nostrPlugin } from "./channel.js";
 import { nostrOutboundAdapter, startNostrGatewayAccount } from "./gateway.js";
 import { setNostrRuntime } from "./runtime.js";
 import { TEST_RESOLVED_PRIVATE_KEY, buildResolvedNostrAccount } from "./test-fixtures.js";
@@ -46,21 +49,32 @@ function installOutboundRuntime(convertMarkdownTables = vi.fn((text: string) => 
 }
 
 async function startOutboundAccount(accountId?: string) {
-  const sendDm = vi.fn(async () => {});
+  const sendDm = vi.fn(async () => "a".repeat(64));
   const bus = {
     sendDm,
-    close: vi.fn(),
+    close: vi.fn(async () => {}),
     getMetrics: vi.fn(() => ({ counters: {} })),
     publishProfile: vi.fn(),
     getProfileState: vi.fn(async () => null),
   };
   mocks.startNostrBus.mockResolvedValueOnce(bus as unknown);
+  const abort = new AbortController();
 
-  const cleanup = (await startNostrGatewayAccount(
+  const task = startNostrGatewayAccount(
     createStartAccountContext({
       account: buildResolvedNostrAccount(accountId ? { accountId } : undefined),
+      abortSignal: abort.signal,
     }),
-  )) as { stop: () => void };
+  );
+  await vi.waitFor(() => {
+    expect(mocks.startNostrBus).toHaveBeenCalledTimes(1);
+  });
+  const cleanup = {
+    stop: async () => {
+      abort.abort();
+      await task;
+    },
+  };
 
   return { cleanup, sendDm };
 }
@@ -71,9 +85,9 @@ describe("nostr outbound cfg threading", () => {
     mocks.startNostrBus.mockReset();
   });
 
-  it("uses resolved cfg when converting markdown tables before send", async () => {
+  it("converts tables before projecting markdown to Nostr plain text", async () => {
     const { resolveMarkdownTableMode, convertMarkdownTables } = installOutboundRuntime(
-      vi.fn((text: string) => `converted:${text}`),
+      vi.fn((text: string) => (text === "***" ? text : "**Table:** [docs](https://example.com)")),
     );
     const { cleanup, sendDm } = await startOutboundAccount();
 
@@ -92,9 +106,17 @@ describe("nostr outbound cfg threading", () => {
     });
     expect(convertMarkdownTables).toHaveBeenCalledWith("|a|b|", "off");
     expect(mocks.normalizePubkey).toHaveBeenCalledWith("NPUB123");
-    expect(sendDm).toHaveBeenCalledWith("normalized-npub123", "converted:|a|b|");
+    expect(sendDm).toHaveBeenCalledWith("normalized-npub123", "Table: docs (https://example.com)");
+    await expect(
+      nostrOutboundAdapter.sendText({
+        cfg: cfg as OpenClawConfig,
+        to: "NPUB123",
+        text: "***",
+        accountId: "default",
+      }),
+    ).rejects.toThrow("requires non-empty text");
 
-    cleanup.stop();
+    await cleanup.stop();
   });
 
   it("uses the configured defaultAccount when accountId is omitted", async () => {
@@ -123,6 +145,61 @@ describe("nostr outbound cfg threading", () => {
     });
     expect(sendDm).toHaveBeenCalledWith("normalized-npub123", "hello");
 
-    cleanup.stop();
+    await cleanup.stop();
+  });
+
+  it("returns the relay-confirmed event id in the delivery receipt", async () => {
+    installOutboundRuntime();
+    const { cleanup, sendDm } = await startOutboundAccount();
+    const eventId = "b".repeat(64);
+    sendDm.mockResolvedValueOnce(eventId);
+
+    const result = await nostrOutboundAdapter.sendText({
+      cfg: createCfg() as OpenClawConfig,
+      to: "NPUB123",
+      text: "hello",
+      accountId: "default",
+    });
+
+    expect(result.messageId).toBe(eventId);
+
+    await cleanup.stop();
+  });
+
+  it("recognizes uppercase npub targets", () => {
+    expect(nostrPlugin.messaging?.targetResolver?.looksLikeId?.("NPUB1XYZ123")).toBe(true);
+  });
+
+  it("backs declared message adapter capabilities with outbound sends", async () => {
+    installOutboundRuntime();
+    const { cleanup, sendDm } = await startOutboundAccount();
+    const adapter = nostrPlugin.message;
+    if (!adapter?.send?.text) {
+      throw new Error("expected Nostr message adapter with text sender");
+    }
+    const sendText = adapter.send.text;
+    expect(adapter.send.media).toBeUndefined();
+
+    await verifyChannelMessageAdapterCapabilityProofs({
+      adapterName: "nostrMessageAdapter",
+      adapter,
+      proofs: {
+        text: async () => {
+          const result = await sendText({
+            cfg: createCfg() as OpenClawConfig,
+            to: "NPUB123",
+            text: "hello",
+            accountId: "default",
+          });
+          expect(sendDm).toHaveBeenCalledWith("normalized-npub123", "hello");
+          expect(result.receipt.parts[0]?.kind).toBe("text");
+        },
+        messageSendingHooks: () => {
+          expect(sendText).toBeTypeOf("function");
+        },
+      },
+    });
+
+    await cleanup.stop();
   });
 });

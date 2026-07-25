@@ -1,14 +1,20 @@
-import fs from "node:fs";
+import { clearBootstrapSnapshotOnSessionBoundary } from "../../agents/bootstrap-cache.js";
+import { clearAllCliSessions } from "../../agents/cli-session.js";
+// Handles session reset requests produced during agent runner execution.
+import { transitionMainSessionRecovery } from "../../agents/main-session-recovery-state.js";
 import type { SessionEntry } from "../../config/sessions.js";
+import { persistSessionResetLifecycle } from "../../config/sessions/session-accessor.js";
 import {
-  resolveAgentIdFromSessionKey,
-  resolveSessionFilePath,
-  resolveSessionFilePathOptions,
-  resolveSessionTranscriptPath,
-  updateSessionStore,
-} from "../../config/sessions.js";
+  formatSqliteSessionFileMarker,
+  sqliteSessionFileMarkerMatchesTarget,
+} from "../../config/sessions/sqlite-marker.js";
 import { generateSecureUuid } from "../../infra/secure-random.js";
 import { defaultRuntime } from "../../runtime.js";
+import {
+  isModelSelectionLocked,
+  ModelSelectionLockedError,
+  MODEL_SELECTION_LOCKED_RESET_MESSAGE,
+} from "../../sessions/model-overrides.js";
 import { refreshQueuedFollowupSession, type FollowupRun } from "./queue.js";
 
 type ResetSessionOptions = {
@@ -19,19 +25,25 @@ type ResetSessionOptions = {
 
 const deps = {
   generateSecureUuid,
-  updateSessionStore,
+  persistSessionResetLifecycle,
   refreshQueuedFollowupSession,
   error: (message: string) => defaultRuntime.error(message),
 };
 
-export function setAgentRunnerSessionResetTestDeps(overrides?: Partial<typeof deps>): void {
+function setAgentRunnerSessionResetTestDeps(overrides?: Partial<typeof deps>): void {
   Object.assign(deps, {
     generateSecureUuid,
-    updateSessionStore,
+    persistSessionResetLifecycle,
     refreshQueuedFollowupSession,
     error: (message: string) => defaultRuntime.error(message),
     ...overrides,
   });
+}
+
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[
+    Symbol.for("openclaw.agentRunnerSessionResetTestApi")
+  ] = { setAgentRunnerSessionResetTestDeps };
 }
 
 export async function resetReplyRunSession(params: {
@@ -53,12 +65,16 @@ export async function resetReplyRunSession(params: {
   if (!prevEntry) {
     return false;
   }
-  const prevSessionId = params.options.cleanupTranscripts ? prevEntry.sessionId : undefined;
-  const nextSessionId = deps.generateSecureUuid();
+  if (isModelSelectionLocked(prevEntry)) {
+    throw new ModelSelectionLockedError(MODEL_SELECTION_LOCKED_RESET_MESSAGE);
+  }
+  const nextSessionId = prevEntry.sessionId;
   const now = Date.now();
   const nextEntry: SessionEntry = {
     ...prevEntry,
     sessionId: nextSessionId,
+    previousSessionId: undefined,
+    lifecycleRevision: deps.generateSecureUuid(),
     updatedAt: now,
     sessionStartedAt: now,
     lastInteractionAt: now,
@@ -74,28 +90,58 @@ export async function resetReplyRunSession(params: {
     cacheRead: undefined,
     cacheWrite: undefined,
     contextTokens: undefined,
+    contextBudgetStatus: undefined,
     systemPromptReport: undefined,
     fallbackNoticeSelectedModel: undefined,
     fallbackNoticeActiveModel: undefined,
     fallbackNoticeReason: undefined,
+    compactionCount: 0,
+    memoryFlushAt: undefined,
+    memoryFlushCompactionCount: undefined,
+    memoryFlushContextHash: undefined,
+    memoryFlushFailureCount: undefined,
+    memoryFlushLastFailedAt: undefined,
+    memoryFlushLastFailureError: undefined,
   };
-  const agentId = resolveAgentIdFromSessionKey(params.sessionKey);
-  const nextSessionFile = resolveSessionTranscriptPath(
-    nextSessionId,
-    agentId,
-    params.messageThreadId,
-  );
+  clearAllCliSessions(nextEntry);
+  nextEntry.agentHarnessId = undefined;
+  transitionMainSessionRecovery(nextEntry, { kind: "clear" });
+  const agentId = params.followupRun.run.agentId;
+  const nextSessionFile =
+    (sqliteSessionFileMarkerMatchesTarget(prevEntry.sessionFile, {
+      agentId,
+      sessionId: nextSessionId,
+      storePath: params.storePath,
+    })
+      ? prevEntry.sessionFile
+      : undefined) ??
+    formatSqliteSessionFileMarker({
+      agentId,
+      sessionId: nextSessionId,
+      storePath: params.storePath,
+    });
   nextEntry.sessionFile = nextSessionFile;
   params.activeSessionStore[params.sessionKey] = nextEntry;
   try {
-    await deps.updateSessionStore(params.storePath, (store) => {
-      store[params.sessionKey!] = nextEntry;
+    await deps.persistSessionResetLifecycle({
+      agentId,
+      nextEntry,
+      nextSessionFile,
+      previousEntry: prevEntry,
+      sessionKey: params.sessionKey,
+      storePath: params.storePath,
     });
   } catch (err) {
+    params.activeSessionStore[params.sessionKey] = prevEntry;
     deps.error(
       `Failed to persist session reset after ${params.options.failureLabel} (${params.sessionKey}): ${String(err)}`,
     );
+    throw err;
   }
+  clearBootstrapSnapshotOnSessionBoundary({
+    boundaryAppended: true,
+    sessionKey: params.sessionKey,
+  });
   params.followupRun.run.sessionId = nextSessionId;
   params.followupRun.run.sessionFile = nextSessionFile;
   deps.refreshQueuedFollowupSession({
@@ -107,24 +153,5 @@ export async function resetReplyRunSession(params: {
   params.onActiveSessionEntry(nextEntry);
   params.onNewSession(nextSessionId, nextSessionFile);
   deps.error(params.options.buildLogMessage(nextSessionId));
-  if (params.options.cleanupTranscripts && prevSessionId) {
-    const transcriptCandidates = new Set<string>();
-    const resolved = resolveSessionFilePath(
-      prevSessionId,
-      prevEntry,
-      resolveSessionFilePathOptions({ agentId, storePath: params.storePath }),
-    );
-    if (resolved) {
-      transcriptCandidates.add(resolved);
-    }
-    transcriptCandidates.add(resolveSessionTranscriptPath(prevSessionId, agentId));
-    for (const candidate of transcriptCandidates) {
-      try {
-        fs.unlinkSync(candidate);
-      } catch {
-        // Best-effort cleanup.
-      }
-    }
-  }
   return true;
 }

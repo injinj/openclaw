@@ -1,3 +1,6 @@
+// Builds overview table rows for `openclaw status` and `openclaw status --all`.
+// The row builders combine scan surfaces with health/session summaries while keeping rendering elsewhere.
+
 import { formatCliCommand } from "../cli/command-format.js";
 import type { HeartbeatEventPayload } from "../infra/heartbeat-events.js";
 import type { PluginCompatibilityNotice } from "../plugins/status.js";
@@ -27,6 +30,47 @@ import {
 import type { MemoryPluginStatus, MemoryStatusSnapshot } from "./status.scan.shared.js";
 import type { StatusSummary } from "./status.types.js";
 
+function readModelPricingHealth(params: {
+  health?: HealthSummary;
+  surface: StatusOverviewSurface;
+}): HealthSummary["modelPricing"] | undefined {
+  if (params.health?.modelPricing) {
+    return params.health.modelPricing;
+  }
+  // Fast status can receive model pricing through the gateway probe before deep health is requested.
+  const probeHealth = params.surface.gatewayProbe?.health;
+  if (!probeHealth || typeof probeHealth !== "object") {
+    return undefined;
+  }
+  const modelPricing = (probeHealth as { modelPricing?: unknown }).modelPricing;
+  if (!modelPricing || typeof modelPricing !== "object") {
+    return undefined;
+  }
+  const state = (modelPricing as { state?: unknown }).state;
+  if (state !== "ok" && state !== "degraded" && state !== "disabled") {
+    return undefined;
+  }
+  return modelPricing as HealthSummary["modelPricing"];
+}
+
+function buildModelPricingOverviewValue(params: {
+  health?: HealthSummary["modelPricing"];
+  ok: (value: string) => string;
+  warn: (value: string) => string;
+  muted: (value: string) => string;
+}): string | null {
+  const health = params.health;
+  if (!health) {
+    return null;
+  }
+  if (health.state !== "degraded") {
+    return null;
+  }
+  const detail = health.detail ? ` · ${health.detail}` : "";
+  return params.warn(`warning · optional pricing refresh degraded${detail}`);
+}
+
+/** Builds the default `openclaw status` overview rows from scan, health, memory, and session inputs. */
 export function buildStatusCommandOverviewRows(
   params: {
     opts: {
@@ -52,6 +96,7 @@ export function buildStatusCommandOverviewRows(
     formatTimeAgo: (ageMs: number) => string;
     formatKTokens: (value: number) => string;
     updateValue?: string;
+    updateRestartValue?: string | null;
   } & StatusMemoryStateResolvers,
 ) {
   const agentsValue = buildStatusAgentsValue({
@@ -61,6 +106,24 @@ export function buildStatusCommandOverviewRows(
   const eventsValue = buildStatusEventsValue({
     queuedSystemEvents: params.summary.queuedSystemEvents,
   });
+  const degradedSecretOwners = params.summary.degradedSecretOwners ?? [];
+  const degradedSecretsValue =
+    degradedSecretOwners.length > 0
+      ? params.warn(
+          `${degradedSecretOwners.length} degraded · ${degradedSecretOwners
+            .map((owner) => `${owner.ownerKind}:${owner.ownerId}`)
+            .join(", ")}`,
+        )
+      : null;
+  const degradedPlugins = params.summary.degradedPlugins ?? [];
+  const degradedPluginsValue =
+    degradedPlugins.length > 0
+      ? params.warn(
+          `${degradedPlugins.length} configured-unavailable · ${degradedPlugins
+            .map((plugin) => plugin.pluginId)
+            .join(", ")}`,
+        )
+      : null;
   const tasksValue = buildStatusTasksValue({
     summary: params.summary,
     warn: params.warn,
@@ -96,6 +159,15 @@ export function buildStatusCommandOverviewRows(
     ok: params.ok,
     warn: params.warn,
   });
+  const modelPricingValue = buildModelPricingOverviewValue({
+    health: readModelPricingHealth({
+      health: params.health,
+      surface: params.surface,
+    }),
+    ok: params.ok,
+    warn: params.warn,
+    muted: params.muted,
+  });
 
   return buildStatusOverviewRowsFromSurface({
     surface: params.surface,
@@ -107,7 +179,13 @@ export function buildStatusCommandOverviewRows(
     updateValue: params.updateValue,
     agentsValue,
     suffixRows: [
+      ...(modelPricingValue ? [{ Item: "Model pricing", Value: modelPricingValue }] : []),
+      ...(params.updateRestartValue
+        ? [{ Item: "Update restart", Value: params.updateRestartValue }]
+        : []),
       { Item: "Memory", Value: memoryValue },
+      ...(degradedSecretsValue ? [{ Item: "Degraded secrets", Value: degradedSecretsValue }] : []),
+      ...(degradedPluginsValue ? [{ Item: "Degraded plugins", Value: degradedPluginsValue }] : []),
       { Item: "Plugin compatibility", Value: pluginCompatibilityValue },
       { Item: "Probes", Value: probesValue },
       { Item: "Events", Value: eventsValue },
@@ -128,11 +206,13 @@ export function buildStatusCommandOverviewRows(
   });
 }
 
+/** Builds the expanded status-all overview rows, including config and security hints. */
 export function buildStatusAllOverviewRows(params: {
   surface: StatusOverviewSurface;
   osLabel: string;
   configPath: string;
   secretDiagnosticsCount: number;
+  updateRestartValue?: string | null;
   agentStatus: {
     bootstrapPendingCount: number;
     totalSessions: number;
@@ -156,6 +236,9 @@ export function buildStatusAllOverviewRows(params: {
       { Item: "Config", Value: params.configPath },
     ],
     middleRows: [
+      ...(params.updateRestartValue
+        ? [{ Item: "Update restart", Value: params.updateRestartValue }]
+        : []),
       { Item: "Security", Value: `Run: ${formatCliCommand("openclaw security audit --deep")}` },
     ],
     agentsValue: buildStatusAllAgentsValue({

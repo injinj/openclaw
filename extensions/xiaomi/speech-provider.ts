@@ -1,5 +1,10 @@
+// Xiaomi provider module implements model/runtime integration.
 import { transcodeAudioBufferToOpus } from "openclaw/plugin-sdk/media-runtime";
-import { assertOkOrThrowProviderError } from "openclaw/plugin-sdk/provider-http";
+import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import {
+  assertOkOrThrowProviderError,
+  readProviderJsonResponse,
+} from "openclaw/plugin-sdk/provider-http";
 import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
 import type {
   SpeechDirectiveTokenParseContext,
@@ -7,20 +12,27 @@ import type {
   SpeechProviderOverrides,
   SpeechProviderPlugin,
 } from "openclaw/plugin-sdk/speech-core";
-import { asObject, trimToUndefined } from "openclaw/plugin-sdk/speech-core";
+import {
+  asObject,
+  resolveSpeechProviderApiKey,
+  trimToUndefined,
+} from "openclaw/plugin-sdk/speech-core";
 import {
   fetchWithSsrFGuard,
   ssrfPolicyFromHttpBaseUrlAllowedHostname,
 } from "openclaw/plugin-sdk/ssrf-runtime";
 
-export const DEFAULT_XIAOMI_TTS_BASE_URL = "https://api.xiaomimimo.com/v1";
-export const DEFAULT_XIAOMI_TTS_MODEL = "mimo-v2.5-tts";
-export const DEFAULT_XIAOMI_TTS_VOICE = "mimo_default";
-export const DEFAULT_XIAOMI_TTS_FORMAT = "mp3";
+const DEFAULT_XIAOMI_TTS_BASE_URL = "https://api.xiaomimimo.com/v1";
+const DEFAULT_XIAOMI_TTS_MODEL = "mimo-v2.5-tts";
+const DEFAULT_XIAOMI_TTS_VOICE = "mimo_default";
+const DEFAULT_XIAOMI_TTS_FORMAT = "mp3";
+const XIAOMI_TTS_VOICE_DESIGN_MODEL = "mimo-v2.5-tts-voicedesign";
+const DEFAULT_XIAOMI_TTS_VOICE_DESIGN_STYLE =
+  "Warm, natural, and friendly voice with clear pronunciation and conversational pacing.";
 
-export const XIAOMI_TTS_MODELS = ["mimo-v2.5-tts", "mimo-v2-tts"] as const;
+const XIAOMI_TTS_MODELS = ["mimo-v2.5-tts", XIAOMI_TTS_VOICE_DESIGN_MODEL] as const;
 
-export const XIAOMI_TTS_VOICES = [
+const XIAOMI_TTS_VOICES = [
   "mimo_default",
   "default_zh",
   "default_en",
@@ -75,16 +87,19 @@ function normalizeXiaomiTtsProviderConfig(
   return {
     apiKey: normalizeResolvedSecretInputString({
       value: raw?.apiKey,
-      path: "messages.tts.providers.xiaomi.apiKey",
+      path: "tts.providers.xiaomi.apiKey",
     }),
     baseUrl: normalizeXiaomiTtsBaseUrl(
       trimToUndefined(raw?.baseUrl) ?? trimToUndefined(process.env.XIAOMI_BASE_URL),
     ),
     model:
       trimToUndefined(raw?.model) ??
+      trimToUndefined(raw?.modelId) ??
       trimToUndefined(process.env.XIAOMI_TTS_MODEL) ??
       DEFAULT_XIAOMI_TTS_MODEL,
     voice:
+      trimToUndefined(raw?.speakerVoice) ??
+      trimToUndefined(raw?.speakerVoiceId) ??
       trimToUndefined(raw?.voice) ??
       trimToUndefined(raw?.voiceId) ??
       trimToUndefined(process.env.XIAOMI_TTS_VOICE) ??
@@ -103,13 +118,30 @@ function readXiaomiTtsProviderConfig(config: SpeechProviderConfig): XiaomiTtsPro
     apiKey:
       normalizeResolvedSecretInputString({
         value: config.apiKey,
-        path: "messages.tts.providers.xiaomi.apiKey",
+        path: "tts.providers.xiaomi.apiKey",
       }) ?? normalized.apiKey,
     baseUrl: normalizeXiaomiTtsBaseUrl(trimToUndefined(config.baseUrl) ?? normalized.baseUrl),
-    model: trimToUndefined(config.model) ?? normalized.model,
-    voice: trimToUndefined(config.voice) ?? trimToUndefined(config.voiceId) ?? normalized.voice,
+    model: trimToUndefined(config.model) ?? trimToUndefined(config.modelId) ?? normalized.model,
+    voice:
+      trimToUndefined(config.speakerVoice) ??
+      trimToUndefined(config.speakerVoiceId) ??
+      trimToUndefined(config.voice) ??
+      trimToUndefined(config.voiceId) ??
+      normalized.voice,
     format: normalizeXiaomiTtsFormat(config.format) ?? normalized.format,
     style: trimToUndefined(config.style) ?? normalized.style,
+  };
+}
+
+function resolveXiaomiTtsProviderConfig(config: SpeechProviderConfig): XiaomiTtsProviderConfig {
+  const providerConfig = readXiaomiTtsProviderConfig(config);
+  const resolvedKey = resolveSpeechProviderApiKey(
+    providerConfig.apiKey,
+    process.env.XIAOMI_API_KEY,
+  );
+  return {
+    ...providerConfig,
+    apiKey: resolvedKey,
   };
 }
 
@@ -120,8 +152,12 @@ function readXiaomiTtsOverrides(
     return {};
   }
   return {
-    model: trimToUndefined(overrides.model),
-    voice: trimToUndefined(overrides.voice) ?? trimToUndefined(overrides.voiceId),
+    model: trimToUndefined(overrides.model) ?? trimToUndefined(overrides.modelId),
+    voice:
+      trimToUndefined(overrides.speakerVoice) ??
+      trimToUndefined(overrides.speakerVoiceId) ??
+      trimToUndefined(overrides.voice) ??
+      trimToUndefined(overrides.voiceId),
     format: normalizeXiaomiTtsFormat(overrides.format),
     style: trimToUndefined(overrides.style),
   };
@@ -181,6 +217,24 @@ function buildXiaomiTtsMessages(params: { text: string; style?: string }) {
   ];
 }
 
+function isXiaomiVoiceDesignModel(model: string): boolean {
+  return model === XIAOMI_TTS_VOICE_DESIGN_MODEL;
+}
+
+function resolveXiaomiVoiceDesignStyle(style: string | undefined): string {
+  return trimToUndefined(style) ?? DEFAULT_XIAOMI_TTS_VOICE_DESIGN_STYLE;
+}
+
+function buildXiaomiTtsAudio(params: { model: string; voice: string; format: XiaomiTtsFormat }): {
+  format: XiaomiTtsFormat;
+  voice?: string;
+} {
+  if (isXiaomiVoiceDesignModel(params.model)) {
+    return { format: params.format };
+  }
+  return { format: params.format, voice: params.voice };
+}
+
 function decodeXiaomiAudioData(body: unknown): Buffer {
   const root = asObject(body);
   const choices = Array.isArray(root?.choices) ? root.choices : [];
@@ -194,7 +248,7 @@ function decodeXiaomiAudioData(body: unknown): Buffer {
   return Buffer.from(audioData, "base64");
 }
 
-export async function xiaomiTTS(params: {
+async function xiaomiTTS(params: {
   text: string;
   apiKey: string;
   baseUrl: string;
@@ -205,8 +259,12 @@ export async function xiaomiTTS(params: {
   timeoutMs: number;
 }): Promise<Buffer> {
   const { text, apiKey, baseUrl, model, voice, format, style, timeoutMs } = params;
+  const requestTimeoutMs = resolveTimerTimeoutMs(timeoutMs, 1);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const resolvedStyle = isXiaomiVoiceDesignModel(model)
+    ? resolveXiaomiVoiceDesignStyle(style)
+    : style;
 
   try {
     const { response, release } = await fetchWithSsrFGuard({
@@ -219,18 +277,19 @@ export async function xiaomiTTS(params: {
         },
         body: JSON.stringify({
           model,
-          messages: buildXiaomiTtsMessages({ text, style }),
-          audio: { format, voice },
+          messages: buildXiaomiTtsMessages({ text, style: resolvedStyle }),
+          audio: buildXiaomiTtsAudio({ model, voice, format }),
         }),
         signal: controller.signal,
       },
-      timeoutMs,
+      timeoutMs: requestTimeoutMs,
       policy: ssrfPolicyFromHttpBaseUrlAllowedHostname(baseUrl),
       auditContext: "xiaomi.tts",
     });
     try {
       await assertOkOrThrowProviderError(response, "Xiaomi TTS API error");
-      return decodeXiaomiAudioData(await response.json());
+      const body = await readProviderJsonResponse<unknown>(response, "Xiaomi TTS API");
+      return decodeXiaomiAudioData(body);
     } finally {
       await release();
     }
@@ -245,24 +304,24 @@ export function buildXiaomiSpeechProvider(): SpeechProviderPlugin {
     label: "Xiaomi MiMo",
     aliases: ["mimo"],
     autoSelectOrder: 45,
+    defaultModel: DEFAULT_XIAOMI_TTS_MODEL,
     models: XIAOMI_TTS_MODELS,
     voices: XIAOMI_TTS_VOICES,
     resolveConfig: ({ rawConfig }) => normalizeXiaomiTtsProviderConfig(rawConfig),
     parseDirectiveToken,
     listVoices: async () => XIAOMI_TTS_VOICES.map((voice) => ({ id: voice, name: voice })),
     isConfigured: ({ providerConfig }) =>
-      Boolean(readXiaomiTtsProviderConfig(providerConfig).apiKey || process.env.XIAOMI_API_KEY),
+      Boolean(resolveXiaomiTtsProviderConfig(providerConfig).apiKey),
     synthesize: async (req) => {
-      const config = readXiaomiTtsProviderConfig(req.providerConfig);
+      const config = resolveXiaomiTtsProviderConfig(req.providerConfig);
       const overrides = readXiaomiTtsOverrides(req.providerOverrides);
-      const apiKey = config.apiKey || process.env.XIAOMI_API_KEY;
-      if (!apiKey) {
+      if (!config.apiKey) {
         throw new Error("Xiaomi API key missing");
       }
       const outputFormat = overrides.format ?? config.format;
       const audioBuffer = await xiaomiTTS({
         text: req.text,
-        apiKey,
+        apiKey: config.apiKey,
         baseUrl: config.baseUrl,
         model: overrides.model ?? config.model,
         voice: overrides.voice ?? config.voice,

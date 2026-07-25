@@ -1,5 +1,8 @@
+// Model pricing cache tests protect provider/model normalization, manifest
+// metadata lookup, fetch preconnect behavior, cache refresh, and logging.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { modelKey } from "../agents/model-selection.js";
 import type { normalizeProviderModelIdWithRuntime } from "../agents/provider-model-normalization.runtime.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { resetLogger, setLoggerOverride } from "../logging/logger.js";
@@ -8,7 +11,15 @@ import type { PluginManifestRecord, PluginManifestRegistry } from "../plugins/ma
 import { withFetchPreconnect } from "../test-utils/fetch-mock.js";
 
 const normalizeProviderModelIdWithRuntimeMock = vi.hoisted(() =>
-  vi.fn<typeof normalizeProviderModelIdWithRuntime>(({ context }) => context.modelId),
+  vi.fn<typeof normalizeProviderModelIdWithRuntime>(({ provider, context }) => {
+    if (
+      provider === "google" &&
+      (context.modelId === "gemini-3-pro" || context.modelId === "gemini-3-pro-preview")
+    ) {
+      return "gemini-3.1-pro-preview";
+    }
+    return context.modelId;
+  }),
 );
 const pluginManifestRegistryMocks = vi.hoisted(() => ({
   manifestRegistry: undefined as PluginManifestRegistry | undefined,
@@ -50,16 +61,82 @@ vi.mock("../plugins/manifest-metadata-scan.js", async (importOriginal) => {
 });
 
 import {
-  __resetGatewayModelPricingCacheForTest,
-  collectConfiguredModelPricingRefs,
+  clearGatewayModelPricingFailures,
+  getGatewayModelPricingCacheMeta,
+  getGatewayModelPricingHealth,
+  replaceGatewayModelPricingCache,
+} from "./model-pricing-cache-state.js";
+import {
   getCachedGatewayModelPricing,
-  refreshGatewayModelPricingCache,
   startGatewayModelPricingRefresh,
 } from "./model-pricing-cache.js";
 
+type CachedModelPricing = NonNullable<ReturnType<typeof getCachedGatewayModelPricing>>;
+
+function requirePricing(
+  pricing: ReturnType<typeof getCachedGatewayModelPricing>,
+  label: string,
+): CachedModelPricing {
+  if (!pricing) {
+    throw new Error(`expected ${label} pricing`);
+  }
+  return pricing;
+}
+
+function requireTieredPricing(
+  pricing: CachedModelPricing,
+  label: string,
+): NonNullable<CachedModelPricing["tieredPricing"]> {
+  if (!pricing.tieredPricing) {
+    throw new Error(`expected ${label} tiered pricing`);
+  }
+  return pricing.tieredPricing;
+}
+
+function clearGatewayModelPricingState(): void {
+  replaceGatewayModelPricingCache(new Map(), 0);
+  clearGatewayModelPricingFailures();
+}
+
+async function runGatewayModelPricingRefresh(
+  params: Parameters<typeof startGatewayModelPricingRefresh>[0],
+): Promise<void> {
+  const previousCachedAt = getGatewayModelPricingCacheMeta().cachedAt;
+  while (Date.now() <= previousCachedAt) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 1);
+    });
+  }
+  const stop = startGatewayModelPricingRefresh(params);
+  try {
+    await vi.dynamicImportSettled();
+    if (params.config.models?.pricing?.enabled === false) {
+      return;
+    }
+    await vi.waitFor(
+      () => {
+        expect(getGatewayModelPricingCacheMeta().cachedAt).not.toBe(previousCachedAt);
+      },
+      { timeout: 5_000 },
+    );
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  } finally {
+    stop();
+  }
+}
+
+function requireAbortSignal(signal: RequestInit["signal"] | undefined): AbortSignal {
+  if (!signal) {
+    throw new Error("expected pricing fetch abort signal");
+  }
+  return signal;
+}
+
 describe("model-pricing-cache", () => {
   beforeEach(() => {
-    __resetGatewayModelPricingCacheForTest();
+    clearGatewayModelPricingState();
     pluginManifestRegistryMocks.manifestRegistry = undefined;
     pluginManifestRegistryMocks.loadPluginManifestRegistryForInstalledIndex.mockClear();
     pluginManifestRegistryMocks.listOpenClawPluginManifestMetadata.mockClear();
@@ -67,97 +144,9 @@ describe("model-pricing-cache", () => {
   });
 
   afterEach(() => {
-    __resetGatewayModelPricingCacheForTest();
+    clearGatewayModelPricingState();
     loggingState.rawConsole = null;
     resetLogger();
-  });
-
-  it("collects configured model refs across defaults, aliases, overrides, and media tools", () => {
-    const config = {
-      agents: {
-        defaults: {
-          model: { primary: "gpt", fallbacks: ["anthropic/claude-sonnet-4-6"] },
-          imageModel: { primary: "google/gemini-3-pro" },
-          compaction: { model: "opus" },
-          heartbeat: { model: "xai/grok-4" },
-          models: {
-            "openai/gpt-5.4": { alias: "gpt" },
-            "anthropic/claude-opus-4-6": { alias: "opus" },
-          },
-        },
-        list: [
-          {
-            id: "router",
-            model: { primary: "openrouter/anthropic/claude-opus-4-6" },
-            subagents: { model: { primary: "openrouter/auto" } },
-            heartbeat: { model: "anthropic/claude-opus-4-6" },
-          },
-        ],
-      },
-      channels: {
-        modelByChannel: {
-          slack: {
-            C123: "gpt",
-          },
-        },
-      },
-      hooks: {
-        gmail: { model: "anthropic/claude-opus-4-6" },
-        mappings: [{ model: "zai/glm-5" }],
-      },
-      tools: {
-        subagents: { model: { primary: "anthropic/claude-haiku-4-5" } },
-        media: {
-          models: [{ provider: "google", model: "gemini-2.5-pro" }],
-          image: {
-            models: [{ provider: "xai", model: "grok-4" }],
-          },
-        },
-      },
-      messages: {
-        tts: {
-          summaryModel: "openai/gpt-5.4",
-        },
-      },
-    } as unknown as OpenClawConfig;
-
-    const refs = collectConfiguredModelPricingRefs(config).map((ref) =>
-      modelKey(ref.provider, ref.model),
-    );
-
-    expect(refs).toEqual(
-      expect.arrayContaining([
-        "openai/gpt-5.4",
-        "anthropic/claude-sonnet-4-6",
-        "google/gemini-3-pro-preview",
-        "anthropic/claude-opus-4-6",
-        "xai/grok-4",
-        "openrouter/anthropic/claude-opus-4-6",
-        "openrouter/auto",
-        "zai/glm-5",
-        "anthropic/claude-haiku-4-5",
-        "google/gemini-2.5-pro",
-      ]),
-    );
-    expect(new Set(refs).size).toBe(refs.length);
-  });
-
-  it("collects manifest-owned web search plugin model refs without a hardcoded plugin list", () => {
-    const refs = collectConfiguredModelPricingRefs({
-      plugins: {
-        entries: {
-          tavily: {
-            config: {
-              webSearch: {
-                model: "tavily/search-preview",
-              },
-            },
-          },
-        },
-      },
-    } as OpenClawConfig).map((ref) => modelKey(ref.provider, ref.model));
-
-    expect(refs).toContain("tavily/search-preview");
   });
 
   it("uses one installed manifest pass for pricing policies and configured web-search refs", async () => {
@@ -194,12 +183,83 @@ describe("model-pricing-cache", () => {
     } as unknown as OpenClawConfig;
     const fetchImpl = vi.fn<typeof fetch>();
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     expect(
       pluginManifestRegistryMocks.loadPluginManifestRegistryForInstalledIndex,
     ).toHaveBeenCalledOnce();
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("uses a provided metadata registry view without rebuilding manifest metadata", async () => {
+    const manifestRegistry = {
+      diagnostics: [],
+      plugins: [
+        createManifestRecord({
+          id: "search-plugin",
+          contracts: { webSearchProviders: ["search-plugin"] },
+        }),
+      ],
+    };
+    const config = {
+      plugins: {
+        entries: {
+          "search-plugin": {
+            config: {
+              webSearch: {
+                model: "local-search/search-model",
+              },
+            },
+          },
+        },
+      },
+      models: {
+        providers: {
+          "local-search": {
+            baseUrl: "http://127.0.0.1:43210/v1",
+            api: "openai-completions",
+            models: [
+              {
+                id: "search-model",
+                cost: { input: 0.2, output: 0.4 },
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const fetchImpl = vi.fn<typeof fetch>();
+
+    await runGatewayModelPricingRefresh({
+      config,
+      fetchImpl,
+      pluginMetadataSnapshot: {
+        index: {
+          plugins: [
+            {
+              pluginId: "search-plugin",
+              origin: "global",
+              enabled: true,
+              enabledByDefault: true,
+            },
+          ],
+        } as never,
+        manifestRegistry,
+      },
+    });
+
+    expect(
+      pluginManifestRegistryMocks.loadPluginManifestRegistryForInstalledIndex,
+    ).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(
+      getCachedGatewayModelPricing({ provider: "local-search", model: "search-model" }),
+    ).toEqual({
+      input: 0.2,
+      output: 0.4,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
   });
 
   it("does not load plugin manifests for pricing when plugins are globally disabled", async () => {
@@ -238,7 +298,7 @@ describe("model-pricing-cache", () => {
     } as unknown as OpenClawConfig;
     const fetchImpl = vi.fn<typeof fetch>();
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     expect(
       pluginManifestRegistryMocks.loadPluginManifestRegistryForInstalledIndex,
@@ -281,12 +341,186 @@ describe("model-pricing-cache", () => {
     } as unknown as OpenClawConfig;
     const fetchImpl = vi.fn<typeof fetch>();
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(
       getCachedGatewayModelPricing({ provider: "ollama", model: "llama3.2:latest" }),
     ).toBeUndefined();
+  });
+
+  it("records and clears remote pricing source failures for health surfaces", async () => {
+    const config = {
+      agents: {
+        defaults: {
+          model: { primary: "custom/gpt-remote" },
+        },
+      },
+      models: {
+        providers: {
+          custom: {
+            baseUrl: "https://models.example/v1",
+            api: "openai-completions",
+            models: [{ id: "gpt-remote" }],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const failingFetch = withFetchPreconnect(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("openrouter.ai")) {
+        throw new TypeError("fetch failed");
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await runGatewayModelPricingRefresh({ config, fetchImpl: failingFetch });
+
+    const failedHealth = getGatewayModelPricingHealth();
+    expect(failedHealth.state).toBe("degraded");
+    expect(failedHealth.sources).toHaveLength(1);
+    expect(failedHealth.sources[0]?.source).toBe("openrouter");
+    expect(failedHealth.sources[0]?.state).toBe("degraded");
+    expect(failedHealth.sources[0]?.detail).toContain("OpenRouter pricing fetch failed");
+
+    const successfulFetch = withFetchPreconnect(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = url.includes("openrouter.ai") ? { data: [] } : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await runGatewayModelPricingRefresh({ config, fetchImpl: successfulFetch });
+
+    expect(getGatewayModelPricingHealth()).toEqual({
+      state: "ok",
+      sources: [],
+    });
+  });
+
+  it("cancels remote pricing error response bodies", async () => {
+    const config = {
+      agents: {
+        defaults: {
+          model: { primary: "custom/gpt-remote" },
+        },
+      },
+      models: {
+        providers: {
+          custom: {
+            baseUrl: "https://models.example/v1",
+            api: "openai-completions",
+            models: [{ id: "gpt-remote" }],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const openRouterResponse = new Response("rate limited", { status: 429 });
+    const cancel = vi.spyOn(openRouterResponse.body!, "cancel").mockResolvedValue(undefined);
+    const fetchImpl = withFetchPreconnect(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("openrouter.ai")) {
+        return openRouterResponse;
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
+
+    expect(cancel).toHaveBeenCalledOnce();
+    const health = getGatewayModelPricingHealth();
+    expect(health.state).toBe("degraded");
+    expect(health.sources[0]?.source).toBe("openrouter");
+    expect(health.sources[0]?.detail).toContain("HTTP 429");
+  });
+
+  it("records malformed remote pricing catalog JSON as source failures", async () => {
+    const config = {
+      agents: {
+        defaults: {
+          model: { primary: "custom/gpt-remote" },
+        },
+      },
+      models: {
+        providers: {
+          custom: {
+            baseUrl: "https://models.example/v1",
+            api: "openai-completions",
+            models: [{ id: "gpt-remote" }],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const fetchImpl = withFetchPreconnect(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("openrouter.ai")) {
+        return new Response("{not json", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
+
+    const health = getGatewayModelPricingHealth();
+    expect(health.state).toBe("degraded");
+    expect(health.sources).toHaveLength(1);
+    expect(health.sources[0]?.source).toBe("openrouter");
+    expect(health.sources[0]?.state).toBe("degraded");
+    expect(health.sources[0]?.detail).toContain("OpenRouter pricing response is malformed JSON");
+  });
+
+  it("records malformed pricing content-length headers as source failures", async () => {
+    const config = {
+      agents: {
+        defaults: {
+          model: { primary: "custom/gpt-remote" },
+        },
+      },
+      models: {
+        providers: {
+          custom: {
+            baseUrl: "https://models.example/v1",
+            api: "openai-completions",
+            models: [{ id: "gpt-remote" }],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const fetchImpl = withFetchPreconnect(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("openrouter.ai")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Content-Length": "1e3" },
+        });
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
+
+    const health = getGatewayModelPricingHealth();
+    expect(health.state).toBe("degraded");
+    expect(health.sources).toHaveLength(1);
+    expect(health.sources[0]?.source).toBe("openrouter");
+    expect(health.sources[0]?.detail).toContain("invalid content-length header: 1e3");
   });
 
   it("seeds pricing from explicit configured model cost without external catalog fetches", async () => {
@@ -318,7 +552,7 @@ describe("model-pricing-cache", () => {
     } as unknown as OpenClawConfig;
     const fetchImpl = vi.fn<typeof fetch>();
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(getCachedGatewayModelPricing({ provider: "custom", model: "gpt-local" })).toEqual({
@@ -334,6 +568,7 @@ describe("model-pricing-cache", () => {
       agents: {
         defaults: {
           model: { primary: "anthropic/claude-opus-4-6" },
+          subagents: { model: { primary: "zai/glm-openrouter-test" } },
         },
         list: [
           {
@@ -341,9 +576,6 @@ describe("model-pricing-cache", () => {
             model: { primary: "openrouter/anthropic/claude-sonnet-4-6" },
           },
         ],
-      },
-      tools: {
-        subagents: { model: { primary: "zai/glm-5" } },
       },
     } as unknown as OpenClawConfig;
 
@@ -371,7 +603,7 @@ describe("model-pricing-cache", () => {
                 },
               },
               {
-                id: "z-ai/glm-5",
+                id: "z-ai/glm-openrouter-test",
                 pricing: {
                   prompt: "0.000001",
                   completion: "0.000004",
@@ -392,7 +624,7 @@ describe("model-pricing-cache", () => {
       });
     });
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     expect(
       getCachedGatewayModelPricing({ provider: "anthropic", model: "claude-opus-4-6" }),
@@ -413,12 +645,14 @@ describe("model-pricing-cache", () => {
       cacheRead: 0.3,
       cacheWrite: 0,
     });
-    expect(getCachedGatewayModelPricing({ provider: "zai", model: "glm-5" })).toEqual({
-      input: 1,
-      output: 4,
-      cacheRead: 0,
-      cacheWrite: 0,
-    });
+    expect(getCachedGatewayModelPricing({ provider: "zai", model: "glm-openrouter-test" })).toEqual(
+      {
+        input: 1,
+        output: 4,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+    );
   });
 
   it("does not recurse forever for native openrouter auto refs", async () => {
@@ -457,7 +691,7 @@ describe("model-pricing-cache", () => {
       });
     });
 
-    await expect(refreshGatewayModelPricingCache({ config, fetchImpl })).resolves.toBeUndefined();
+    await expect(runGatewayModelPricingRefresh({ config, fetchImpl })).resolves.toBeUndefined();
     expect(
       getCachedGatewayModelPricing({ provider: "openrouter", model: "openrouter/auto" }),
     ).toEqual({
@@ -523,27 +757,28 @@ describe("model-pricing-cache", () => {
       );
     });
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     const pricing = getCachedGatewayModelPricing({
       provider: "volcengine",
       model: "doubao-seed-2-0-pro",
     });
+    const cached = requirePricing(pricing, "volcengine doubao-seed-2-0-pro");
+    const tiers = requireTieredPricing(cached, "volcengine doubao-seed-2-0-pro");
 
-    expect(pricing).toBeDefined();
-    expect(pricing!.input).toBeCloseTo(0.46);
-    expect(pricing!.output).toBeCloseTo(2.3);
-    expect(pricing!.cacheWrite).toBeCloseTo(0.92);
-    expect(pricing!.tieredPricing).toHaveLength(3);
-    expect(pricing!.tieredPricing![0]).toEqual({
+    expect(cached.input).toBeCloseTo(0.46);
+    expect(cached.output).toBeCloseTo(2.3);
+    expect(cached.cacheWrite).toBeCloseTo(0.92);
+    expect(tiers).toHaveLength(3);
+    expect(tiers[0]).toEqual({
       input: expect.closeTo(0.46),
       output: expect.closeTo(2.3),
       cacheRead: 0,
       cacheWrite: expect.closeTo(0.092),
       range: [0, 32000],
     });
-    expect(pricing!.tieredPricing![2].cacheWrite).toBeCloseTo(0.28);
-    expect(pricing!.tieredPricing![2].range).toEqual([128000, 256000]);
+    expect(expectDefined(tiers[2], "tiers[2] test invariant").cacheWrite).toBeCloseTo(0.28);
+    expect(expectDefined(tiers[2], "tiers[2] test invariant").range).toEqual([128000, 256000]);
   });
 
   it("normalizes LiteLLM open-ended range [start] to [start, Infinity]", async () => {
@@ -591,18 +826,21 @@ describe("model-pricing-cache", () => {
       );
     });
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     const pricing = getCachedGatewayModelPricing({
       provider: "volcengine",
       model: "doubao-open",
     });
+    const tiers = requireTieredPricing(
+      requirePricing(pricing, "volcengine doubao-open"),
+      "volcengine doubao-open",
+    );
 
-    expect(pricing).toBeDefined();
-    expect(pricing!.tieredPricing).toHaveLength(2);
-    expect(pricing!.tieredPricing![0].range).toEqual([0, 32000]);
-    expect(pricing!.tieredPricing![1].range).toEqual([32000, Infinity]);
-    expect(pricing!.tieredPricing![1].cacheWrite).toBeCloseTo(0.14);
+    expect(tiers).toHaveLength(2);
+    expect(expectDefined(tiers[0], "tiers[0] test invariant").range).toEqual([0, 32000]);
+    expect(expectDefined(tiers[1], "tiers[1] test invariant").range).toEqual([32000, Infinity]);
+    expect(expectDefined(tiers[1], "tiers[1] test invariant").cacheWrite).toBeCloseTo(0.14);
   });
 
   it("merges OpenRouter flat pricing with LiteLLM tiered pricing", async () => {
@@ -664,21 +902,22 @@ describe("model-pricing-cache", () => {
       );
     });
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     const pricing = getCachedGatewayModelPricing({
       provider: "dashscope",
       model: "qwen-plus",
     });
+    const cached = requirePricing(pricing, "dashscope qwen-plus");
+    const tiers = requireTieredPricing(cached, "dashscope qwen-plus");
 
-    expect(pricing).toBeDefined();
     // OpenRouter base flat pricing is used
-    expect(pricing!.input).toBeCloseTo(0.4);
-    expect(pricing!.output).toBeCloseTo(2.4);
+    expect(cached.input).toBeCloseTo(0.4);
+    expect(cached.output).toBeCloseTo(2.4);
     // LiteLLM tiered pricing is merged in
-    expect(pricing!.tieredPricing).toHaveLength(2);
-    expect(pricing!.tieredPricing![1].range).toEqual([256000, 1000000]);
-    expect(pricing!.tieredPricing![1].cacheWrite).toBeCloseTo(0.1);
+    expect(tiers).toHaveLength(2);
+    expect(expectDefined(tiers[1], "tiers[1] test invariant").range).toEqual([256000, 1000000]);
+    expect(expectDefined(tiers[1], "tiers[1] test invariant").cacheWrite).toBeCloseTo(0.1);
   });
 
   it("falls back gracefully when LiteLLM fetch fails", async () => {
@@ -715,7 +954,7 @@ describe("model-pricing-cache", () => {
       return new Response("Internal Server Error", { status: 500 });
     });
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     // OpenRouter pricing still works
     expect(
@@ -761,6 +1000,54 @@ describe("model-pricing-cache", () => {
     stop();
   });
 
+  it("aborts in-flight bootstrap pricing fetches after stop", async () => {
+    const config = {
+      agents: {
+        defaults: {
+          model: { primary: "anthropic/claude-opus-4-6" },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const abortedUrls: string[] = [];
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const fetchImpl = withFetchPreconnect(
+      vi.fn(
+        (input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            const url =
+              typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+            const signal = requireAbortSignal(init?.signal);
+            signal.addEventListener(
+              "abort",
+              () => {
+                abortedUrls.push(url);
+                reject(toLintErrorObject(signal.reason, "Non-Error rejection"));
+              },
+              { once: true },
+            );
+          }),
+      ),
+    );
+
+    try {
+      const stop = startGatewayModelPricingRefresh({ config, fetchImpl });
+
+      await vi.dynamicImportSettled();
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      stop();
+      await vi.waitFor(() => expect(abortedUrls).toHaveLength(2));
+      await vi.dynamicImportSettled();
+
+      const scheduledDelays = setTimeoutSpy.mock.calls.map(([, delay]) => delay);
+      expect(scheduledDelays).not.toContain(24 * 60 * 60_000);
+      expect(
+        getCachedGatewayModelPricing({ provider: "anthropic", model: "claude-opus-4-6" }),
+      ).toBeUndefined();
+    } finally {
+      setTimeoutSpy.mockRestore();
+    }
+  });
+
   it("does not bootstrap remote pricing when pricing is disabled", async () => {
     const config = {
       agents: {
@@ -790,7 +1077,7 @@ describe("model-pricing-cache", () => {
     } as unknown as OpenClawConfig;
     const fetchImpl = withFetchPreconnect(vi.fn());
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
     expect(fetchImpl).not.toHaveBeenCalled();
   });
@@ -820,18 +1107,22 @@ describe("model-pricing-cache", () => {
       throw timeoutError;
     });
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
-    expect(warnings).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining(
+    expect(
+      warnings.some((message) =>
+        message.includes(
           "OpenRouter pricing fetch failed (timeout 60s): TimeoutError: The operation was aborted due to timeout",
         ),
-        expect.stringContaining(
+      ),
+    ).toBe(true);
+    expect(
+      warnings.some((message) =>
+        message.includes(
           "LiteLLM pricing fetch failed (timeout 60s): TimeoutError: The operation was aborted due to timeout",
         ),
-      ]),
-    );
+      ),
+    ).toBe(true);
   });
 
   it("treats oversized LiteLLM catalog responses as source failures", async () => {
@@ -843,6 +1134,7 @@ describe("model-pricing-cache", () => {
       },
     } as unknown as OpenClawConfig;
 
+    const liteLLMCancel = vi.fn(async () => undefined);
     const fetchImpl = withFetchPreconnect(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url.includes("openrouter.ai")) {
@@ -865,17 +1157,85 @@ describe("model-pricing-cache", () => {
           },
         );
       }
-      return new Response("{}", {
+      const liteLLMResponse = new Response("{}", {
         status: 200,
         headers: {
           "Content-Type": "application/json",
           "Content-Length": "6000000",
         },
       });
+      vi.spyOn(liteLLMResponse.body!, "cancel").mockImplementation(liteLLMCancel);
+      return liteLLMResponse;
     });
 
-    await refreshGatewayModelPricingCache({ config, fetchImpl });
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
 
+    expect(liteLLMCancel).toHaveBeenCalledOnce();
+    expect(getCachedGatewayModelPricing({ provider: "kimi", model: "kimi-k2.6" })).toEqual({
+      input: 0.95,
+      output: 4,
+      cacheRead: 0.16,
+      cacheWrite: 0,
+    });
+  });
+
+  it("bounds streamed LiteLLM catalog responses without content-length", async () => {
+    const config = {
+      agents: {
+        defaults: {
+          model: { primary: "kimi/kimi-k2.6" },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    const liteLLMCancel = vi.fn(async () => undefined);
+    let liteLLMPullCount = 0;
+    const fetchImpl = withFetchPreconnect(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("openrouter.ai")) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "moonshotai/kimi-k2.6",
+                pricing: {
+                  prompt: "0.00000095",
+                  completion: "0.000004",
+                  input_cache_read: "0.00000016",
+                },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      return new Response(
+        new ReadableStream({
+          pull(controller) {
+            liteLLMPullCount += 1;
+            controller.enqueue(new Uint8Array(liteLLMPullCount === 1 ? 5 * 1024 * 1024 : 1));
+          },
+          cancel: liteLLMCancel,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    });
+
+    await runGatewayModelPricingRefresh({ config, fetchImpl });
+
+    expect(liteLLMPullCount).toBeGreaterThanOrEqual(2);
+    expect(liteLLMCancel).toHaveBeenCalledOnce();
+    const health = getGatewayModelPricingHealth();
+    expect(health.sources[0]?.source).toBe("litellm");
+    expect(health.sources[0]?.detail).toContain(
+      "LiteLLM pricing response too large: 5242881 bytes",
+    );
     expect(getCachedGatewayModelPricing({ provider: "kimi", model: "kimi-k2.6" })).toEqual({
       input: 0.95,
       output: 4,
@@ -900,3 +1260,18 @@ function createManifestRecord(overrides: Partial<PluginManifestRecord>): PluginM
     ...overrides,
   };
 }
+
+function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
+}
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

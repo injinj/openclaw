@@ -1,11 +1,9 @@
+// Evaluates plugin config policy without activating plugin runtime code.
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
-  createEffectiveEnableStateResolver,
-  createPluginEnableStateResolver,
   resolveMemorySlotDecisionShared,
   resolvePluginActivationDecisionShared,
   toPluginActivationState,
-  type PluginActivationSource,
   type PluginActivationStateLike,
 } from "./config-activation-shared.js";
 import {
@@ -19,10 +17,9 @@ import {
 import type { PluginKind } from "./plugin-kind.types.js";
 import type { PluginOrigin } from "./plugin-origin.types.js";
 
-export type { PluginActivationSource };
-export type PluginActivationState = PluginActivationStateLike;
+type PluginActivationState = PluginActivationStateLike;
 
-export type NormalizedPluginsConfig = SharedNormalizedPluginsConfig;
+type NormalizedPluginsConfig = SharedNormalizedPluginsConfig;
 
 export function normalizePluginsConfigWithResolver(
   config?: OpenClawConfig["plugins"],
@@ -31,7 +28,7 @@ export function normalizePluginsConfigWithResolver(
   return normalizePluginsConfigWithResolverShared(config, normalizePluginId);
 }
 
-export function resolvePluginActivationState(params: {
+function resolvePluginActivationState(params: {
   id: string;
   origin: PluginOrigin;
   config: NormalizedPluginsConfig;
@@ -54,12 +51,7 @@ export function resolvePluginActivationState(params: {
 }
 export const hasExplicitPluginConfig = hasExplicitPluginConfigShared;
 
-export const resolveEnableState = createPluginEnableStateResolver<
-  NormalizedPluginsConfig,
-  PluginOrigin
->(resolvePluginActivationState);
-
-export const isBundledChannelEnabledByChannelConfig = isBundledChannelEnabledByChannelConfigShared;
+const isBundledChannelEnabledByChannelConfig = isBundledChannelEnabledByChannelConfigShared;
 
 type PolicyEffectiveActivationParams = {
   id: string;
@@ -71,11 +63,6 @@ type PolicyEffectiveActivationParams = {
   sourceRootConfig?: OpenClawConfig;
   autoEnabledReason?: string;
 };
-
-export const resolveEffectiveEnableState =
-  createEffectiveEnableStateResolver<PolicyEffectiveActivationParams>(
-    resolveEffectivePluginActivationState,
-  );
 
 export function resolveEffectivePluginActivationState(
   params: PolicyEffectiveActivationParams,

@@ -1,8 +1,11 @@
-import { execFile, execFileSync, spawn } from "node:child_process";
+// Microsoft Foundry plugin module implements cli behavior.
+import { execFileSync, spawn } from "node:child_process";
+import { runExec } from "openclaw/plugin-sdk/process-runtime";
 import {
   normalizeOptionalString,
   normalizeStringifiedOptionalString,
-} from "openclaw/plugin-sdk/text-runtime";
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { AzAccessToken, AzAccount } from "./shared.js";
 import { COGNITIVE_SERVICES_RESOURCE } from "./shared.js";
 
@@ -33,7 +36,7 @@ function summarizeAzErrorMessage(raw: string): string {
   if (/aadsts\d+/i.test(normalized)) {
     return "Azure login failed for the selected tenant. Re-run `az login --use-device-code` and confirm the tenant is correct.";
   }
-  return normalized.slice(0, 300);
+  return truncateUtf16Safe(normalized, 300);
 }
 
 function buildAzCommandError(error: Error, stderr: string, stdout: string): Error {
@@ -53,25 +56,19 @@ export function execAz(args: string[]): string {
   );
 }
 
-export async function execAzAsync(args: string[]): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    execFile(
-      "az",
-      args,
-      {
-        encoding: "utf-8",
-        timeout: 30_000,
-        shell: process.platform === "win32",
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(buildAzCommandError(error, stderr ?? "", stdout ?? ""));
-          return;
-        }
-        resolve(normalizeStringifiedOptionalString(stdout) ?? "");
-      },
+async function execAzAsync(args: string[]): Promise<string> {
+  try {
+    const { stdout } = await runExec("az", args, { logOutput: false, timeoutMs: 30_000 });
+    return normalizeStringifiedOptionalString(stdout) ?? "";
+  } catch (error) {
+    const commandError = error instanceof Error ? error : new Error(String(error));
+    const output = error as { stderr?: unknown; stdout?: unknown };
+    throw buildAzCommandError(
+      commandError,
+      typeof output.stderr === "string" ? output.stderr : "",
+      typeof output.stdout === "string" ? output.stdout : "",
     );
-  });
+  }
 }
 
 export function isAzCliInstalled(): boolean {
@@ -85,7 +82,7 @@ export function isAzCliInstalled(): boolean {
 
 export function getLoggedInAccount(): AzAccount | null {
   try {
-    return JSON.parse(execAz(["account", "show", "--output", "json"])) as AzAccount;
+    return parseAzJson(execAz(["account", "show", "--output", "json"]), "account") as AzAccount;
   } catch {
     return null;
   }
@@ -93,8 +90,9 @@ export function getLoggedInAccount(): AzAccount | null {
 
 export function listSubscriptions(): AzAccount[] {
   try {
-    const subs = JSON.parse(
+    const subs = parseAzJson(
       execAz(["account", "list", "--output", "json", "--all"]),
+      "subscriptions",
     ) as AzAccount[];
     return subs.filter((sub) => sub.state === "Enabled");
   } catch {
@@ -102,20 +100,28 @@ export function listSubscriptions(): AzAccount[] {
   }
 }
 
+function parseAzJson(raw: string, label: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error(`Azure CLI returned malformed ${label} JSON.`);
+  }
+}
+
 type AccessTokenParams = {
+  scope?: string;
   subscriptionId?: string;
   tenantId?: string;
 };
 
 function buildAccessTokenArgs(params?: AccessTokenParams): string[] {
-  const args = [
-    "account",
-    "get-access-token",
-    "--resource",
-    COGNITIVE_SERVICES_RESOURCE,
-    "--output",
-    "json",
-  ];
+  const args = ["account", "get-access-token"];
+  if (params?.scope) {
+    args.push("--scope", params.scope);
+  } else {
+    args.push("--resource", COGNITIVE_SERVICES_RESOURCE);
+  }
+  args.push("--output", "json");
   if (params?.subscriptionId) {
     args.push("--subscription", params.subscriptionId);
   } else if (params?.tenantId) {
@@ -125,13 +131,16 @@ function buildAccessTokenArgs(params?: AccessTokenParams): string[] {
 }
 
 export function getAccessTokenResult(params?: AccessTokenParams): AzAccessToken {
-  return JSON.parse(execAz(buildAccessTokenArgs(params))) as AzAccessToken;
+  return parseAzJson(execAz(buildAccessTokenArgs(params)), "access token") as AzAccessToken;
 }
 
 export async function getAccessTokenResultAsync(
   params?: AccessTokenParams,
 ): Promise<AzAccessToken> {
-  return JSON.parse(await execAzAsync(buildAccessTokenArgs(params))) as AzAccessToken;
+  return parseAzJson(
+    await execAzAsync(buildAccessTokenArgs(params)),
+    "access token",
+  ) as AzAccessToken;
 }
 
 export async function azLoginDeviceCode(): Promise<void> {
@@ -170,13 +179,17 @@ export async function azLoginDeviceCodeWithOptions(params: {
       }
       return total;
     };
-    child.stdout?.on("data", (chunk) => {
-      const text = String(chunk);
+    // Decode pipes statefully so a multibyte UTF-8 code point split across
+    // chunk boundaries does not become U+FFFD in terminal output / error text.
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      const text = chunk;
       stdoutLen = appendBoundedChunk(stdoutChunks, text, stdoutLen);
       process.stdout.write(text);
     });
-    child.stderr?.on("data", (chunk) => {
-      const text = String(chunk);
+    child.stderr?.on("data", (chunk: string) => {
+      const text = chunk;
       stderrLen = appendBoundedChunk(stderrChunks, text, stderrLen);
       process.stderr.write(text);
     });

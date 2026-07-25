@@ -1,3 +1,4 @@
+// Qa Lab helper module supports mock model config behavior.
 import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-shared";
 
 const ZERO_COST = Object.freeze({
@@ -14,11 +15,46 @@ function cloneProvider(provider: ModelProviderConfig): ModelProviderConfig {
   };
 }
 
-export function trimTrailingApiV1(baseUrl: string) {
+function trimTrailingApiV1(baseUrl: string) {
   return baseUrl.replace(/\/v1\/?$/i, "");
 }
 
-export function createMockOpenAiResponsesProvider(baseUrl: string): ModelProviderConfig {
+const DEFAULT_OPENAI_MODEL_IDS = ["gpt-5.6-luna", "gpt-5.6-luna-alt"] as const;
+
+function selectedOpenAiModelIds(
+  primaryProviderId: string,
+  selectedModelRefs: readonly (string | undefined)[],
+) {
+  const selected = selectedModelRefs.flatMap((modelRef) => {
+    const slash = modelRef?.indexOf("/") ?? -1;
+    if (!modelRef || slash <= 0 || slash === modelRef.length - 1) {
+      return [];
+    }
+    const providerId = modelRef.slice(0, slash);
+    return providerId === primaryProviderId || providerId === "openai"
+      ? [modelRef.slice(slash + 1)]
+      : [];
+  });
+  return selected.length > 0 ? [...new Set(selected)] : [...DEFAULT_OPENAI_MODEL_IDS];
+}
+
+function createMockOpenAiTextModel(id: string): ModelProviderConfig["models"][number] {
+  return {
+    id,
+    name: id,
+    api: "openai-responses",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: 128_000,
+    maxTokens: 4096,
+  };
+}
+
+function createMockOpenAiResponsesProvider(
+  baseUrl: string,
+  modelIds: readonly string[],
+): ModelProviderConfig {
   return {
     baseUrl,
     apiKey: "test",
@@ -27,26 +63,7 @@ export function createMockOpenAiResponsesProvider(baseUrl: string): ModelProvide
       allowPrivateNetwork: true,
     },
     models: [
-      {
-        id: "gpt-5.5",
-        name: "gpt-5.5",
-        api: "openai-responses",
-        reasoning: false,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: 128_000,
-        maxTokens: 4096,
-      },
-      {
-        id: "gpt-5.5-alt",
-        name: "gpt-5.5-alt",
-        api: "openai-responses",
-        reasoning: false,
-        input: ["text", "image"],
-        cost: ZERO_COST,
-        contextWindow: 128_000,
-        maxTokens: 4096,
-      },
+      ...modelIds.map(createMockOpenAiTextModel),
       {
         id: "gpt-image-1",
         name: "gpt-image-1",
@@ -61,7 +78,7 @@ export function createMockOpenAiResponsesProvider(baseUrl: string): ModelProvide
   };
 }
 
-export function createMockAnthropicMessagesProvider(baseUrl: string): ModelProviderConfig {
+function createMockAnthropicMessagesProvider(baseUrl: string): ModelProviderConfig {
   return {
     baseUrl: trimTrailingApiV1(baseUrl),
     apiKey: "test",
@@ -71,14 +88,14 @@ export function createMockAnthropicMessagesProvider(baseUrl: string): ModelProvi
     },
     models: [
       {
-        id: "claude-opus-4-6",
-        name: "claude-opus-4-6",
+        id: "claude-opus-4-8",
+        name: "claude-opus-4-8",
         api: "anthropic-messages",
         reasoning: false,
         input: ["text", "image"],
         cost: ZERO_COST,
-        contextWindow: 200_000,
-        maxTokens: 4096,
+        contextWindow: 1_048_576,
+        maxTokens: 128_000,
       },
       {
         id: "claude-sonnet-4-6",
@@ -94,11 +111,29 @@ export function createMockAnthropicMessagesProvider(baseUrl: string): ModelProvi
   };
 }
 
-export function createMockProviderMap(primaryProviderId: string, providerBaseUrl: string) {
-  const primaryProvider = createMockOpenAiResponsesProvider(providerBaseUrl);
+export function createMockProviderMap(
+  primaryProviderId: string,
+  providerBaseUrl: string,
+  selectedModelRefs: readonly (string | undefined)[] = [],
+) {
+  const primaryProvider = createMockOpenAiResponsesProvider(
+    providerBaseUrl,
+    selectedOpenAiModelIds(primaryProviderId, selectedModelRefs),
+  );
   return {
     [primaryProviderId]: primaryProvider,
     openai: cloneProvider(primaryProvider),
     anthropic: createMockAnthropicMessagesProvider(providerBaseUrl),
   };
+}
+
+export function listMockOpenAiServerModelIds(selectedModelRefs: readonly string[] = []) {
+  return [
+    ...selectedOpenAiModelIds("mock-openai", selectedModelRefs),
+    "gpt-image-1",
+    "gpt-4o-transcribe",
+    "text-embedding-3-small",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+  ];
 }

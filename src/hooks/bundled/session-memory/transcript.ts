@@ -1,6 +1,39 @@
+// Session memory transcript helpers persist compact session transcript excerpts.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { sanitizeModelSpecialTokens } from "../../../security/external-content.js";
 import { hasInterSessionUserProvenance } from "../../../sessions/input-provenance.js";
+import { isOpenClawDeliveryMirrorAssistantMessage } from "../../../shared/transcript-only-openclaw-assistant.js";
+
+const SESSION_MEMORY_TOOL_DIRECTIVE_PREFIX = String.raw`(?:(?:\|DSML\|)|(?:\uFF5CDSML\uFF5C))?`;
+const SESSION_MEMORY_TOOL_DIRECTIVE_KIND = String.raw`(?:tool_calls?|function_calls?|tool_use_error)`;
+const SESSION_MEMORY_DROP_BLOCK_RE = new RegExp(
+  String.raw`<${SESSION_MEMORY_TOOL_DIRECTIVE_PREFIX}${SESSION_MEMORY_TOOL_DIRECTIVE_KIND}\b[^>]*>` +
+    String.raw`[\s\S]*?(?:<\/${SESSION_MEMORY_TOOL_DIRECTIVE_PREFIX}${SESSION_MEMORY_TOOL_DIRECTIVE_KIND}>|$)`,
+  "gi",
+);
+const SESSION_MEMORY_ROLE_DIRECTIVE_BLOCK_RE = /<(system|assistant|user)\b[^>]*>[\s\S]*?<\/\1>/gi;
+const SESSION_MEMORY_ROLE_DIRECTIVE_TAG_RE = /<\/?(?:system|assistant|user)\b[^>]*>/gi;
+const SESSION_MEMORY_TRAILING_NO_REPLY_RE = /(?:^|\n)\s*NO_REPLY\s*$/i;
+
+function isNoReplyMarker(text: string): boolean {
+  const trimmed = text.trim();
+  return /^NO_REPLY$/i.test(trimmed) || /^\{\s*"action"\s*:\s*"NO_REPLY"\s*\}$/i.test(trimmed);
+}
+
+function sanitizeSessionMemoryTranscriptText(text: string): string | null {
+  if (isNoReplyMarker(text)) {
+    return null;
+  }
+  const withoutArtifacts = sanitizeModelSpecialTokens(text)
+    .replace(SESSION_MEMORY_DROP_BLOCK_RE, "")
+    .replace(SESSION_MEMORY_ROLE_DIRECTIVE_BLOCK_RE, "")
+    .replace(SESSION_MEMORY_ROLE_DIRECTIVE_TAG_RE, "")
+    .replace(SESSION_MEMORY_TRAILING_NO_REPLY_RE, "")
+    .trim();
+
+  return withoutArtifacts || null;
+}
 
 function extractTextMessageContent(content: unknown): string | undefined {
   if (typeof content === "string") {
@@ -21,41 +54,101 @@ function extractTextMessageContent(content: unknown): string | undefined {
   return undefined;
 }
 
-export async function getRecentSessionContent(
+type RenderedSessionMemoryMessage = {
+  isDeliveryMirror: boolean;
+  role: "assistant" | "user";
+  text?: string;
+};
+
+function renderSessionMemoryMessage(entry: unknown): RenderedSessionMemoryMessage | undefined {
+  if (!entry || typeof entry !== "object") {
+    return undefined;
+  }
+  const record = entry as {
+    message?: {
+      content?: unknown;
+      provenance?: unknown;
+      role?: unknown;
+    };
+    type?: unknown;
+  };
+  if (record.type !== "message" || !record.message) {
+    return undefined;
+  }
+  const role = record.message.role;
+  if ((role !== "user" && role !== "assistant") || !("content" in record.message)) {
+    return undefined;
+  }
+  if (role === "user" && hasInterSessionUserProvenance(record.message)) {
+    return undefined;
+  }
+  const text = extractTextMessageContent(record.message.content);
+  const sanitized = text ? sanitizeSessionMemoryTranscriptText(text) : null;
+  if (!sanitized) {
+    return undefined;
+  }
+  if (sanitized.startsWith("/")) {
+    return role === "user" ? { isDeliveryMirror: false, role } : undefined;
+  }
+  return {
+    isDeliveryMirror: isOpenClawDeliveryMirrorAssistantMessage(record.message),
+    role,
+    text: sanitized,
+  };
+}
+
+/** Renders recent user/assistant transcript events into session memory text. */
+export function getRecentSessionContentFromEvents(
+  events: readonly unknown[],
+  messageCount = 15,
+): string | null {
+  const allMessages: string[] = [];
+  let lastAssistantText: string | undefined;
+  for (const event of events) {
+    const rendered = renderSessionMemoryMessage(event);
+    if (!rendered) {
+      continue;
+    }
+    if (rendered.role === "user") {
+      // New turn: reset even when slash commands are omitted from memory, so
+      // later standalone delivery mirrors are preserved.
+      lastAssistantText = undefined;
+    }
+    if (!rendered.text) {
+      continue;
+    }
+    // Skip delivery-mirror rows only when they duplicate the preceding
+    // assistant text. Delivery-mirror rows with unique visible content
+    // (e.g., message-tool replies) are preserved.
+    if (rendered.isDeliveryMirror && rendered.text === lastAssistantText) {
+      continue;
+    }
+    allMessages.push(`${rendered.role}: ${rendered.text}`);
+    if (rendered.role === "assistant") {
+      lastAssistantText = rendered.text;
+    }
+  }
+  return allMessages.slice(-messageCount).join("\n");
+}
+
+async function getRecentSessionContent(
   sessionFilePath: string,
-  messageCount: number = 15,
+  messageCount = 15,
 ): Promise<string | null> {
   try {
     const content = await fs.readFile(sessionFilePath, "utf-8");
     const lines = content.trim().split("\n");
 
-    const allMessages: string[] = [];
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry.type === "message" && entry.message) {
-          const msg = entry.message as {
-            role?: unknown;
-            content?: unknown;
-            provenance?: unknown;
-          };
-          const role = msg.role;
-          if ((role === "user" || role === "assistant") && "content" in msg && msg.content) {
-            if (role === "user" && hasInterSessionUserProvenance(msg)) {
-              continue;
-            }
-            const text = extractTextMessageContent(msg.content);
-            if (text && !text.startsWith("/")) {
-              allMessages.push(`${role}: ${text}`);
-            }
-          }
+    return getRecentSessionContentFromEvents(
+      lines.flatMap((line) => {
+        try {
+          return [JSON.parse(line) as unknown];
+        } catch {
+          return [];
         }
-      } catch {
-        // Skip invalid JSON lines.
-      }
-    }
-
-    return allMessages.slice(-messageCount).join("\n");
+      }),
+      messageCount,
+    );
   } catch {
     return null;
   }
@@ -63,7 +156,7 @@ export async function getRecentSessionContent(
 
 export async function getRecentSessionContentWithResetFallback(
   sessionFilePath: string,
-  messageCount: number = 15,
+  messageCount = 15,
 ): Promise<string | null> {
   const primary = await getRecentSessionContent(sessionFilePath, messageCount);
   if (primary) {
@@ -81,14 +174,18 @@ export async function getRecentSessionContentWithResetFallback(
       return primary;
     }
 
-    const latestResetPath = path.join(dir, resetCandidates[resetCandidates.length - 1]);
+    const latestReset = resetCandidates.at(-1);
+    if (latestReset === undefined) {
+      return primary;
+    }
+    const latestResetPath = path.join(dir, latestReset);
     return (await getRecentSessionContent(latestResetPath, messageCount)) || primary;
   } catch {
     return primary;
   }
 }
 
-export function stripResetSuffix(fileName: string): string {
+function stripResetSuffix(fileName: string): string {
   const resetIndex = fileName.indexOf(".reset.");
   return resetIndex === -1 ? fileName : fileName.slice(0, resetIndex);
 }
@@ -124,8 +221,9 @@ export async function findPreviousSessionFile(params: {
         .filter((name) => name.startsWith(`${canonicalFile}.reset.`))
         .toSorted()
         .toReversed();
-      if (canonicalResetVariants.length > 0) {
-        return path.join(params.sessionsDir, canonicalResetVariants[0]);
+      const [canonicalResetVariant] = canonicalResetVariants;
+      if (canonicalResetVariant !== undefined) {
+        return path.join(params.sessionsDir, canonicalResetVariant);
       }
 
       const topicVariants = files
@@ -137,8 +235,9 @@ export async function findPreviousSessionFile(params: {
         )
         .toSorted()
         .toReversed();
-      if (topicVariants.length > 0) {
-        return path.join(params.sessionsDir, topicVariants[0]);
+      const [topicVariant] = topicVariants;
+      if (topicVariant !== undefined) {
+        return path.join(params.sessionsDir, topicVariant);
       }
 
       const topicResetVariants = files
@@ -147,8 +246,9 @@ export async function findPreviousSessionFile(params: {
         )
         .toSorted()
         .toReversed();
-      if (topicResetVariants.length > 0) {
-        return path.join(params.sessionsDir, topicResetVariants[0]);
+      const [topicResetVariant] = topicResetVariants;
+      if (topicResetVariant !== undefined) {
+        return path.join(params.sessionsDir, topicResetVariant);
       }
     }
 
@@ -160,16 +260,18 @@ export async function findPreviousSessionFile(params: {
       .filter((name) => name.endsWith(".jsonl") && !name.includes(".reset."))
       .toSorted()
       .toReversed();
-    if (nonResetJsonl.length > 0) {
-      return path.join(params.sessionsDir, nonResetJsonl[0]);
+    const [nonResetFile] = nonResetJsonl;
+    if (nonResetFile !== undefined) {
+      return path.join(params.sessionsDir, nonResetFile);
     }
 
     const resetJsonl = files
       .filter((name) => name.includes(".jsonl.reset."))
       .toSorted()
       .toReversed();
-    if (resetJsonl.length > 0) {
-      return path.join(params.sessionsDir, resetJsonl[0]);
+    const [resetFile] = resetJsonl;
+    if (resetFile !== undefined) {
+      return path.join(params.sessionsDir, resetFile);
     }
   } catch {
     // Ignore directory read errors.

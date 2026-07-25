@@ -1,11 +1,17 @@
+/**
+ * Sandbox filesystem bridge implementation.
+ *
+ * Resolves container paths to mounted host paths and executes guarded reads, writes, stats, renames, and deletes.
+ */
 import fs from "node:fs";
-import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type {
   SandboxBackendCommandResult,
   SandboxFsBridgeContext,
 } from "./backend-handle.types.js";
 import { runDockerSandboxShellCommand } from "./docker-backend.js";
 import {
+  buildPinnedCopyPlan,
   buildPinnedMkdirpPlan,
   buildPinnedRemovePlan,
   buildPinnedRenamePlan,
@@ -13,6 +19,7 @@ import {
 } from "./fs-bridge-mutation-helper.js";
 import { SandboxFsPathGuard } from "./fs-bridge-path-safety.js";
 import { buildStatPlan, type SandboxFsCommandPlan } from "./fs-bridge-shell-command-plans.js";
+import { parseSandboxStatMtimeMs, parseSandboxStatSize } from "./fs-bridge-stat-parse.js";
 import type { SandboxFsBridge, SandboxFsStat, SandboxResolvedPath } from "./fs-bridge.types.js";
 import {
   buildSandboxFsMounts,
@@ -30,6 +37,7 @@ type RunCommandOptions = {
 
 export type { SandboxFsBridge, SandboxFsStat, SandboxResolvedPath } from "./fs-bridge.types.js";
 
+/** Create the filesystem bridge for local Docker-style mounted sandboxes. */
 export function createSandboxFsBridge(params: {
   sandbox: SandboxFsBridgeContext;
 }): SandboxFsBridge {
@@ -47,6 +55,8 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
     const mountsByContainer = [...this.mounts].toSorted(
       (a, b) => b.containerRoot.length - a.containerRoot.length,
     );
+    // Longest mount first keeps nested agent/skill mounts from being claimed by
+    // the broader workspace root during symlink and mutation safety checks.
     this.pathGuard = new SandboxFsPathGuard({
       mountsByContainer,
       runCommand: (script, options) => this.runCommand(script, options),
@@ -69,6 +79,39 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
   }): Promise<Buffer> {
     const target = this.resolveResolvedPath(params);
     return this.readPinnedFile(target);
+  }
+
+  async copyFile(params: {
+    sourcePath: string;
+    destinationPath: string;
+    cwd?: string;
+    mkdir?: boolean;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    const source = this.resolveResolvedPath({ filePath: params.sourcePath, cwd: params.cwd });
+    const destination = this.resolveResolvedPath({
+      filePath: params.destinationPath,
+      cwd: params.cwd,
+    });
+    this.ensureWriteAccess(destination, "copy files");
+    const sourceCheck = {
+      target: source,
+      options: { action: "copy files", allowedType: "file" } as const,
+    };
+    const destinationCheck = {
+      target: destination,
+      options: { action: "copy files", requireWritable: true } as const,
+    };
+    await this.runCheckedCommand({
+      ...buildPinnedCopyPlan({
+        sourceCheck,
+        destinationCheck,
+        source: await this.pathGuard.resolveAnchoredPinnedEntry(source, "copy files"),
+        destination: await this.pathGuard.resolveAnchoredPinnedEntry(destination, "copy files"),
+        mkdir: params.mkdir !== false,
+      }),
+      signal: params.signal,
+    });
   }
 
   async writeFile(params: {
@@ -207,12 +250,10 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
     }
     const text = result.stdout.toString("utf8").trim();
     const [typeRaw, sizeRaw, mtimeRaw] = text.split("|");
-    const size = Number.parseInt(sizeRaw ?? "0", 10);
-    const mtime = Number.parseInt(mtimeRaw ?? "0", 10) * 1000;
     return {
       type: coerceStatType(typeRaw),
-      size: Number.isFinite(size) ? size : 0,
-      mtimeMs: Number.isFinite(mtime) ? mtime : 0,
+      size: parseSandboxStatSize(sizeRaw),
+      mtimeMs: parseSandboxStatMtimeMs(mtimeRaw),
     };
   }
 
@@ -254,6 +295,8 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
   ): Promise<SandboxBackendCommandResult> {
     await this.pathGuard.assertPathChecks(plan.checks);
     if (plan.recheckBeforeCommand) {
+      // Mutations that can create or swap path parents re-run the anchored
+      // checks immediately before command execution to close TOCTOU gaps.
       await this.pathGuard.assertPathChecks(plan.checks);
     }
     return await this.runCommand(plan.script, {

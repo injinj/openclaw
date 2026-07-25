@@ -1,6 +1,8 @@
+// Qqbot plugin module implements register clear storage behavior.
 import fs from "node:fs";
 import path from "node:path";
-import { getHomeDir } from "../../utils/platform.js";
+import { formatByteSize } from "openclaw/plugin-sdk/number-runtime";
+import { getQQBotMediaPath } from "../../utils/platform.js";
 import type { SlashCommandRegistry } from "../slash-commands.js";
 
 function scanDirectoryFiles(dirPath: string): { filePath: string; size: number }[] {
@@ -35,16 +37,12 @@ function scanDirectoryFiles(dirPath: string): { filePath: string; size: number }
 }
 
 function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-  if (bytes < 1024 * 1024 * 1024) {
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  }
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  return formatByteSize(bytes, {
+    style: "legacy-binary",
+    maxUnit: "giga",
+    separator: " ",
+    fractionDigits: (_value, unit) => (unit === "byte" ? null : 1),
+  });
 }
 
 function removeEmptyDirs(dirPath: string): void {
@@ -75,52 +73,78 @@ function removeEmptyDirs(dirPath: string): void {
 const CLEAR_STORAGE_MAX_DISPLAY = 10;
 
 /**
- * Resolve the canonical downloads directory for an appId under the user's home.
- * Must stay strictly under ~/.openclaw/media/qqbot/downloads/.
+ * Resolve the canonical QQBot downloads directory.
+ *
+ * All inbound attachments and outbound fallback downloads are stored directly
+ * under `~/.openclaw/media/qqbot/downloads/` without appId subdivision.
+ * The clear-storage command therefore cleans the entire downloads root.
  */
-export function resolveQqbotDownloadsDirForApp(appId: string): string {
-  const id = appId.trim();
-  if (!id || id.includes("\0") || /[/\\\n]|\.\./.test(id)) {
-    throw new Error("invalid appId path");
+function resolveQqbotDownloadsDir(): string {
+  return getQQBotMediaPath("downloads");
+}
+
+function clearQqbotDownloads(targetDir: string): string {
+  const files = scanDirectoryFiles(targetDir);
+
+  if (files.length === 0) {
+    return `✅ 目录已为空，无需清理`;
   }
-  const base = path.join(getHomeDir(), ".openclaw", "media", "qqbot", "downloads");
-  const resolvedBase = path.resolve(base);
-  const target = path.resolve(path.join(resolvedBase, id));
-  if (target === resolvedBase || !target.startsWith(resolvedBase + path.sep)) {
-    throw new Error("invalid appId path");
+
+  let deletedCount = 0;
+  let deletedSize = 0;
+  let failedCount = 0;
+
+  for (const f of files) {
+    try {
+      fs.unlinkSync(f.filePath);
+      deletedCount++;
+      deletedSize += f.size;
+    } catch {
+      failedCount++;
+    }
   }
-  return target;
+
+  try {
+    removeEmptyDirs(targetDir);
+  } catch {
+    // Non-critical, silently ignore.
+  }
+
+  if (failedCount === 0) {
+    return [
+      `✅ 清理成功`,
+      ``,
+      `已删除 ${deletedCount} 个文件，释放 ${formatBytes(deletedSize)} 磁盘空间。`,
+    ].join("\n");
+  }
+
+  return [
+    `⚠️ 部分清理完成`,
+    ``,
+    `已删除 ${deletedCount} 个文件（${formatBytes(deletedSize)}），${failedCount} 个文件删除失败。`,
+  ].join("\n");
 }
 
 export function registerClearStorageCommands(registry: SlashCommandRegistry): void {
   registry.register({
     name: "bot-clear-storage",
     description: "清理通过 QQBot 对话产生的下载文件，释放主机磁盘空间",
+    requireAuth: true,
+    c2cOnly: true,
     usage: [
       `/bot-clear-storage`,
       ``,
-      `扫描当前机器人产生的下载文件并列出明细。`,
+      `扫描 QQBot 下载目录下的所有文件并列出明细。`,
       `确认后执行删除，释放主机磁盘空间。`,
       ``,
       `/bot-clear-storage --force   确认执行清理`,
       ``,
       `⚠️ 仅在私聊中可用。`,
     ].join("\n"),
-    handler: (ctx) => {
-      const { appId, type } = ctx;
-
-      if (type !== "c2c") {
-        return `💡 请在私聊中使用此指令`;
-      }
-
+    handler: async (ctx) => {
       const isForce = ctx.args.trim() === "--force";
-      let targetDir: string;
-      try {
-        targetDir = resolveQqbotDownloadsDirForApp(appId);
-      } catch {
-        return `❌ 无效的机器人标识，无法解析清理目录。`;
-      }
-      const displayDir = `~/.openclaw/media/qqbot/downloads/${appId}`;
+      const targetDir = resolveQqbotDownloadsDir();
+      const displayDir = `~/.openclaw/media/qqbot/downloads`;
 
       if (!isForce) {
         const files = scanDirectoryFiles(targetDir);
@@ -159,45 +183,12 @@ export function registerClearStorageCommands(registry: SlashCommandRegistry): vo
         return lines.join("\n");
       }
 
-      const files = scanDirectoryFiles(targetDir);
-
-      if (files.length === 0) {
-        return `✅ 目录已为空，无需清理`;
+      const run = async () => clearQqbotDownloads(targetDir);
+      if (!ctx.runIngressEffectOnce) {
+        return await run();
       }
-
-      let deletedCount = 0;
-      let deletedSize = 0;
-      let failedCount = 0;
-
-      for (const f of files) {
-        try {
-          fs.unlinkSync(f.filePath);
-          deletedCount++;
-          deletedSize += f.size;
-        } catch {
-          failedCount++;
-        }
-      }
-
-      try {
-        removeEmptyDirs(targetDir);
-      } catch {
-        // Non-critical, silently ignore.
-      }
-
-      if (failedCount === 0) {
-        return [
-          `✅ 清理成功`,
-          ``,
-          `已删除 ${deletedCount} 个文件，释放 ${formatBytes(deletedSize)} 磁盘空间。`,
-        ].join("\n");
-      }
-
-      return [
-        `⚠️ 部分清理完成`,
-        ``,
-        `已删除 ${deletedCount} 个文件（${formatBytes(deletedSize)}），${failedCount} 个文件删除失败。`,
-      ].join("\n");
+      const outcome = await ctx.runIngressEffectOnce({ effect: "clear-storage", run });
+      return outcome.kind === "executed" ? outcome.value : `✅ 此清理请求已经处理，无需重复清理`;
     },
   });
 }

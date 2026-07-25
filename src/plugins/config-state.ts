@@ -1,9 +1,10 @@
-import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+/** Normalizes plugin config and resolves effective enablement, slots, and activation sources. */
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
-import { listBundledPluginMetadata } from "./bundled-plugin-metadata.js";
+} from "@openclaw/normalization-core/string-coerce";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   createEffectiveEnableStateResolver,
   createPluginEnableStateResolver,
@@ -18,6 +19,7 @@ import {
   hasExplicitPluginConfig as hasExplicitPluginConfigShared,
   isBundledChannelEnabledByChannelConfig as isBundledChannelEnabledByChannelConfigShared,
   normalizePluginsConfigWithResolver,
+  type NormalizePluginId,
   type NormalizedPluginsConfig as SharedNormalizedPluginsConfig,
 } from "./config-normalization-shared.js";
 import type { PluginOrigin } from "./plugin-origin.types.js";
@@ -33,10 +35,7 @@ export type PluginActivationConfigSource = {
 
 export type NormalizedPluginsConfig = SharedNormalizedPluginsConfig;
 
-let bundledPluginAliasLookupCache: ReadonlyMap<string, string> | undefined;
-
 const BUILT_IN_PLUGIN_ALIAS_FALLBACKS: ReadonlyArray<readonly [alias: string, pluginId: string]> = [
-  ["openai-codex", "openai"],
   ["google-gemini-cli", "google"],
   ["minimax-portal", "minimax"],
   ["minimax-portal-auth", "minimax"],
@@ -47,51 +46,77 @@ const BUILT_IN_PLUGIN_ALIAS_LOOKUP = new Map<string, string>([
 ]);
 
 function getBundledPluginAliasLookup(): ReadonlyMap<string, string> {
-  if (bundledPluginAliasLookupCache) {
-    return bundledPluginAliasLookupCache;
-  }
-
   const lookup = new Map<string, string>();
-  for (const plugin of listBundledPluginMetadata({ includeChannelConfigs: false })) {
-    const pluginId = normalizeOptionalLowercaseString(plugin.manifest.id);
-    if (pluginId) {
-      lookup.set(pluginId, plugin.manifest.id);
-    }
-    for (const providerId of plugin.manifest.providers ?? []) {
-      const normalizedProviderId = normalizeOptionalLowercaseString(providerId);
-      if (normalizedProviderId) {
-        lookup.set(normalizedProviderId, plugin.manifest.id);
-      }
-    }
-    for (const legacyPluginId of plugin.manifest.legacyPluginIds ?? []) {
-      const normalizedLegacyPluginId = normalizeOptionalLowercaseString(legacyPluginId);
-      if (normalizedLegacyPluginId) {
-        lookup.set(normalizedLegacyPluginId, plugin.manifest.id);
-      }
-    }
-  }
   for (const [alias, pluginId] of BUILT_IN_PLUGIN_ALIAS_FALLBACKS) {
     lookup.set(alias, pluginId);
   }
-  bundledPluginAliasLookupCache = lookup;
   return lookup;
 }
 
-export function normalizePluginId(id: string): string {
+function normalizePluginIdWithLookup(
+  id: string,
+  getAliasLookup: () => ReadonlyMap<string, string>,
+): string {
   const trimmed = normalizeOptionalString(id) ?? "";
   const normalized = normalizeOptionalLowercaseString(trimmed) ?? "";
   const builtInAlias = BUILT_IN_PLUGIN_ALIAS_LOOKUP.get(normalized);
   if (builtInAlias) {
     return builtInAlias;
   }
-  return getBundledPluginAliasLookup().get(normalized) ?? trimmed;
+  return getAliasLookup().get(normalized) ?? normalized;
+}
+
+function createScopedPluginIdNormalizer(): NormalizePluginId {
+  let lookup: ReadonlyMap<string, string> | undefined;
+  return (id) =>
+    normalizePluginIdWithLookup(id, () => {
+      lookup ??= getBundledPluginAliasLookup();
+      return lookup;
+    });
+}
+
+/** Normalizes user/config plugin ids into the canonical lowercase key form. */
+export function normalizePluginId(id: string): string {
+  return normalizePluginIdWithLookup(id, getBundledPluginAliasLookup);
 }
 
 export const normalizePluginsConfig = (
   config?: OpenClawConfig["plugins"],
 ): NormalizedPluginsConfig => {
-  return normalizePluginsConfigWithResolver(config, normalizePluginId);
+  return normalizePluginsConfigWithResolver(config, createScopedPluginIdNormalizer());
 };
+
+/** Canonicalizes one plugin entry and its policy-list ids before a targeted mutation. */
+export function normalizePluginTargetConfig(
+  config: OpenClawConfig,
+  pluginId: string,
+): OpenClawConfig {
+  const normalizedId = normalizePluginId(pluginId);
+  const normalized = normalizePluginsConfig(config.plugins);
+  const rawEntries = config.plugins?.entries ?? {};
+  const hasTargetEntry = Object.keys(rawEntries).some(
+    (entryId) => normalizePluginId(entryId) === normalizedId,
+  );
+  const entries = Object.fromEntries(
+    Object.entries(rawEntries).filter(([entryId]) => normalizePluginId(entryId) !== normalizedId),
+  );
+  if (hasTargetEntry) {
+    const { config: pluginConfig, ...entry } = normalized.entries[normalizedId] ?? {};
+    entries[normalizedId] = {
+      ...entry,
+      ...(isRecord(pluginConfig) ? { config: pluginConfig } : {}),
+    };
+  }
+  return {
+    ...config,
+    plugins: {
+      ...config.plugins,
+      ...(Array.isArray(config.plugins?.allow) ? { allow: normalized.allow } : {}),
+      ...(Array.isArray(config.plugins?.deny) ? { deny: normalized.deny } : {}),
+      entries,
+    },
+  };
+}
 
 export function createPluginActivationSource(params: {
   config?: OpenClawConfig;
@@ -104,13 +129,10 @@ export function createPluginActivationSource(params: {
 }
 
 const hasExplicitMemorySlot = (plugins?: OpenClawConfig["plugins"]) =>
-  Boolean(plugins?.slots && Object.prototype.hasOwnProperty.call(plugins.slots, "memory"));
+  Boolean(plugins?.slots && Object.hasOwn(plugins.slots, "memory"));
 
 const hasExplicitMemoryEntry = (plugins?: OpenClawConfig["plugins"]) =>
-  Boolean(
-    plugins?.entries &&
-    Object.prototype.hasOwnProperty.call(plugins.entries, defaultSlotIdForKey("memory")),
-  );
+  Boolean(plugins?.entries && Object.hasOwn(plugins.entries, defaultSlotIdForKey("memory")));
 
 export const hasExplicitPluginConfig = (plugins?: OpenClawConfig["plugins"]) =>
   hasExplicitPluginConfigShared(plugins);

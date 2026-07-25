@@ -1,7 +1,11 @@
-import { type ChannelDoctorAdapter } from "openclaw/plugin-sdk/channel-contract";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { ChannelDoctorAdapter } from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+// Discord plugin module implements doctor behavior.
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { collectProviderDangerousNameMatchingScopes } from "openclaw/plugin-sdk/runtime-doctor";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { inspectDiscordAccount } from "./account-inspect.js";
+import { resolveDefaultDiscordAccountId } from "./accounts.js";
 import { normalizeCompatibilityConfig as normalizeDiscordCompatibilityConfig } from "./doctor-contract.js";
 import { DISCORD_LEGACY_CONFIG_RULES } from "./doctor-shared.js";
 import { isDiscordMutableAllowEntry } from "./security-doctor.js";
@@ -158,14 +162,14 @@ export function collectDiscordNumericIdWarnings(params: {
 
   const lines: string[] = [];
   if (repairableHits.length > 0) {
-    const sample = repairableHits[0];
+    const sample = expectDefined(repairableHits.at(0), "non-empty repairable Discord ID hits");
     lines.push(
       `- Discord allowlists contain ${repairableHits.length} numeric ${repairableHits.length === 1 ? "entry" : "entries"} (e.g. ${sanitizeForLog(sample.path)}=${sanitizeForLog(String(sample.entry))}).`,
       `- Discord IDs must be strings; run "${params.doctorFixCommand}" to convert numeric IDs to quoted strings.`,
     );
   }
   if (blockedHits.length > 0) {
-    const sample = blockedHits[0];
+    const sample = expectDefined(blockedHits.at(0), "non-empty blocked Discord ID hits");
     lines.push(
       `- Discord allowlists contain ${blockedHits.length} numeric ${blockedHits.length === 1 ? "entry" : "entries"} in lists that cannot be auto-repaired (e.g. ${sanitizeForLog(sample.path)}).`,
       `- These lists include invalid or precision-losing numeric IDs; manually quote the original values in your config file, then rerun "${params.doctorFixCommand}".`,
@@ -235,6 +239,26 @@ export function maybeRepairDiscordNumericIds(
   };
 }
 
+export function collectDiscordMissingEnvTokenWarnings(params: {
+  cfg: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+}): string[] {
+  if (resolveDefaultDiscordAccountId(params.cfg) !== "default") {
+    return [];
+  }
+  const account = inspectDiscordAccount({
+    cfg: params.cfg,
+    accountId: "default",
+    envToken: params.env?.DISCORD_BOT_TOKEN ?? "",
+  });
+  if (!account.enabled || account.tokenStatus !== "missing" || account.tokenSource !== "none") {
+    return [];
+  }
+  return [
+    "- channels.discord: default account has no available bot token, and DISCORD_BOT_TOKEN is absent in this doctor environment. After migration, verify DISCORD_BOT_TOKEN is present in the state-dir .env or configure channels.discord.token / channels.discord.accounts.default.token as a SecretRef.",
+  ];
+}
+
 function collectDiscordMutableAllowlistWarnings(cfg: OpenClawConfig): string[] {
   const hits: Array<{ path: string; entry: string }> = [];
   const addHits = (pathLabel: string, list: unknown) => {
@@ -300,17 +324,19 @@ function collectDiscordMutableAllowlistWarnings(cfg: OpenClawConfig): string[] {
 }
 
 export const discordDoctor: ChannelDoctorAdapter = {
-  dmAllowFromMode: "topOrNested",
+  dmAllowFromMode: "topOnly",
   groupModel: "route",
   groupAllowFromFallbackToAllowFrom: false,
   warnOnEmptyGroupSenderAllowlist: false,
   legacyConfigRules: DISCORD_LEGACY_CONFIG_RULES,
   normalizeCompatibilityConfig: normalizeDiscordCompatibilityConfig,
-  collectPreviewWarnings: ({ cfg, doctorFixCommand }) =>
-    collectDiscordNumericIdWarnings({
+  collectPreviewWarnings: ({ cfg, doctorFixCommand, env }) => [
+    ...collectDiscordMissingEnvTokenWarnings({ cfg, env }),
+    ...collectDiscordNumericIdWarnings({
       hits: scanDiscordNumericIdEntries(cfg),
       doctorFixCommand,
     }),
+  ],
   collectMutableAllowlistWarnings: ({ cfg }) => collectDiscordMutableAllowlistWarnings(cfg),
   repairConfig: ({ cfg, doctorFixCommand }) => maybeRepairDiscordNumericIds(cfg, doctorFixCommand),
 };

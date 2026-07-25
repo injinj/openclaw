@@ -1,4 +1,6 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Line tests cover send plugin behavior.
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   pushMessageMock,
@@ -13,36 +15,36 @@ const {
   logVerboseMock,
   resolvePinnedHostnameWithPolicyMock,
 } = vi.hoisted(() => {
-  const pushMessageMock = vi.fn();
-  const replyMessageMock = vi.fn();
-  const showLoadingAnimationMock = vi.fn();
-  const getProfileMock = vi.fn();
-  const MessagingApiClientMock = vi.fn(function () {
+  const pushMessageMockLocal = vi.fn();
+  const replyMessageMockLocal = vi.fn();
+  const showLoadingAnimationMockLocal = vi.fn();
+  const getProfileMockLocal = vi.fn();
+  const MessagingApiClientMockLocal = vi.fn(function () {
     return {
-      pushMessage: pushMessageMock,
-      replyMessage: replyMessageMock,
-      showLoadingAnimation: showLoadingAnimationMock,
-      getProfile: getProfileMock,
+      pushMessage: pushMessageMockLocal,
+      replyMessage: replyMessageMockLocal,
+      showLoadingAnimation: showLoadingAnimationMockLocal,
+      getProfile: getProfileMockLocal,
     };
   });
-  const requireRuntimeConfigMock = vi.fn((cfg: unknown) => cfg ?? {});
-  const resolveLineAccountMock = vi.fn(() => ({ accountId: "default" }));
-  const resolveLineChannelAccessTokenMock = vi.fn(() => "line-token");
-  const recordChannelActivityMock = vi.fn();
-  const logVerboseMock = vi.fn();
-  const resolvePinnedHostnameWithPolicyMock = vi.fn();
+  const requireRuntimeConfigMockLocal = vi.fn((cfg: unknown) => cfg ?? {});
+  const resolveLineAccountMockLocal = vi.fn(() => ({ accountId: "default" }));
+  const resolveLineChannelAccessTokenMockLocal = vi.fn(() => "line-token");
+  const recordChannelActivityMockLocal = vi.fn();
+  const logVerboseMockLocal = vi.fn();
+  const resolvePinnedHostnameWithPolicyMockLocal = vi.fn();
   return {
-    pushMessageMock,
-    replyMessageMock,
-    showLoadingAnimationMock,
-    getProfileMock,
-    MessagingApiClientMock,
-    requireRuntimeConfigMock,
-    resolveLineAccountMock,
-    resolveLineChannelAccessTokenMock,
-    recordChannelActivityMock,
-    logVerboseMock,
-    resolvePinnedHostnameWithPolicyMock,
+    pushMessageMock: pushMessageMockLocal,
+    replyMessageMock: replyMessageMockLocal,
+    showLoadingAnimationMock: showLoadingAnimationMockLocal,
+    getProfileMock: getProfileMockLocal,
+    MessagingApiClientMock: MessagingApiClientMockLocal,
+    requireRuntimeConfigMock: requireRuntimeConfigMockLocal,
+    resolveLineAccountMock: resolveLineAccountMockLocal,
+    resolveLineChannelAccessTokenMock: resolveLineChannelAccessTokenMockLocal,
+    recordChannelActivityMock: recordChannelActivityMockLocal,
+    logVerboseMock: logVerboseMockLocal,
+    resolvePinnedHostnameWithPolicyMock: resolvePinnedHostnameWithPolicyMockLocal,
   };
 });
 
@@ -92,12 +94,34 @@ const LINE_TEST_CFG = {
   },
 };
 
+function createCredentialBearingHttpUrl(): string {
+  const url = new URL("http://example.com/image.jpg");
+  url.username = ["line", "user"].join("-");
+  url.password = ["line", "fixture"].join("-");
+  url.searchParams.set("auth", ["line", "query"].join("-"));
+  return url.href;
+}
+
 describe("LINE send helpers", () => {
+  const fixedSentAt = 1_800_000_000_000;
+
   beforeAll(async () => {
     sendModule = await import("./send.js");
   });
 
+  afterAll(() => {
+    vi.doUnmock("@line/bot-sdk");
+    vi.doUnmock("openclaw/plugin-sdk/plugin-config-runtime");
+    vi.doUnmock("./accounts.js");
+    vi.doUnmock("./channel-access-token.js");
+    vi.doUnmock("openclaw/plugin-sdk/channel-activity-runtime");
+    vi.doUnmock("openclaw/plugin-sdk/runtime-env");
+    vi.doUnmock("openclaw/plugin-sdk/ssrf-runtime");
+    vi.resetModules();
+  });
+
   beforeEach(() => {
+    vi.setSystemTime(fixedSentAt);
     pushMessageMock.mockReset();
     replyMessageMock.mockReset();
     showLoadingAnimationMock.mockReset();
@@ -141,6 +165,16 @@ describe("LINE send helpers", () => {
     expect(quickReply.items).toHaveLength(13);
   });
 
+  it("truncates quick reply labels without leaving lone surrogates", () => {
+    const label = "1234567890123456789😀";
+    const quickReply = sendModule.createQuickReplyItems([label]);
+    const item = quickReply.items?.[0] as { action: { label: string; text: string } } | undefined;
+
+    expect(item?.action.label).toBe("1234567890123456789");
+    expect(item?.action.text).toBe(label);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(item?.action.label ?? "")).toBe(false);
+  });
+
   it("pushes images via normalized LINE target", async () => {
     const result = await sendModule.pushImageMessage(
       "line:user:U123",
@@ -165,7 +199,40 @@ describe("LINE send helpers", () => {
       direction: "outbound",
     });
     expect(logVerboseMock).toHaveBeenCalledWith("line: pushed image to U123");
-    expect(result).toEqual({ messageId: "push", chatId: "U123" });
+    expect(result).toEqual({
+      chatId: "U123",
+      messageId: "push",
+      receipt: {
+        parts: [
+          {
+            index: 0,
+            kind: "media",
+            platformMessageId: "push",
+            raw: {
+              channel: "line",
+              chatId: "U123",
+              conversationId: "U123",
+              messageId: "push",
+              meta: { messageCount: 1 },
+            },
+            threadId: "U123",
+          },
+        ],
+        platformMessageIds: ["push"],
+        primaryPlatformMessageId: "push",
+        raw: [
+          {
+            channel: "line",
+            chatId: "U123",
+            conversationId: "U123",
+            messageId: "push",
+            meta: { messageCount: 1 },
+          },
+        ],
+        sentAt: fixedSentAt,
+        threadId: "U123",
+      },
+    });
   });
 
   it("replies when reply token is provided", async () => {
@@ -193,7 +260,51 @@ describe("LINE send helpers", () => {
       ],
     });
     expect(logVerboseMock).toHaveBeenCalledWith("line: replied to C1");
-    expect(result).toEqual({ messageId: "reply", chatId: "C1" });
+    expect(result).toEqual({
+      chatId: "C1",
+      messageId: "reply",
+      receipt: {
+        parts: [
+          {
+            index: 0,
+            kind: "media",
+            platformMessageId: "reply",
+            raw: {
+              channel: "line",
+              chatId: "C1",
+              conversationId: "C1",
+              messageId: "reply",
+              meta: { messageCount: 2 },
+            },
+            threadId: "C1",
+          },
+        ],
+        platformMessageIds: ["reply"],
+        primaryPlatformMessageId: "reply",
+        raw: [
+          {
+            channel: "line",
+            chatId: "C1",
+            conversationId: "C1",
+            messageId: "reply",
+            meta: { messageCount: 2 },
+          },
+        ],
+        sentAt: fixedSentAt,
+        threadId: "C1",
+      },
+    });
+  });
+
+  it("preserves literal internal-looking text in low-level sends", async () => {
+    const text = "⚠️ 🛠️ `search repos (agent)` failed";
+
+    await sendModule.sendMessageLine("line:user:U123", text, { cfg: LINE_TEST_CFG });
+
+    expect(pushMessageMock).toHaveBeenCalledWith({
+      to: "U123",
+      messages: [{ type: "text", text }],
+    });
   });
 
   it("sends video with explicit image preview URL", async () => {
@@ -247,6 +358,48 @@ describe("LINE send helpers", () => {
     expect(pushMessageMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      name: "send media URL",
+      run: () =>
+        sendModule.sendMessageLine("line:user:U200", "Image", {
+          cfg: LINE_TEST_CFG,
+          mediaUrl: createCredentialBearingHttpUrl(),
+        }),
+    },
+    {
+      name: "send preview URL",
+      run: () =>
+        sendModule.sendMessageLine("line:user:U200", "Video", {
+          cfg: LINE_TEST_CFG,
+          mediaUrl: "https://example.com/video.mp4",
+          mediaKind: "video",
+          previewImageUrl: createCredentialBearingHttpUrl(),
+        }),
+    },
+    {
+      name: "push image URL",
+      run: () =>
+        sendModule.pushImageMessage("line:user:U200", createCredentialBearingHttpUrl(), undefined, {
+          cfg: LINE_TEST_CFG,
+        }),
+    },
+    {
+      name: "push image preview URL",
+      run: () =>
+        sendModule.pushImageMessage(
+          "line:user:U200",
+          "https://example.com/image.jpg",
+          createCredentialBearingHttpUrl(),
+          { cfg: LINE_TEST_CFG },
+        ),
+    },
+  ])("does not expose credentials from an insecure $name", async ({ run }) => {
+    await expect(run()).rejects.toThrow(new Error("LINE outbound media URL must use HTTPS"));
+    expect(pushMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+  });
+
   it("omits trackingId for non-user destinations", async () => {
     await sendModule.sendMessageLine("line:group:C100", "Video", {
       cfg: LINE_TEST_CFG,
@@ -276,6 +429,51 @@ describe("LINE send helpers", () => {
     await expect(sendModule.pushMessagesLine("U123", [], { cfg: LINE_TEST_CFG })).rejects.toThrow(
       "Message must be non-empty for LINE sends",
     );
+  });
+
+  it("rejects lowercased LINE-shaped recipients (#81628 safety net)", async () => {
+    // 33-char value with lowercase leading char — what an upstream session-key
+    // fragment looked like before the cron-tool fix. LINE rejects with HTTP 400
+    // anyway; throwing locally keeps the failure permanent so delivery-recovery
+    // moves the entry to failed/ immediately instead of silently retrying 5×.
+    await expect(
+      sendModule.pushMessagesLine(
+        "cabcdef0123456789abcdef0123456789",
+        [{ type: "text", text: "hello" }],
+        { cfg: LINE_TEST_CFG },
+      ),
+    ).rejects.toThrow(/Recipient is not a valid LINE id/);
+    expect(pushMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves UTF-16 boundaries in invalid recipient diagnostics", async () => {
+    await expect(
+      sendModule.pushMessagesLine(`aab😀${"x".repeat(40)}`, [{ type: "text", text: "hello" }], {
+        cfg: LINE_TEST_CFG,
+      }),
+    ).rejects.toThrow(
+      "Recipient is not a valid LINE id (case-sensitive; expected leading capital C/U/R): aab…",
+    );
+    await expect(
+      sendModule.pushMessagesLine(`aa😀${"y".repeat(40)}`, [{ type: "text", text: "hello" }], {
+        cfg: LINE_TEST_CFG,
+      }),
+    ).rejects.toThrow(
+      "Recipient is not a valid LINE id (case-sensitive; expected leading capital C/U/R): aa😀…",
+    );
+    expect(pushMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts case-exact LINE recipients with the leading capital preserved", async () => {
+    await sendModule.pushMessagesLine(
+      "Cabcdef0123456789abcdef0123456789",
+      [{ type: "text", text: "hello" }],
+      { cfg: LINE_TEST_CFG },
+    );
+    expect(pushMessageMock).toHaveBeenCalledWith({
+      to: "Cabcdef0123456789abcdef0123456789",
+      messages: [{ type: "text", text: "hello" }],
+    });
   });
 
   it("logs HTTP body when push fails", async () => {
@@ -317,6 +515,19 @@ describe("LINE send helpers", () => {
     expect(getProfileMock).toHaveBeenCalledTimes(1);
   });
 
+  it("bounds profile cache entries across distinct users", async () => {
+    getProfileMock.mockImplementation(async (userId: string) => ({
+      displayName: userId,
+    }));
+
+    for (let index = 0; index <= 1000; index += 1) {
+      await sendModule.getUserProfile(`U-profile-${index}`, { cfg: LINE_TEST_CFG });
+    }
+    await sendModule.getUserProfile("U-profile-0", { cfg: LINE_TEST_CFG });
+
+    expect(getProfileMock).toHaveBeenCalledTimes(1002);
+  });
+
   it("continues when loading animation is unsupported", async () => {
     showLoadingAnimationMock.mockRejectedValueOnce(new Error("unsupported"));
 
@@ -325,7 +536,7 @@ describe("LINE send helpers", () => {
     ).resolves.toBeUndefined();
 
     expect(logVerboseMock).toHaveBeenCalledWith(
-      expect.stringContaining("line: loading animation failed (non-fatal)"),
+      "line: loading animation failed (non-fatal): Error: unsupported",
     );
   });
 
@@ -338,9 +549,12 @@ describe("LINE send helpers", () => {
     );
 
     expect(pushMessageMock).toHaveBeenCalledTimes(1);
-    const firstCall = pushMessageMock.mock.calls[0] as [
+    const firstCall = pushMessageMock.mock.calls.at(0) as [
       { messages: Array<{ quickReply?: { items: unknown[] } }> },
     ];
-    expect(firstCall[0].messages[0].quickReply?.items).toHaveLength(13);
+    const payload = expectDefined(firstCall[0], "LINE push payload");
+    expect(expectDefined(payload.messages[0], "LINE push message").quickReply?.items).toHaveLength(
+      13,
+    );
   });
 });

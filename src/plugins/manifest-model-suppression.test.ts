@@ -1,25 +1,31 @@
+// Verifies manifest-driven model suppression behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  loadPluginManifestRegistryForPluginRegistry: vi.fn(),
+  loadPluginMetadataSnapshot: vi.fn(),
+  resolvePluginMetadataSnapshot: vi.fn(),
 }));
 
-vi.mock("./plugin-registry.js", () => ({
-  loadPluginManifestRegistryForPluginRegistry: mocks.loadPluginManifestRegistryForPluginRegistry,
+vi.mock("./plugin-metadata-snapshot.js", () => ({
+  loadPluginMetadataSnapshot: mocks.loadPluginMetadataSnapshot,
+  resolvePluginMetadataSnapshot: mocks.resolvePluginMetadataSnapshot,
 }));
 
-import {
-  clearManifestModelSuppressionCacheForTest,
-  resolveManifestBuiltInModelSuppression,
-} from "./manifest-model-suppression.js";
+import { buildManifestBuiltInModelSuppressionResolver } from "./manifest-model-suppression.js";
+
+function createMetadataSnapshot(plugins: Record<string, unknown>[]) {
+  return {
+    index: { plugins: [] },
+    diagnostics: [],
+    plugins: plugins.map((plugin) => ({ origin: "bundled", ...plugin })),
+  };
+}
 
 describe("manifest model suppression", () => {
   beforeEach(() => {
-    clearManifestModelSuppressionCacheForTest();
-    mocks.loadPluginManifestRegistryForPluginRegistry.mockReset();
-    mocks.loadPluginManifestRegistryForPluginRegistry.mockReturnValue({
-      diagnostics: [],
-      plugins: [
+    mocks.loadPluginMetadataSnapshot.mockReset();
+    mocks.loadPluginMetadataSnapshot.mockReturnValue(
+      createMetadataSnapshot([
         {
           id: "openai",
           providers: ["openai"],
@@ -42,16 +48,45 @@ describe("manifest model suppression", () => {
             ],
           },
         },
-      ],
+      ]),
+    );
+    mocks.resolvePluginMetadataSnapshot.mockImplementation(
+      (params?: Parameters<typeof mocks.loadPluginMetadataSnapshot>[0]) =>
+        mocks.loadPluginMetadataSnapshot(params),
+    );
+  });
+
+  describe("buildManifestBuiltInModelSuppressionResolver", () => {
+    it("reads planned manifest suppressions once per resolver creation", () => {
+      const config = { plugins: { entries: { openai: { enabled: true } } } };
+
+      const resolver = buildManifestBuiltInModelSuppressionResolver({
+        config,
+        env: process.env,
+      });
+
+      expect(mocks.loadPluginMetadataSnapshot).toHaveBeenCalledTimes(1);
+
+      resolver({
+        provider: "azure-openai-responses",
+        id: "gpt-5.3-codex-spark",
+      });
+      resolver({
+        provider: "azure-openai-responses",
+        id: "gpt-5.3-codex-spark",
+      });
+
+      expect(mocks.loadPluginMetadataSnapshot).toHaveBeenCalledTimes(1);
     });
   });
 
   it("resolves manifest suppressions for declared provider aliases", () => {
+    const resolver = buildManifestBuiltInModelSuppressionResolver({ env: process.env });
+
     expect(
-      resolveManifestBuiltInModelSuppression({
+      resolver({
         provider: "azure-openai-responses",
         id: "GPT-5.3-Codex-Spark",
-        env: process.env,
       }),
     ).toEqual({
       suppress: true,
@@ -61,38 +96,42 @@ describe("manifest model suppression", () => {
   });
 
   it("ignores suppressions for providers the plugin does not own", () => {
+    const resolver = buildManifestBuiltInModelSuppressionResolver({ env: process.env });
+
     expect(
-      resolveManifestBuiltInModelSuppression({
+      resolver({
         provider: "openrouter",
         id: "foreign-row",
-        env: process.env,
       }),
     ).toBeUndefined();
   });
 
-  it("caches planned manifest suppressions per config and environment", () => {
+  it("reuses planned manifest suppressions inside a resolver instance", () => {
     const config = { plugins: { entries: { openai: { enabled: true } } } };
 
-    resolveManifestBuiltInModelSuppression({
-      provider: "azure-openai-responses",
-      id: "gpt-5.3-codex-spark",
-      config,
-      env: process.env,
-    });
-    resolveManifestBuiltInModelSuppression({
-      provider: "azure-openai-responses",
-      id: "gpt-5.3-codex-spark",
+    const resolver = buildManifestBuiltInModelSuppressionResolver({
       config,
       env: process.env,
     });
 
-    expect(mocks.loadPluginManifestRegistryForPluginRegistry).toHaveBeenCalledTimes(1);
+    expect(
+      resolver({
+        provider: "azure-openai-responses",
+        id: "gpt-5.3-codex-spark",
+      })?.suppress,
+    ).toBe(true);
+    expect(
+      resolver({
+        provider: "azure-openai-responses",
+        id: "gpt-4.1",
+      }),
+    ).toBeUndefined();
+    expect(mocks.loadPluginMetadataSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it("matches conditional suppressions by base URL host", () => {
-    mocks.loadPluginManifestRegistryForPluginRegistry.mockReturnValue({
-      diagnostics: [],
-      plugins: [
+    mocks.loadPluginMetadataSnapshot.mockReturnValue(
+      createMetadataSnapshot([
         {
           id: "qwen",
           providers: ["qwen", "modelstudio"],
@@ -113,39 +152,42 @@ describe("manifest model suppression", () => {
             ],
           },
         },
-      ],
-    });
+      ]),
+    );
+    const resolver = buildManifestBuiltInModelSuppressionResolver({ env: process.env });
 
     expect(
-      resolveManifestBuiltInModelSuppression({
+      resolver({
         provider: "qwen",
         id: "qwen3.6-plus",
         baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
-        env: process.env,
       })?.suppress,
     ).toBe(true);
     expect(
-      resolveManifestBuiltInModelSuppression({
+      resolver({
         provider: "qwen",
         id: "qwen3.6-plus",
         baseUrl: " https://coding-intl.dashscope.aliyuncs.com./v1 ",
-        env: process.env,
       })?.suppress,
     ).toBe(true);
     expect(
-      resolveManifestBuiltInModelSuppression({
+      resolver({
+        provider: "qwen",
+        id: "qwen3.6-plus",
+      })?.suppress,
+    ).toBe(true);
+    expect(
+      resolver({
         provider: "qwen",
         id: "qwen3.6-plus",
         baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        env: process.env,
       }),
     ).toBeUndefined();
   });
 
   it("does not apply conditional suppressions to custom providers with a foreign api owner", () => {
-    mocks.loadPluginManifestRegistryForPluginRegistry.mockReturnValue({
-      diagnostics: [],
-      plugins: [
+    mocks.loadPluginMetadataSnapshot.mockReturnValue(
+      createMetadataSnapshot([
         {
           id: "qwen",
           providers: ["modelstudio"],
@@ -162,25 +204,70 @@ describe("manifest model suppression", () => {
             ],
           },
         },
-      ],
-    });
-
-    expect(
-      resolveManifestBuiltInModelSuppression({
-        provider: "modelstudio",
-        id: "qwen3.6-plus",
-        config: {
-          models: {
-            providers: {
-              modelstudio: {
-                api: "openai-completions",
-                baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
-                models: [],
-              },
+      ]),
+    );
+    const resolver = buildManifestBuiltInModelSuppressionResolver({
+      config: {
+        models: {
+          providers: {
+            modelstudio: {
+              api: "openai-completions",
+              baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
+              models: [],
             },
           },
         },
-        env: process.env,
+      },
+      env: process.env,
+    });
+
+    expect(
+      resolver({
+        provider: "modelstudio",
+        id: "qwen3.6-plus",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("does not apply provider api conditional suppressions when a configured provider omits api", () => {
+    mocks.loadPluginMetadataSnapshot.mockReturnValue(
+      createMetadataSnapshot([
+        {
+          id: "qwen",
+          providers: ["modelstudio"],
+          modelCatalog: {
+            suppressions: [
+              {
+                provider: "modelstudio",
+                model: "qwen3.6-plus",
+                when: {
+                  baseUrlHosts: ["coding-intl.dashscope.aliyuncs.com"],
+                  providerConfigApiIn: ["qwen", "modelstudio"],
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    );
+    const resolver = buildManifestBuiltInModelSuppressionResolver({
+      config: {
+        models: {
+          providers: {
+            modelstudio: {
+              baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
+              models: [],
+            },
+          },
+        },
+      },
+      env: process.env,
+    });
+
+    expect(
+      resolver({
+        provider: "modelstudio",
+        id: "qwen3.6-plus",
       }),
     ).toBeUndefined();
   });

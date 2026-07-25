@@ -1,19 +1,30 @@
+/**
+ * Tool-call loop detection.
+ *
+ * Watches recent tool history for repeated no-progress patterns and circuit-breaker thresholds.
+ */
 import { createHash } from "node:crypto";
+import {
+  normalizeNullableString as nonEmptyStringField,
+  normalizeOptionalString as normalizeRunId,
+} from "@openclaw/normalization-core/string-coerce";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
 import type { SessionState, ToolCallRecord } from "../logging/diagnostic-session-state.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { isPlainObject } from "../utils.js";
+import { isMessagingToolSendAction } from "./embedded-agent-messaging.js";
+import { stableStringify } from "./stable-stringify.js";
 
 const log = createSubsystemLogger("agents/loop-detection");
 
-export type LoopDetectorKind =
+type LoopDetectorKind =
   | "generic_repeat"
   | "unknown_tool_repeat"
   | "known_poll_no_progress"
   | "global_circuit_breaker"
   | "ping_pong";
 
-export type LoopDetectionResult =
+type LoopDetectionResult =
   | { stuck: false }
   | {
       stuck: true;
@@ -25,11 +36,11 @@ export type LoopDetectionResult =
       warningKey?: string;
     };
 
-export const TOOL_CALL_HISTORY_SIZE = 30;
-export const WARNING_THRESHOLD = 10;
+const TOOL_CALL_HISTORY_SIZE = 30;
+const WARNING_THRESHOLD = 10;
 export const UNKNOWN_TOOL_THRESHOLD = 10;
-export const CRITICAL_THRESHOLD = 20;
-export const GLOBAL_CIRCUIT_BREAKER_THRESHOLD = 30;
+const CRITICAL_THRESHOLD = 20;
+const GLOBAL_CIRCUIT_BREAKER_THRESHOLD = 30;
 const DEFAULT_LOOP_DETECTION_CONFIG = {
   enabled: false,
   historySize: TOOL_CALL_HISTORY_SIZE,
@@ -58,14 +69,9 @@ type ResolvedLoopDetectionConfig = {
   };
 };
 
-export type ToolLoopDetectionScope = {
+type ToolLoopDetectionScope = {
   runId?: string;
 };
-
-function normalizeRunId(runId?: string): string | undefined {
-  const trimmed = runId?.trim();
-  return trimmed ? trimmed : undefined;
-}
 
 function selectHistoryForScope(
   history: readonly ToolCallRecord[],
@@ -75,52 +81,15 @@ function selectHistoryForScope(
   return history.filter((record) => normalizeRunId(record.runId) === runId);
 }
 
-function asPositiveInt(value: number | undefined, fallback: number): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    return fallback;
-  }
-  return value;
-}
-
 function resolveLoopDetectionConfig(config?: ToolLoopDetectionConfig): ResolvedLoopDetectionConfig {
-  let warningThreshold = asPositiveInt(
-    config?.warningThreshold,
-    DEFAULT_LOOP_DETECTION_CONFIG.warningThreshold,
-  );
-  let criticalThreshold = asPositiveInt(
-    config?.criticalThreshold,
-    DEFAULT_LOOP_DETECTION_CONFIG.criticalThreshold,
-  );
-  let globalCircuitBreakerThreshold = asPositiveInt(
-    config?.globalCircuitBreakerThreshold,
-    DEFAULT_LOOP_DETECTION_CONFIG.globalCircuitBreakerThreshold,
-  );
-
-  if (criticalThreshold <= warningThreshold) {
-    criticalThreshold = warningThreshold + 1;
-  }
-  if (globalCircuitBreakerThreshold <= criticalThreshold) {
-    globalCircuitBreakerThreshold = criticalThreshold + 1;
-  }
-
   return {
     enabled: config?.enabled ?? DEFAULT_LOOP_DETECTION_CONFIG.enabled,
-    historySize: asPositiveInt(config?.historySize, DEFAULT_LOOP_DETECTION_CONFIG.historySize),
-    warningThreshold,
-    unknownToolThreshold: asPositiveInt(
-      config?.unknownToolThreshold,
-      DEFAULT_LOOP_DETECTION_CONFIG.unknownToolThreshold,
-    ),
-    criticalThreshold,
-    globalCircuitBreakerThreshold,
-    detectors: {
-      genericRepeat:
-        config?.detectors?.genericRepeat ?? DEFAULT_LOOP_DETECTION_CONFIG.detectors.genericRepeat,
-      knownPollNoProgress:
-        config?.detectors?.knownPollNoProgress ??
-        DEFAULT_LOOP_DETECTION_CONFIG.detectors.knownPollNoProgress,
-      pingPong: config?.detectors?.pingPong ?? DEFAULT_LOOP_DETECTION_CONFIG.detectors.pingPong,
-    },
+    historySize: DEFAULT_LOOP_DETECTION_CONFIG.historySize,
+    warningThreshold: DEFAULT_LOOP_DETECTION_CONFIG.warningThreshold,
+    unknownToolThreshold: DEFAULT_LOOP_DETECTION_CONFIG.unknownToolThreshold,
+    criticalThreshold: DEFAULT_LOOP_DETECTION_CONFIG.criticalThreshold,
+    globalCircuitBreakerThreshold: DEFAULT_LOOP_DETECTION_CONFIG.globalCircuitBreakerThreshold,
+    detectors: DEFAULT_LOOP_DETECTION_CONFIG.detectors,
   };
 }
 
@@ -128,45 +97,13 @@ function resolveLoopDetectionConfig(config?: ToolLoopDetectionConfig): ResolvedL
  * Hash a tool call for pattern matching.
  * Uses tool name + deterministic JSON serialization digest of params.
  */
-export function hashToolCall(toolName: string, params: unknown): string {
+function hashToolCall(toolName: string, params: unknown): string {
   return `${toolName}:${digestStable(params)}`;
 }
 
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(",")}]`;
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).toSorted();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
-}
-
 function digestStable(value: unknown): string {
-  const serialized = stableStringifyFallback(value);
+  const serialized = stableStringify(value);
   return createHash("sha256").update(serialized).digest("hex");
-}
-
-function stableStringifyFallback(value: unknown): string {
-  try {
-    return stableStringify(value);
-  } catch {
-    if (value === null || value === undefined) {
-      return `${value}`;
-    }
-    if (typeof value === "string") {
-      return value;
-    }
-    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
-      return `${value}`;
-    }
-    if (value instanceof Error) {
-      return `${value.name}:${value.message}`;
-    }
-    return Object.prototype.toString.call(value);
-  }
 }
 
 function isKnownPollToolCall(toolName: string, params: unknown): boolean {
@@ -223,14 +160,6 @@ function stringField(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
-function nonEmptyStringField(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
-
 function hashExecToolOutcome(details: Record<string, unknown>, text: string): string | undefined {
   const status = stringField(details.status);
   if (!status) {
@@ -266,6 +195,95 @@ function hashExecToolOutcome(details: Record<string, unknown>, text: string): st
   return undefined;
 }
 
+// Delivery results carry fresh per-call ids (messageId/runId) in details and text, so
+// hashing them defeats no-progress loop blocking (#89090). Hash only id-stripped facts
+// for outbound-message actions; other `message` actions keep full hashing (real progress).
+const SEND_LIKE_MESSAGE_ACTIONS = new Set([
+  "send",
+  "broadcast",
+  "reply",
+  "thread-reply",
+  "sendWithEffect",
+  "sendAttachment",
+  "upload-file",
+  "sticker",
+  "poll",
+]);
+// Denylist of per-call volatile delivery ids/timestamps stripped before hashing. Must
+// cover the id/timestamp fields a channel's delivery result can carry; a new channel
+// emitting a volatile field name outside this set silently regresses its loop blocking.
+const VOLATILE_SEND_RESULT_KEYS = new Set([
+  "messageId",
+  "message_id",
+  "messageIds",
+  "platformMessageId",
+  "platformMessageIds",
+  "fileId",
+  "file_id",
+  "fileKey",
+  "pollId",
+  "poll_id",
+  "receipt",
+  "runId",
+  "idempotencyKey",
+  "ts",
+  "timestamp",
+  "sentAt",
+  "deliveredAt",
+  "createdAt",
+]);
+
+// A message object's own `id` is its volatile per-send id; a bare `id` elsewhere
+// (route/conversation) is a stable fact, so only strip `id` on the message object.
+function isMessageDeliveryObject(value: Record<string, unknown>): boolean {
+  return (
+    typeof value.id === "string" &&
+    typeof value.text === "string" &&
+    (typeof value.direction === "string" ||
+      typeof value.senderId === "string" ||
+      typeof value.accountId === "string" ||
+      isPlainObject(value.conversation))
+  );
+}
+
+function stripVolatileSendIds(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stripVolatileSendIds);
+  }
+  if (!isPlainObject(value)) {
+    return value;
+  }
+  const dropMessageObjectId = isMessageDeliveryObject(value);
+  const stripped: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value)) {
+    if (VOLATILE_SEND_RESULT_KEYS.has(key) || (key === "id" && dropMessageObjectId)) {
+      continue;
+    }
+    stripped[key] = stripVolatileSendIds(nested);
+  }
+  return stripped;
+}
+
+function isVolatileSendResult(toolName: string, params: unknown): boolean {
+  if (toolName === "sessions_send") {
+    return true;
+  }
+  const args = isPlainObject(params) ? params : {};
+  if (toolName === "message") {
+    return typeof args.action === "string" && SEND_LIKE_MESSAGE_ACTIONS.has(args.action);
+  }
+  // Provider-docked send tools (telegram/discord/...) return the same volatile-id shape.
+  // SEND_LIKE_MESSAGE_ACTIONS stays broader than the terminal-send set on purpose:
+  // broadcast/reply/sticker/poll carry volatile ids but are not terminal sends.
+  return isMessagingToolSendAction(toolName, args);
+}
+
+// Only the loop detector's own veto must not reset the streak; other blocked results
+// (plugin/approval vetoes) keep a hash so repeated identical denials still escalate.
+function isLoopVetoResult(details: Record<string, unknown>): boolean {
+  return details.status === "blocked" && details.deniedReason === "tool-loop";
+}
+
 function hashToolOutcome(
   toolName: string,
   params: unknown,
@@ -285,6 +303,11 @@ function hashToolOutcome(
 
   const details = isPlainObject(result.details) ? result.details : {};
   const text = extractTextContent(result);
+  // The loop detector's own veto is not real progress; giving it no result hash keeps a
+  // critical loop block sticky instead of letting the block reset the streak (#89090).
+  if (isLoopVetoResult(details)) {
+    return { resultHash: undefined };
+  }
   if (toolName === "exec") {
     const execHash = hashExecToolOutcome(details, text);
     if (execHash) {
@@ -319,6 +342,10 @@ function hashToolOutcome(
         }),
       };
     }
+  }
+
+  if (isVolatileSendResult(toolName, params)) {
+    return { resultHash: digestStable(stripVolatileSendIds(details)) };
   }
 
   return {
@@ -609,10 +636,27 @@ export function detectToolCallLoop(
     };
   }
 
-  // Generic detector: warn-only for repeated identical calls.
+  // Generic detector: warn on repeated identical calls, then block only after
+  // outcomes prove the calls are not making progress.
   const recentCount = history.filter(
     (h) => h.toolName === toolName && h.argsHash === currentHash,
   ).length;
+
+  if (
+    !knownPollTool &&
+    resolvedConfig.detectors.genericRepeat &&
+    noProgressStreak >= resolvedConfig.criticalThreshold
+  ) {
+    log.error(`Critical generic loop detected: ${toolName} repeated ${noProgressStreak} times`);
+    return {
+      stuck: true,
+      level: "critical",
+      detector: "generic_repeat",
+      count: noProgressStreak,
+      message: `CRITICAL: Called ${toolName} with identical arguments and identical outcomes ${noProgressStreak} times. Session execution blocked to prevent runaway loops.`,
+      warningKey: `generic:${toolName}:${currentHash}:${noProgress.latestResultHash ?? "none"}`,
+    };
+  }
 
   if (
     !knownPollTool &&
@@ -660,7 +704,7 @@ export function recordToolCall(
   });
 
   if (state.toolCallHistory.length > resolvedConfig.historySize) {
-    state.toolCallHistory.shift();
+    state.toolCallHistory.splice(0, state.toolCallHistory.length - resolvedConfig.historySize);
   }
 }
 
@@ -678,13 +722,13 @@ export function recordToolCallOutcome(
     config?: ToolLoopDetectionConfig;
     runId?: string;
   },
-): void {
+): ToolCallRecord | undefined {
   const resolvedConfig = resolveLoopDetectionConfig(params.config);
   const runId = normalizeRunId(params.runId);
   const outcome = hashToolOutcome(params.toolName, params.toolParams, params.result, params.error);
   const resultHash = outcome.resultHash;
   if (!resultHash) {
-    return;
+    return undefined;
   }
 
   if (!state.toolCallHistory) {
@@ -693,6 +737,7 @@ export function recordToolCallOutcome(
 
   const argsHash = hashToolCall(params.toolName, params.toolParams);
   let matched = false;
+  let recordedOutcome: ToolCallRecord | undefined;
   for (let i = state.toolCallHistory.length - 1; i >= 0; i -= 1) {
     const call = state.toolCallHistory[i];
     if (!call) {
@@ -713,11 +758,12 @@ export function recordToolCallOutcome(
     call.resultHash = resultHash;
     call.unknownToolName = outcome.unknownToolName;
     matched = true;
+    recordedOutcome = call;
     break;
   }
 
   if (!matched) {
-    state.toolCallHistory.push({
+    const record: ToolCallRecord = {
       toolName: params.toolName,
       argsHash,
       toolCallId: params.toolCallId,
@@ -725,45 +771,13 @@ export function recordToolCallOutcome(
       resultHash,
       unknownToolName: outcome.unknownToolName,
       timestamp: Date.now(),
-    });
+    };
+    state.toolCallHistory.push(record);
+    recordedOutcome = record;
   }
 
   if (state.toolCallHistory.length > resolvedConfig.historySize) {
     state.toolCallHistory.splice(0, state.toolCallHistory.length - resolvedConfig.historySize);
   }
-}
-
-/**
- * Get current tool call statistics for a session (for debugging/monitoring).
- */
-export function getToolCallStats(state: SessionState): {
-  totalCalls: number;
-  uniquePatterns: number;
-  mostFrequent: { toolName: string; count: number } | null;
-} {
-  const history = state.toolCallHistory ?? [];
-  const patterns = new Map<string, { toolName: string; count: number }>();
-
-  for (const call of history) {
-    const key = call.argsHash;
-    const existing = patterns.get(key);
-    if (existing) {
-      existing.count += 1;
-    } else {
-      patterns.set(key, { toolName: call.toolName, count: 1 });
-    }
-  }
-
-  let mostFrequent: { toolName: string; count: number } | null = null;
-  for (const pattern of patterns.values()) {
-    if (!mostFrequent || pattern.count > mostFrequent.count) {
-      mostFrequent = pattern;
-    }
-  }
-
-  return {
-    totalCalls: history.length,
-    uniquePatterns: patterns.size,
-    mostFrequent,
-  };
+  return recordedOutcome;
 }

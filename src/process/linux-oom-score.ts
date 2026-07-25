@@ -1,3 +1,4 @@
+// Linux OOM score helpers adjust child process OOM priority when supported.
 import fs from "node:fs";
 
 /**
@@ -17,7 +18,7 @@ import fs from "node:fs";
  * `params.env` for per-child overrides.
  */
 
-export const CHILD_OOM_SCORE_ADJ_ENV_KEY = "OPENCLAW_CHILD_OOM_SCORE_ADJ";
+const CHILD_OOM_SCORE_ADJ_ENV_KEY = "OPENCLAW_CHILD_OOM_SCORE_ADJ";
 const OOM_SCORE_WRAP_SHELL = "/bin/sh";
 const OOM_SCORE_WRAP_SCRIPT = 'echo 1000 > /proc/self/oom_score_adj 2>/dev/null; exec "$0" "$@"';
 
@@ -113,31 +114,4 @@ export function prepareOomScoreAdjustedSpawn(
     env: hardenShellEnv(options?.env),
     wrapped: true,
   };
-}
-
-export function wrapArgvForChildOomScoreRaise(
-  argv: readonly string[],
-  options?: OomWrapOptions,
-): string[] {
-  const copy = [...argv];
-  if (copy.length === 0) {
-    return copy;
-  }
-  const spawn = prepareOomScoreAdjustedSpawn(copy[0] ?? "", copy.slice(1), options);
-  return [spawn.command, ...spawn.args];
-}
-
-/**
- * Returns `baseEnv` with shell-init keys stripped when argv will be wrapped.
- * Unchanged (including `undefined`) when no wrap applies, so non-Linux and
- * opted-out paths keep exact inherited-env semantics.
- */
-export function hardenedEnvForChildOomWrap(
-  baseEnv: NodeJS.ProcessEnv | undefined,
-  options?: OomWrapOptions,
-): NodeJS.ProcessEnv | undefined {
-  if (!shouldWrapChildForOomScore(options)) {
-    return baseEnv;
-  }
-  return hardenShellEnv(baseEnv);
 }

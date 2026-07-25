@@ -1,9 +1,9 @@
+// Feishu plugin module implements lifecycle test support behavior.
 import { randomUUID } from "node:crypto";
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { expect, vi, type Mock } from "vitest";
 import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../../runtime-api.js";
-import { createFeishuMessageReceiveHandler } from "../monitor.message-handler.js";
-import { setFeishuRuntime } from "../runtime.js";
+import { getFeishuRuntime, setFeishuRuntime } from "../runtime.js";
 import type { ResolvedFeishuAccount } from "../types.js";
 
 const FEISHU_LIFECYCLE_WAIT_TIMEOUT_MS = 10_000;
@@ -12,7 +12,6 @@ type InboundDebouncerParams<T> = {
   onFlush?: (items: T[]) => Promise<void>;
   onError?: (err: unknown, items: T[]) => void;
 };
-type UnknownMock = Mock<(...args: unknown[]) => unknown>;
 type AsyncUnknownMock = Mock<(...args: unknown[]) => Promise<unknown>>;
 type FeishuDispatchReplyCounts = {
   final: number;
@@ -29,19 +28,23 @@ type FeishuDispatchReplyMock = Mock<
   (args: {
     ctx: FeishuDispatchReplyContext;
     dispatcher: FeishuDispatchReplyDispatcher;
+    replyOptions?: {
+      turnAdoptionLifecycle?: {
+        onAdopted: () => void | Promise<void>;
+      };
+    };
   }) => Promise<{ queuedFinal: boolean; counts: FeishuDispatchReplyCounts }>
 >;
+type RuntimeReplyDispatcher = NonNullable<
+  Parameters<PluginRuntime["channel"]["reply"]["withReplyDispatcher"]>[0]["dispatcher"]
+>;
 type FeishuLifecycleReplyDispatcher = {
-  dispatcher: {
-    sendToolResult: UnknownMock;
-    sendBlockReply: UnknownMock;
-    sendFinalReply: AsyncUnknownMock;
-    waitForIdle: AsyncUnknownMock;
-    getQueuedCounts: UnknownMock;
-    markComplete: UnknownMock;
+  dispatcherOptions: Record<string, never>;
+  delivery: {
+    deliver: AsyncUnknownMock;
   };
   replyOptions: Record<string, never>;
-  markDispatchIdle: UnknownMock;
+  ensureNoVisibleReplyFallback: AsyncUnknownMock;
 };
 
 export function setFeishuLifecycleStateDir(prefix: string) {
@@ -56,7 +59,7 @@ export function restoreFeishuLifecycleStateDir(originalStateDir: string | undefi
   process.env.OPENCLAW_STATE_DIR = originalStateDir;
 }
 
-export const FEISHU_PREFETCHED_BOT_OPEN_ID_SOURCE = {
+const FEISHU_PREFETCHED_BOT_OPEN_ID_SOURCE = {
   kind: "prefetched",
   botOpenId: "ou_bot_1",
   botName: "Bot",
@@ -64,20 +67,14 @@ export const FEISHU_PREFETCHED_BOT_OPEN_ID_SOURCE = {
 
 export function createFeishuLifecycleReplyDispatcher(): FeishuLifecycleReplyDispatcher {
   return {
-    dispatcher: {
-      sendToolResult: vi.fn(() => false),
-      sendBlockReply: vi.fn(() => false),
-      sendFinalReply: vi.fn(async () => true),
-      waitForIdle: vi.fn(async () => {}),
-      getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
-      markComplete: vi.fn(),
-    },
+    dispatcherOptions: {},
+    delivery: { deliver: vi.fn(async () => {}) },
     replyOptions: {},
-    markDispatchIdle: vi.fn(),
+    ensureNoVisibleReplyFallback: vi.fn(async () => false),
   };
 }
 
-export function createImmediateInboundDebounce() {
+function createImmediateInboundDebounce() {
   return {
     resolveInboundDebounceMs: vi.fn(() => 0),
     createInboundDebouncer: <T>(params: InboundDebouncerParams<T>) => ({
@@ -89,13 +86,13 @@ export function createImmediateInboundDebounce() {
         }
       },
       flushKey: async () => {},
+      cancelKey: () => false,
     }),
   };
 }
 
-export function installFeishuLifecycleRuntime(params: {
+function installFeishuLifecycleRuntime(params: {
   resolveAgentRoute: PluginRuntime["channel"]["routing"]["resolveAgentRoute"];
-  finalizeInboundContext: PluginRuntime["channel"]["reply"]["finalizeInboundContext"];
   dispatchReplyFromConfig: PluginRuntime["channel"]["reply"]["dispatchReplyFromConfig"];
   withReplyDispatcher: PluginRuntime["channel"]["reply"]["withReplyDispatcher"];
   resolveStorePath: PluginRuntime["channel"]["session"]["resolveStorePath"];
@@ -119,7 +116,41 @@ export function installFeishuLifecycleRuntime(params: {
       reply: {
         resolveEnvelopeFormatOptions: vi.fn(() => ({})),
         formatAgentEnvelope: vi.fn((value: { body: string }) => value.body),
-        finalizeInboundContext: params.finalizeInboundContext,
+        dispatchReplyWithBufferedBlockDispatcher: async ({
+          cfg,
+          ctx,
+          dispatcherOptions,
+          replyOptions,
+        }) => {
+          // ReplyDispatcher enqueue methods are synchronous; settlement owns async delivery.
+          const pendingDeliveries: Promise<unknown>[] = [];
+          const dispatcher: RuntimeReplyDispatcher = {
+            sendToolResult: () => false,
+            sendBlockReply: () => false,
+            sendFinalReply: (payload) => {
+              pendingDeliveries.push(
+                Promise.resolve(dispatcherOptions.deliver(payload, { kind: "final" })),
+              );
+              return true;
+            },
+            waitForIdle: async () => {
+              await Promise.all(pendingDeliveries);
+            },
+            getQueuedCounts: () => ({ tool: 0, block: 0, final: 0 }),
+            getFailedCounts: () => ({ tool: 0, block: 0, final: 0 }),
+            markComplete: () => {},
+          };
+          return await params.withReplyDispatcher({
+            dispatcher,
+            run: () =>
+              params.dispatchReplyFromConfig({
+                cfg,
+                ctx: ctx as Parameters<typeof params.dispatchReplyFromConfig>[0]["ctx"],
+                dispatcher,
+                replyOptions,
+              }),
+          });
+        },
         dispatchReplyFromConfig: params.dispatchReplyFromConfig,
         withReplyDispatcher: params.withReplyDispatcher,
       },
@@ -148,7 +179,6 @@ export function installFeishuLifecycleRuntime(params: {
 
 export function installFeishuLifecycleReplyRuntime(params: {
   resolveAgentRouteMock: unknown;
-  finalizeInboundContextMock: unknown;
   dispatchReplyFromConfigMock: unknown;
   withReplyDispatcherMock: unknown;
   storePath: string;
@@ -156,8 +186,6 @@ export function installFeishuLifecycleReplyRuntime(params: {
   return installFeishuLifecycleRuntime({
     resolveAgentRoute:
       params.resolveAgentRouteMock as PluginRuntime["channel"]["routing"]["resolveAgentRoute"],
-    finalizeInboundContext:
-      params.finalizeInboundContextMock as PluginRuntime["channel"]["reply"]["finalizeInboundContext"],
     dispatchReplyFromConfig:
       params.dispatchReplyFromConfigMock as PluginRuntime["channel"]["reply"]["dispatchReplyFromConfig"],
     withReplyDispatcher:
@@ -171,16 +199,19 @@ export function mockFeishuReplyOnceDispatch(params: {
   replyText: string;
   shouldSendFinalReply?: (ctx: unknown) => boolean;
 }) {
-  params.dispatchReplyFromConfigMock.mockImplementation(async ({ ctx, dispatcher }) => {
-    const shouldSendFinalReply = params.shouldSendFinalReply?.(ctx) ?? true;
-    if (shouldSendFinalReply && typeof dispatcher?.sendFinalReply === "function") {
-      await dispatcher.sendFinalReply({ text: params.replyText });
-    }
-    return {
-      queuedFinal: false,
-      counts: { final: shouldSendFinalReply ? 1 : 0 },
-    };
-  });
+  params.dispatchReplyFromConfigMock.mockImplementation(
+    async ({ ctx, dispatcher, replyOptions }) => {
+      await replyOptions?.turnAdoptionLifecycle?.onAdopted();
+      const shouldSendFinalReply = params.shouldSendFinalReply?.(ctx) ?? true;
+      if (shouldSendFinalReply && typeof dispatcher?.sendFinalReply === "function") {
+        await dispatcher.sendFinalReply({ text: params.replyText });
+      }
+      return {
+        queuedFinal: false,
+        counts: { final: shouldSendFinalReply ? 1 : 0 },
+      };
+    },
+  );
 }
 
 export function createFeishuLifecycleConfig(params: {
@@ -309,7 +340,7 @@ async function expectFeishuLifecycleEventually(
   }
 }
 
-export async function replayFeishuLifecycleEvent(params: {
+async function replayFeishuLifecycleEvent(params: {
   handler: (data: unknown) => Promise<void>;
   event: unknown;
   waitForFirst: () => void | Promise<void>;
@@ -400,40 +431,15 @@ export async function expectFeishuReplyPipelineDedupedAfterPostSendFailure(param
 export function expectFeishuReplyDispatcherSentFinalReplyOnce(params: {
   createFeishuReplyDispatcherMock: ReturnType<typeof vi.fn>;
 }) {
-  const dispatcher = params.createFeishuReplyDispatcherMock.mock.results[0]?.value.dispatcher as {
-    sendFinalReply: ReturnType<typeof vi.fn>;
+  const delivery = params.createFeishuReplyDispatcherMock.mock.results[0]?.value.delivery as {
+    deliver: ReturnType<typeof vi.fn>;
   };
-  expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+  expect(delivery.deliver).toHaveBeenCalledTimes(1);
 }
 
 async function loadMonitorSingleAccount() {
   const module = await import("../monitor.account.js");
   return module.monitorSingleAccount;
-}
-
-export async function setupFeishuMessageReceiveLifecycleHandler(params: {
-  runtime: RuntimeEnv;
-  core: PluginRuntime;
-  cfg: ClawdbotConfig;
-  accountId: string;
-  fireAndForget?: boolean;
-  handleMessage: Parameters<typeof createFeishuMessageReceiveHandler>[0]["handleMessage"];
-  resolveDebounceText: Parameters<
-    typeof createFeishuMessageReceiveHandler
-  >[0]["resolveDebounceText"];
-}): Promise<(data: unknown) => Promise<void>> {
-  return createFeishuMessageReceiveHandler({
-    cfg: params.cfg,
-    core: params.core,
-    accountId: params.accountId,
-    runtime: params.runtime,
-    chatHistories: new Map(),
-    fireAndForget: params.fireAndForget,
-    handleMessage: params.handleMessage,
-    resolveDebounceText: params.resolveDebounceText,
-    hasProcessedMessage: vi.fn(async () => false),
-    recordProcessedMessage: vi.fn(async () => true),
-  });
 }
 
 export async function setupFeishuLifecycleHandler(params: {
@@ -457,6 +463,9 @@ export async function setupFeishuLifecycleHandler(params: {
   } else {
     params.createEventDispatcherMock.mockReturnValue({ register });
   }
+  getFeishuRuntime().config.current = vi.fn(
+    () => params.cfg,
+  ) as unknown as PluginRuntime["config"]["current"];
 
   const monitorSingleAccount = await loadMonitorSingleAccount();
   await monitorSingleAccount({
@@ -468,7 +477,7 @@ export async function setupFeishuLifecycleHandler(params: {
   });
 
   const handlers: Record<string, (data: unknown) => Promise<void>> = {};
-  for (const [key, value] of Object.entries(register.mock.calls[0]?.[0] ?? {})) {
+  for (const [key, value] of Object.entries(register.mock.calls.at(0)?.[0] ?? {})) {
     handlers[key] = value as (data: unknown) => Promise<void>;
   }
   const handler = handlers[params.handlerKey];

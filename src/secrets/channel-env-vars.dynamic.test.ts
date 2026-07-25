@@ -1,10 +1,14 @@
+/** Tests dynamic channel env-var discovery from plugin/channel metadata. */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 type MockManifestRegistry = {
   plugins: Array<{
     id: string;
     origin: string;
-    channelEnvVars?: Record<string, string[]>;
+    packageChannel?: {
+      id: string;
+      configuredState?: { env?: { allOf?: string[]; anyOf?: string[] } };
+    };
   }>;
   diagnostics: unknown[];
 };
@@ -18,6 +22,10 @@ const pluginRegistryMocks = vi.hoisted(() => {
     loadPluginManifestRegistryForInstalledIndex: loadManifestRegistry,
     loadPluginManifestRegistryForPluginRegistry: loadManifestRegistry,
     loadPluginRegistrySnapshot: vi.fn(() => ({ plugins: [] })),
+    loadPluginMetadataSnapshot: vi.fn(() => ({
+      plugins: loadManifestRegistry().plugins,
+      manifestRegistry: loadManifestRegistry(),
+    })),
   };
 });
 
@@ -32,7 +40,11 @@ vi.mock("../plugins/plugin-registry.js", () => ({
   loadPluginRegistrySnapshot: pluginRegistryMocks.loadPluginRegistrySnapshot,
 }));
 
-describe("channel env vars dynamic manifest metadata", () => {
+vi.mock("../plugins/plugin-metadata-snapshot.js", () => ({
+  loadPluginMetadataSnapshot: pluginRegistryMocks.loadPluginMetadataSnapshot,
+}));
+
+describe("channel env vars dynamic package metadata", () => {
   beforeEach(() => {
     vi.resetModules();
     pluginRegistryMocks.loadPluginManifestRegistryForInstalledIndex.mockReset();
@@ -42,6 +54,7 @@ describe("channel env vars dynamic manifest metadata", () => {
     });
     pluginRegistryMocks.loadPluginRegistrySnapshot.mockReset();
     pluginRegistryMocks.loadPluginRegistrySnapshot.mockReturnValue({ plugins: [] });
+    pluginRegistryMocks.loadPluginMetadataSnapshot.mockClear();
   });
 
   it("includes later-installed plugin env vars without a bundled generated map", async () => {
@@ -50,8 +63,11 @@ describe("channel env vars dynamic manifest metadata", () => {
         {
           id: "external-mattermost",
           origin: "global",
-          channelEnvVars: {
-            mattermost: ["MATTERMOST_BOT_TOKEN", "MATTERMOST_URL"],
+          packageChannel: {
+            id: "mattermost",
+            configuredState: {
+              env: { anyOf: ["MATTERMOST_BOT_TOKEN", "MATTERMOST_URL"] },
+            },
           },
         },
       ],
@@ -61,8 +77,8 @@ describe("channel env vars dynamic manifest metadata", () => {
     const mod = await import("./channel-env-vars.js");
 
     expect(mod.getChannelEnvVars("mattermost")).toEqual(["MATTERMOST_BOT_TOKEN", "MATTERMOST_URL"]);
-    expect(mod.listKnownChannelEnvVarNames()).toEqual(
-      expect.arrayContaining(["MATTERMOST_BOT_TOKEN", "MATTERMOST_URL"]),
-    );
+    const knownNames = mod.listKnownChannelEnvVarNames();
+    expect(knownNames).toContain("MATTERMOST_BOT_TOKEN");
+    expect(knownNames).toContain("MATTERMOST_URL");
   });
 });

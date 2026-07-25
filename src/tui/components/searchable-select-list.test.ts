@@ -1,5 +1,6 @@
+// Searchable select list tests cover filtering and selection behavior.
 import { describe, expect, it } from "vitest";
-import { stripAnsi, visibleWidth } from "../../terminal/ansi.js";
+import { stripAnsi, visibleWidth } from "../../../packages/terminal-core/src/ansi.js";
 import { SearchableSelectList, type SearchableSelectListTheme } from "./searchable-select-list.js";
 
 const mockTheme: SearchableSelectListTheme = {
@@ -60,7 +61,7 @@ describe("SearchableSelectList", () => {
   function expectNoMatchesForQuery(list: SearchableSelectList, query: string) {
     typeInput(list, query);
     const output = list.render(80);
-    expect(output.some((line) => line.includes("No matches"))).toBe(true);
+    expect(output.join("\n")).toContain("No matches");
   }
 
   function expectDescriptionVisibilityAtWidth(width: number, shouldContainDescription: boolean) {
@@ -169,8 +170,10 @@ describe("SearchableSelectList", () => {
     typeInput(list, "gpt m");
 
     const renderedLine = list.render(80).find((line) => stripAnsi(line).includes("gpt-model"));
-    expect(renderedLine).toBeDefined();
-    const highlightOpens = renderedLine ? renderedLine.split("\u001b[31m").length - 1 : 0;
+    if (!renderedLine) {
+      throw new Error("expected rendered gpt-model line");
+    }
+    const highlightOpens = renderedLine.split("\u001b[31m").length - 1;
     expect(highlightOpens).toBe(2);
   });
 
@@ -254,6 +257,16 @@ describe("SearchableSelectList", () => {
     expect(selected?.value).toContain("gpt");
   });
 
+  it("treats slashes as fuzzy token separators", () => {
+    const list = new SearchableSelectList(
+      [{ value: "sonnet", label: "Claude Sonnet", description: "anthropic" }],
+      5,
+      mockTheme,
+    );
+
+    expectSelectedValueForQuery(list, "anthropic/sonnet", "sonnet");
+  });
+
   it("preserves fuzzy ranking when only fuzzy matches exist", () => {
     const items = [
       { value: "xg---4", label: "xg---4", description: "Worse fuzzy match" },
@@ -274,6 +287,24 @@ describe("SearchableSelectList", () => {
 
     const output = list.render(80).join("\n");
     expect(output).toContain("*gpt*");
+  });
+
+  it("discards compiled regexes from previous searches", () => {
+    const queryLength = 300;
+    const list = new SearchableSelectList(
+      [{ value: "match", label: "a".repeat(queryLength) }],
+      5,
+      mockTheme,
+    );
+
+    for (let index = 0; index < queryLength; index += 1) {
+      list.handleInput("a");
+      list.render(queryLength + 10);
+    }
+
+    const regexCache = (list as unknown as { regexCache: Map<string, RegExp> }).regexCache;
+    expect(regexCache.size).toBe(1);
+    expect(list.render(queryLength + 10).join("\n")).toContain(`*${"a".repeat(queryLength)}*`);
   });
 
   it("shows no match message when filter yields no results", () => {

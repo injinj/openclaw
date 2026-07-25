@@ -1,10 +1,22 @@
+// Trajectory export tests cover packaged trajectory output and metadata.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { Message, Usage } from "@mariozechner/pi-ai";
+import { expectDefined } from "@openclaw/normalization-core";
+import type { Message, Usage } from "openclaw/plugin-sdk/llm";
 import { afterAll, describe, expect, it } from "vitest";
+import { replaceTranscriptEvents } from "../config/sessions/session-accessor.js";
+import { formatSqliteSessionFileMarker } from "../config/sessions/sqlite-marker.js";
+import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { exportTrajectoryBundle, resolveDefaultTrajectoryExportDir } from "./export.js";
-import { resolveTrajectoryPointerFilePath } from "./paths.js";
+import {
+  TRAJECTORY_POINTER_FILE_MAX_BYTES,
+  TRAJECTORY_RUNTIME_FILE_MAX_BYTES,
+  resolveTrajectoryFilePath,
+  resolveTrajectoryPointerFilePath,
+} from "./paths.js";
+import { appendSqliteTrajectoryRuntimeEvents } from "./runtime-store.sqlite.js";
 import type { TrajectoryEvent } from "./types.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-trajectory-"));
@@ -63,9 +75,13 @@ function toolResultMessage(content: Extract<Message, { role: "toolResult" }>["co
   };
 }
 
+function eventTypes(events: readonly Pick<TrajectoryEvent, "type">[]): string[] {
+  return events.map((event) => event.type);
+}
+
 function writeSimpleSessionFile(
   sessionFile: string,
-  params: { userEntryTimestamp?: string | number } = {},
+  params: { userEntryTimestamp?: string | number; userMessage?: Message } = {},
 ): void {
   const header = {
     type: "session",
@@ -79,7 +95,7 @@ function writeSimpleSessionFile(
     id: "entry-user",
     parentId: null,
     timestamp: params.userEntryTimestamp ?? "2026-04-01T05:46:40.000Z",
-    message: userMessage("hello"),
+    message: params.userMessage ?? userMessage("hello"),
   };
   const assistantEntry = {
     type: "message",
@@ -181,6 +197,8 @@ function writeToolCallSessionFile(sessionFile: string): void {
 }
 
 afterAll(() => {
+  closeOpenClawAgentDatabasesForTest();
+  closeOpenClawStateDatabaseForTest();
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
 
@@ -202,30 +220,153 @@ describe("exportTrajectoryBundle", () => {
     );
   });
 
-  it("refuses to write into an existing output directory", () => {
+  it("refuses to write into an existing output directory", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const outputDir = path.join(tmpDir, "bundle");
     writeSimpleSessionFile(sessionFile);
     fs.mkdirSync(outputDir);
 
-    expect(() =>
-      exportTrajectoryBundle({
+    try {
+      await exportTrajectoryBundle({
         outputDir,
         sessionFile,
         sessionId: "session-1",
         workspaceDir: tmpDir,
-      }),
-    ).toThrow();
+      });
+      throw new Error("expected trajectory export to reject an existing output directory");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EEXIST");
+    }
   });
 
-  it("does not synthesize prompt files from export-time fallbacks", () => {
+  it("exports SQLite-backed transcript rows without a session JSONL file", async () => {
+    const tmpDir = makeTempDir();
+    const storePath = path.join(tmpDir, "sessions.json");
+    const outputDir = path.join(tmpDir, "bundle");
+    const sessionId = "session-1";
+    const sessionKey = "agent:main:session-1";
+    await replaceTranscriptEvents(
+      {
+        agentId: "main",
+        sessionId,
+        sessionKey,
+        storePath,
+      },
+      [
+        {
+          type: "session",
+          version: 3,
+          id: sessionId,
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        },
+        {
+          type: "message",
+          id: "entry-user",
+          parentId: null,
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("hello from sqlite"),
+        },
+        {
+          type: "message",
+          id: "entry-assistant",
+          parentId: "entry-user",
+          timestamp: "2026-04-01T05:46:41.000Z",
+          message: assistantMessage([{ type: "text", text: "done from sqlite" }]),
+        },
+      ],
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile: formatSqliteSessionFileMarker({
+        agentId: "main",
+        sessionId,
+        storePath,
+      }),
+      sessionId,
+      sessionKey,
+      workspaceDir: tmpDir,
+    });
+
+    expect(bundle.header?.id).toBe(sessionId);
+    expect(bundle.manifest.transcriptEventCount).toBe(2);
+    expect(eventTypes(bundle.events)).toEqual(["user.message", "assistant.message"]);
+    expect(fs.existsSync(path.join(tmpDir, "session-1.jsonl"))).toBe(false);
+  });
+
+  it("exports SQLite-backed runtime rows without a runtime JSONL sidecar", async () => {
+    const tmpDir = makeTempDir();
+    const storePath = path.join(tmpDir, "sessions.json");
+    const outputDir = path.join(tmpDir, "bundle");
+    const sessionId = "session-1";
+    const sessionKey = "agent:main:session-1";
+    await replaceTranscriptEvents(
+      {
+        agentId: "main",
+        sessionId,
+        sessionKey,
+        storePath,
+      },
+      [
+        {
+          type: "session",
+          version: 3,
+          id: sessionId,
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        },
+        {
+          type: "message",
+          id: "entry-user",
+          parentId: null,
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("hello from sqlite"),
+        },
+      ],
+    );
+    appendSqliteTrajectoryRuntimeEvents({ agentId: "main", sessionId, storePath }, [
+      {
+        traceSchema: "openclaw-trajectory",
+        schemaVersion: 1,
+        traceId: sessionId,
+        source: "runtime",
+        type: "sqlite-runtime",
+        ts: "2026-04-01T05:46:41.000Z",
+        seq: 1,
+        sourceSeq: 1,
+        sessionId,
+        sessionKey,
+      },
+    ]);
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile: formatSqliteSessionFileMarker({
+        agentId: "main",
+        sessionId,
+        storePath,
+      }),
+      sessionId,
+      sessionKey,
+      workspaceDir: tmpDir,
+    });
+
+    expect(bundle.runtimeFile).toBeUndefined();
+    expect(bundle.manifest.runtimeEventCount).toBe(1);
+    expect(bundle.manifest.sourceFiles.runtime).toBeUndefined();
+    expect(eventTypes(bundle.events)).toContain("sqlite-runtime");
+    expect(fs.existsSync(path.join(tmpDir, "trajectory", "session-1.jsonl"))).toBe(false);
+  });
+
+  it("does not synthesize prompt files from export-time fallbacks", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const outputDir = path.join(tmpDir, "bundle");
     writeSimpleSessionFile(sessionFile);
 
-    const bundle = exportTrajectoryBundle({
+    const bundle = await exportTrajectoryBundle({
       outputDir,
       sessionFile,
       sessionId: "session-1",
@@ -240,7 +381,108 @@ describe("exportTrajectoryBundle", () => {
     expect(fs.existsSync(path.join(outputDir, "tools.json"))).toBe(false);
   });
 
-  it("preserves numeric transcript timestamps", () => {
+  it("exports usage from truncated model completion runtime events", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    const usage = {
+      input: 384_954,
+      output: 5_624,
+      cacheRead: 333_824,
+      reasoningTokens: 2_038,
+      total: 724_402,
+    };
+    const promptCache = { readTokens: 333_824, writeTokens: 51_130 };
+    writeSimpleSessionFile(sessionFile);
+    const runtimeEvent: TrajectoryEvent = {
+      traceSchema: "openclaw-trajectory",
+      schemaVersion: 1,
+      traceId: "session-1",
+      source: "runtime",
+      type: "model.completed",
+      ts: "2026-04-22T08:00:02.000Z",
+      seq: 1,
+      sourceSeq: 1,
+      sessionId: "session-1",
+      data: {
+        truncated: true,
+        originalBytes: 300_000,
+        limitBytes: 256 * 1024,
+        reason: "trajectory-event-size-limit",
+        usage,
+        promptCache,
+        droppedFields: ["messagesSnapshot"],
+      },
+    };
+    fs.writeFileSync(runtimeFile, `${JSON.stringify(runtimeEvent)}\n`, "utf8");
+
+    await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+      runtimeFile,
+    });
+
+    const artifacts = JSON.parse(
+      fs.readFileSync(path.join(outputDir, "artifacts.json"), "utf8"),
+    ) as { usage?: unknown; promptCache?: unknown };
+    expect(artifacts.usage).toEqual(usage);
+    expect(artifacts.promptCache).toEqual(promptCache);
+  });
+
+  it("projects legacy media in existing runtime message snapshots", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    writeSimpleSessionFile(sessionFile);
+    const runtimeEvent: TrajectoryEvent = {
+      traceSchema: "openclaw-trajectory",
+      schemaVersion: 1,
+      traceId: "session-1",
+      source: "runtime",
+      type: "model.completed",
+      ts: "2026-04-22T08:00:02.000Z",
+      seq: 1,
+      sessionId: "session-1",
+      data: {
+        messagesSnapshot: [
+          {
+            role: "user",
+            content: "",
+            MediaPath: "media/legacy.png",
+            MediaType: "image/png",
+          },
+        ],
+      },
+    };
+    fs.writeFileSync(runtimeFile, `${JSON.stringify(runtimeEvent)}\n`, "utf8");
+
+    await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+      runtimeFile,
+    });
+
+    const exportedEvents = fs
+      .readFileSync(path.join(outputDir, "events.jsonl"), "utf8")
+      .trim()
+      .split(/\r?\n/u)
+      .map((line) => JSON.parse(line) as TrajectoryEvent);
+    const snapshot = exportedEvents.find((event) => event.type === "model.completed")?.data
+      ?.messagesSnapshot as Array<Record<string, unknown>> | undefined;
+    expect(snapshot?.[0]).not.toHaveProperty("MediaPath");
+    expect(snapshot?.[0]).not.toHaveProperty("MediaType");
+    expect(snapshot?.[0]?.["__openclaw"]).toMatchObject({
+      media: [{ path: "media/legacy.png", contentType: "image/png" }],
+    });
+  });
+
+  it("preserves numeric transcript timestamps", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const outputDir = path.join(tmpDir, "bundle");
@@ -248,7 +490,7 @@ describe("exportTrajectoryBundle", () => {
       userEntryTimestamp: Date.parse("2026-04-01T05:46:40.000Z"),
     });
 
-    exportTrajectoryBundle({
+    await exportTrajectoryBundle({
       outputDir,
       sessionFile,
       sessionId: "session-1",
@@ -265,16 +507,254 @@ describe("exportTrajectoryBundle", () => {
     );
   });
 
-  it("rejects oversized runtime trajectory files", () => {
+  it.each([
+    {
+      name: "legacy-only",
+      message: { MediaPath: "media/legacy.png", MediaType: "image/png" },
+      expectedPath: "media/legacy.png",
+    },
+    {
+      name: "facts-only",
+      message: { __openclaw: { media: [{ path: "media/fact.png", contentType: "image/png" }] } },
+      expectedPath: "media/fact.png",
+    },
+    {
+      name: "both-equal",
+      message: {
+        MediaPath: "media/equal.png",
+        __openclaw: { media: [{ path: "media/equal.png", contentType: "image/png" }] },
+      },
+      expectedPath: "media/equal.png",
+    },
+    {
+      name: "both-conflict",
+      message: {
+        MediaPath: "media/legacy-conflict.png",
+        __openclaw: { media: [{ path: "media/canonical.png", contentType: "image/png" }] },
+      },
+      expectedPath: "media/canonical.png",
+    },
+    {
+      name: "sparse",
+      message: { __openclaw: { media: [{}, { path: "media/sparse.png" }] } },
+      expectedPath: "media/sparse.png",
+      expectedIndex: 1,
+    },
+    {
+      name: "type-only",
+      message: { __openclaw: { media: [{ contentType: "image/png" }] } },
+      expectedPath: undefined,
+    },
+    {
+      name: "media-only",
+      message: { content: "", __openclaw: { media: [{ path: "media/media-only.png" }] } },
+      expectedPath: "media/media-only.png",
+    },
+  ])("exports $name transcript rows as facts only", async (testCase) => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    writeSimpleSessionFile(sessionFile, {
+      userMessage: { ...userMessage(""), ...testCase.message } as unknown as Message,
+    });
+
+    await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    const sessionBranch = JSON.parse(
+      fs.readFileSync(path.join(outputDir, "session-branch.json"), "utf8"),
+    ) as { entries?: Array<{ type?: string; message?: Record<string, unknown> }> };
+    const exported = sessionBranch.entries?.find((entry) => entry.type === "message")?.message;
+    const media = (exported?.["__openclaw"] as { media?: Array<{ path?: string }> })?.media;
+    const expectedIndex = "expectedIndex" in testCase ? (testCase.expectedIndex ?? 0) : 0;
+    expect(media?.[expectedIndex]?.path).toBe(testCase.expectedPath);
+    expect(exported).not.toHaveProperty("MediaPath");
+    expect(fs.readFileSync(path.join(outputDir, "events.jsonl"), "utf8")).not.toContain(
+      '"MediaPath"',
+    );
+  });
+
+  it("redacts broad secret patterns from every exported bundle file", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    const rawSecrets = [
+      "sk-exported-session-secret",
+      "ghp_123456789012345678901234",
+      "xoxb-1234567890-abcdefghijkl",
+      "ya29.exported-access-token-with-enough-length",
+      "ADMIN_PASSWORD=plain-text-password",
+      "sk-top-level-export-secret",
+    ];
+    const header = {
+      type: "session",
+      version: 3,
+      id: "session-1",
+      timestamp: "2026-04-01T05:46:39.000Z",
+      cwd: tmpDir,
+    };
+    const userEntry = {
+      type: "message",
+      id: "entry-user",
+      parentId: null,
+      timestamp: "2026-04-01T05:46:40.000Z",
+      message: userMessage(`user pasted ${rawSecrets[0]} keep-visible-marker`),
+    };
+    const assistantEntry = {
+      type: "message",
+      id: "entry-assistant",
+      parentId: "entry-user",
+      timestamp: "2026-04-01T05:46:41.000Z",
+      message: assistantMessage([
+        {
+          type: "toolCall",
+          id: "call_1",
+          name: "read",
+          arguments: {
+            [expectDefined(rawSecrets[5], "rawSecrets[5] test invariant")]:
+              "secret-looking tool argument key",
+            command: `curl -H 'Authorization: Bearer ${rawSecrets[1]}'`,
+          },
+        },
+      ]),
+    };
+    const compactionEntry = {
+      type: "compaction",
+      id: "entry-compaction",
+      parentId: "entry-assistant",
+      timestamp: "2026-04-01T05:46:42.000Z",
+      summary: `compaction summary saw ${rawSecrets[2]}`,
+      firstKeptEntryId: "entry-assistant",
+      tokensBefore: 1024,
+      details: { note: rawSecrets[3] },
+    };
+    const branchSummaryEntry = {
+      type: "branch_summary",
+      id: "entry-branch-summary",
+      parentId: "entry-compaction",
+      timestamp: "2026-04-01T05:46:43.000Z",
+      fromId: "entry-assistant",
+      summary: `branch summary saw ${rawSecrets[4]}`,
+      details: { token: rawSecrets[0] },
+    };
+    fs.writeFileSync(
+      sessionFile,
+      `${[header, userEntry, assistantEntry, compactionEntry, branchSummaryEntry]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n")}\n`,
+      "utf8",
+    );
+    fs.writeFileSync(
+      runtimeFile,
+      [
+        {
+          traceSchema: "openclaw-trajectory",
+          schemaVersion: 1,
+          traceId: "session-1",
+          source: "runtime",
+          type: "context.compiled",
+          ts: "2026-04-22T08:00:00.000Z",
+          seq: 1,
+          sourceSeq: 1,
+          sessionId: "session-1",
+          apiKey: rawSecrets[5],
+          data: {
+            systemPrompt: `system includes ${rawSecrets[1]}`,
+            tools: [{ name: "danger", description: `tool mentions ${rawSecrets[2]}` }],
+          },
+        },
+        {
+          traceSchema: "openclaw-trajectory",
+          schemaVersion: 1,
+          traceId: "session-1",
+          source: "runtime",
+          type: "trace.metadata",
+          ts: "2026-04-22T08:00:01.000Z",
+          seq: 2,
+          sourceSeq: 2,
+          sessionId: "session-1",
+          data: {
+            harness: { type: "openclaw", token: rawSecrets[3] },
+            metadata: {
+              [`https://example.test/callback?token=${rawSecrets[1]}`]:
+                "secret-looking metadata key",
+            },
+            prompting: {
+              skillsPrompt: `skills ${rawSecrets[4]}`,
+              userPromptPrefixText: `prefix ${rawSecrets[0]}`,
+            },
+          },
+        },
+        {
+          traceSchema: "openclaw-trajectory",
+          schemaVersion: 1,
+          traceId: "session-1",
+          source: "runtime",
+          type: "prompt.submitted",
+          ts: "2026-04-22T08:00:02.000Z",
+          seq: 3,
+          sourceSeq: 3,
+          sessionId: "session-1",
+          data: { prompt: `submitted ${rawSecrets[1]}` },
+        },
+        {
+          traceSchema: "openclaw-trajectory",
+          schemaVersion: 1,
+          traceId: "session-1",
+          source: "runtime",
+          type: "trace.artifacts",
+          ts: "2026-04-22T08:00:03.000Z",
+          seq: 4,
+          sourceSeq: 4,
+          sessionId: "session-1",
+          runId: rawSecrets[5],
+          data: {
+            assistantTexts: [`assistant ${rawSecrets[2]}`],
+            finalPromptText: `final ${rawSecrets[3]}`,
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      sessionKey: rawSecrets[5],
+      workspaceDir: tmpDir,
+      runtimeFile,
+    });
+
+    const exportedBundleText = fs
+      .readdirSync(outputDir)
+      .map((file) => fs.readFileSync(path.join(outputDir, file), "utf8"))
+      .join("\n");
+    expect(exportedBundleText).toContain("keep-visible-marker");
+    for (const secret of rawSecrets) {
+      expect(exportedBundleText).not.toContain(secret);
+    }
+    expect(JSON.stringify(bundle.events)).not.toContain(rawSecrets[5]);
+    expect(JSON.stringify(bundle.manifest)).not.toContain(rawSecrets[5]);
+  });
+
+  it("rejects oversized runtime trajectory files", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
     const outputDir = path.join(tmpDir, "bundle");
     writeSimpleSessionFile(sessionFile);
     fs.closeSync(fs.openSync(runtimeFile, "w"));
-    fs.truncateSync(runtimeFile, 50 * 1024 * 1024 + 1);
+    fs.truncateSync(runtimeFile, TRAJECTORY_RUNTIME_FILE_MAX_BYTES + 1);
 
-    expect(() =>
+    await expect(
       exportTrajectoryBundle({
         outputDir,
         sessionFile,
@@ -282,27 +762,27 @@ describe("exportTrajectoryBundle", () => {
         workspaceDir: tmpDir,
         runtimeFile,
       }),
-    ).toThrow(/too large/u);
+    ).rejects.toThrow(/too large/u);
   });
 
-  it("rejects oversized session transcript files before export", () => {
+  it("rejects oversized session transcript files before export", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const outputDir = path.join(tmpDir, "bundle");
     fs.closeSync(fs.openSync(sessionFile, "w"));
     fs.truncateSync(sessionFile, 50 * 1024 * 1024 + 1);
 
-    expect(() =>
+    await expect(
       exportTrajectoryBundle({
         outputDir,
         sessionFile,
         sessionId: "session-1",
         workspaceDir: tmpDir,
       }),
-    ).toThrow(/session file is too large/u);
+    ).rejects.toThrow(/session file is too large/u);
   });
 
-  it("skips malformed-but-valid runtime json rows before sorting", () => {
+  it("skips malformed-but-valid runtime json rows before sorting", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
@@ -310,21 +790,39 @@ describe("exportTrajectoryBundle", () => {
     writeSimpleSessionFile(sessionFile);
     fs.writeFileSync(
       runtimeFile,
-      `${JSON.stringify({})}\n${JSON.stringify({
-        traceSchema: "openclaw-trajectory",
-        schemaVersion: 1,
-        traceId: "session-1",
-        source: "runtime",
-        type: "session.started",
-        ts: "2026-04-22T08:00:00.000Z",
-        seq: 1,
-        sourceSeq: 1,
-        sessionId: "session-1",
-      })}\n`,
+      [
+        "",
+        JSON.stringify({}),
+        "",
+        JSON.stringify({
+          traceSchema: "openclaw-trajectory",
+          schemaVersion: 1,
+          traceId: "session-1",
+          source: "runtime",
+          type: "bad-data",
+          ts: "2026-04-22T08:00:00.000Z",
+          seq: 1,
+          sourceSeq: 1,
+          sessionId: "session-1",
+          data: [],
+        }),
+        '{"traceSchema":',
+        JSON.stringify({
+          traceSchema: "openclaw-trajectory",
+          schemaVersion: 1,
+          traceId: "session-1",
+          source: "runtime",
+          type: "session.started",
+          ts: "2026-04-22T08:00:00.000Z",
+          seq: 1,
+          sourceSeq: 1,
+          sessionId: "session-1",
+        }),
+      ].join("\n") + "\n",
       "utf8",
     );
 
-    const bundle = exportTrajectoryBundle({
+    const bundle = await exportTrajectoryBundle({
       outputDir,
       sessionFile,
       sessionId: "session-1",
@@ -332,10 +830,496 @@ describe("exportTrajectoryBundle", () => {
     });
 
     expect(bundle.manifest.runtimeEventCount).toBe(1);
-    expect(bundle.events.some((event) => event.type === "session.started")).toBe(true);
+    expect(eventTypes(bundle.events)).toContain("session.started");
+    expect(bundle.manifest.warnings).toEqual([
+      {
+        source: "runtime",
+        code: "invalid-runtime-event",
+        count: 2,
+        rows: [2, 4],
+        message: "Skipped a runtime trajectory JSONL row that does not match the session schema.",
+      },
+      {
+        source: "runtime",
+        code: "invalid-runtime-json",
+        count: 1,
+        rows: [5],
+        message: "Skipped a runtime trajectory JSONL row that is not valid JSON.",
+      },
+    ]);
   });
 
-  it("uses the recorded runtime pointer before current environment overrides", () => {
+  it("skips and reports malformed session jsonl rows without poisoning transcript export", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    const header = {
+      type: "session",
+      version: 3,
+      id: "session-1",
+      timestamp: "2026-04-01T05:46:39.000Z",
+      cwd: tmpDir,
+    };
+    const userEntry = {
+      type: "message",
+      id: "entry-user",
+      parentId: null,
+      timestamp: "2026-04-01T05:46:40.000Z",
+      message: userMessage("hello"),
+    };
+    const assistantEntry = {
+      type: "message",
+      id: "entry-assistant",
+      parentId: "entry-user",
+      timestamp: "2026-04-01T05:46:41.000Z",
+      message: assistantMessage([{ type: "text", text: "done" }]),
+    };
+    fs.writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify(header),
+        "null",
+        '{"type":',
+        JSON.stringify({
+          type: "message",
+          id: "entry-corrupt",
+          parentId: null,
+          timestamp: "2026-04-01T05:46:39.500Z",
+        }),
+        JSON.stringify(userEntry),
+        JSON.stringify(assistantEntry),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(bundle.manifest.transcriptEventCount).toBe(2);
+    expect(eventTypes(bundle.events)).toEqual(["user.message", "assistant.message"]);
+    expect(bundle.manifest.warnings).toEqual([
+      {
+        source: "session",
+        code: "invalid-session-row",
+        count: 2,
+        rows: [2, 4],
+        message: "Skipped a session JSONL row that is not a session entry object.",
+      },
+      {
+        source: "session",
+        code: "invalid-session-json",
+        count: 1,
+        rows: [3],
+        message: "Skipped a session JSONL row that is not valid JSON.",
+      },
+    ]);
+    expect(
+      JSON.parse(fs.readFileSync(path.join(outputDir, "manifest.json"), "utf8")).warnings,
+    ).toEqual(bundle.manifest.warnings);
+  });
+
+  it("reports incomplete transcript branches while exporting the reachable suffix", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    fs.writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "session-1",
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "orphan-tail",
+          parentId: "missing-imported-parent",
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: assistantMessage([{ type: "text", text: "reachable tail" }]),
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(eventTypes(bundle.events)).toEqual(["assistant.message"]);
+    expect(bundle.manifest.warnings).toEqual([
+      {
+        source: "session",
+        code: "incomplete-session-branch",
+        count: 1,
+        rows: [2],
+        message: "Exported the reachable session branch suffix after a missing parent link.",
+      },
+    ]);
+  });
+
+  it("exports supported current-version linear transcripts in file order", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    fs.writeFileSync(
+      sessionFile,
+      [
+        {
+          type: "session",
+          version: 3,
+          id: "session-linear",
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        },
+        {
+          type: "message",
+          id: "linear-user",
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("hello"),
+        },
+        {
+          type: "message",
+          id: "linear-assistant",
+          timestamp: "2026-04-01T05:46:41.000Z",
+          message: assistantMessage([{ type: "text", text: "done" }]),
+        },
+        {
+          type: "metadata",
+          id: "linear-metadata",
+          parentId: "linear-assistant",
+          payload: { source: "plugin" },
+        },
+        {
+          type: "message",
+          id: "side-assistant",
+          parentId: "linear-assistant",
+          timestamp: "2026-04-01T05:46:42.000Z",
+          message: assistantMessage([{ type: "text", text: "side" }]),
+        },
+        {
+          type: "leaf",
+          id: "active-leaf",
+          parentId: "side-assistant",
+          targetId: "linear-assistant",
+          appendParentId: "linear-metadata",
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-linear",
+      workspaceDir: tmpDir,
+    });
+
+    expect(eventTypes(bundle.events)).toEqual(["user.message", "assistant.message"]);
+    expect(bundle.manifest.leafId).toBe("linear-assistant");
+    expect(JSON.stringify(bundle.events)).not.toContain("side");
+  });
+
+  it("exports the branch selected by a terminal leaf control", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    fs.writeFileSync(
+      sessionFile,
+      [
+        {
+          type: "session",
+          version: 3,
+          id: "session-1",
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        },
+        {
+          type: "message",
+          id: "active-tail",
+          parentId: null,
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("active"),
+        },
+        {
+          type: "message",
+          id: "inactive-tail",
+          parentId: "active-tail",
+          timestamp: "2026-04-01T05:46:41.000Z",
+          message: assistantMessage([{ type: "text", text: "side delivery" }]),
+        },
+        {
+          type: "leaf",
+          id: "active-leaf",
+          parentId: "inactive-tail",
+          timestamp: "2026-04-01T05:46:42.000Z",
+          targetId: "active-tail",
+          appendParentId: null,
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(eventTypes(bundle.events)).toEqual(["user.message"]);
+    expect(bundle.manifest.leafId).toBe("active-tail");
+    expect(JSON.stringify(bundle.events)).not.toContain("side delivery");
+  });
+
+  it("normalizes an active descendant whose source parent is a leaf control", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    fs.writeFileSync(
+      sessionFile,
+      [
+        {
+          type: "session",
+          version: 3,
+          id: "session-1",
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        },
+        {
+          type: "message",
+          id: "active-tail",
+          parentId: null,
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("active"),
+        },
+        {
+          type: "message",
+          id: "inactive-tail",
+          parentId: "active-tail",
+          timestamp: "2026-04-01T05:46:41.000Z",
+          message: assistantMessage([{ type: "text", text: "side delivery" }]),
+        },
+        {
+          type: "leaf",
+          id: "active-leaf",
+          parentId: "inactive-tail",
+          timestamp: "2026-04-01T05:46:42.000Z",
+          targetId: "active-tail",
+        },
+        {
+          type: "message",
+          id: "replacement",
+          parentId: "active-leaf",
+          timestamp: "2026-04-01T05:46:43.000Z",
+          message: assistantMessage([{ type: "text", text: "replacement" }]),
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(eventTypes(bundle.events)).toEqual(["user.message", "assistant.message"]);
+    expect(bundle.events.find((event) => event.entryId === "replacement")?.parentEntryId).toBe(
+      "active-tail",
+    );
+    expect(JSON.stringify(bundle.events)).not.toContain("active-leaf");
+    expect(JSON.stringify(bundle.events)).not.toContain("side delivery");
+  });
+
+  it("does not export append-parent history from an explicitly empty branch", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    fs.writeFileSync(
+      sessionFile,
+      [
+        {
+          type: "session",
+          version: 3,
+          id: "session-empty",
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        },
+        {
+          type: "message",
+          id: "inactive-root",
+          parentId: null,
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("inactive"),
+        },
+        {
+          type: "leaf",
+          id: "empty-leaf",
+          parentId: "inactive-root",
+          timestamp: "2026-04-01T05:46:41.000Z",
+          targetId: null,
+          appendParentId: null,
+        },
+        {
+          type: "metadata",
+          id: "plugin-metadata",
+          parentId: "inactive-root",
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-empty",
+      workspaceDir: tmpDir,
+    });
+
+    expect(bundle.events).toEqual([]);
+    expect(bundle.manifest.transcriptEventCount).toBe(0);
+  });
+
+  it("traverses opaque append parents while exporting the active branch", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    fs.writeFileSync(
+      sessionFile,
+      [
+        {
+          type: "session",
+          version: 3,
+          id: "session-1",
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        },
+        {
+          type: "message",
+          id: "active-root",
+          parentId: null,
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("active"),
+        },
+        {
+          type: "metadata",
+          id: "plugin-metadata",
+          parentId: "active-root",
+        },
+        {
+          type: "message",
+          id: "side-delivery",
+          parentId: "active-root",
+          timestamp: "2026-04-01T05:46:41.000Z",
+          message: assistantMessage([{ type: "text", text: "side delivery" }]),
+        },
+        {
+          type: "leaf",
+          id: "active-leaf",
+          parentId: "side-delivery",
+          timestamp: "2026-04-01T05:46:42.000Z",
+          targetId: "active-root",
+          appendParentId: "plugin-metadata",
+        },
+        {
+          type: "message",
+          id: "active-tail",
+          parentId: "plugin-metadata",
+          timestamp: "2026-04-01T05:46:43.000Z",
+          message: assistantMessage([{ type: "text", text: "active tail" }]),
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(eventTypes(bundle.events)).toEqual(["user.message", "assistant.message"]);
+    expect(bundle.manifest.leafId).toBe("active-tail");
+    expect(JSON.stringify(bundle.events)).toContain("active tail");
+    expect(JSON.stringify(bundle.events)).not.toContain("side delivery");
+    expect(bundle.events.find((event) => event.entryId === "active-tail")?.parentEntryId).toBe(
+      "active-root",
+    );
+  });
+
+  it("stops cyclic transcript branch export instead of hanging", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    fs.writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "session-1",
+          timestamp: "2026-04-01T05:46:39.000Z",
+          cwd: tmpDir,
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "entry-a",
+          parentId: "entry-b",
+          timestamp: "2026-04-01T05:46:40.000Z",
+          message: userMessage("cycle a"),
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "entry-b",
+          parentId: "entry-a",
+          timestamp: "2026-04-01T05:46:41.000Z",
+          message: assistantMessage([{ type: "text", text: "cycle b" }]),
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(eventTypes(bundle.events)).toEqual(["user.message", "assistant.message"]);
+    expect(bundle.manifest.warnings).toEqual([
+      {
+        source: "session",
+        code: "cyclic-session-branch",
+        count: 1,
+        rows: [3],
+        message: "Stopped trajectory session branch export at a cyclic parent link.",
+      },
+    ]);
+  });
+
+  it("uses the recorded runtime pointer before current environment overrides", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const recordedRuntimeFile = path.join(tmpDir, "recorded", "session-1.jsonl");
@@ -387,7 +1371,7 @@ describe("exportTrajectoryBundle", () => {
     const previous = process.env.OPENCLAW_TRAJECTORY_DIR;
     process.env.OPENCLAW_TRAJECTORY_DIR = envRuntimeDir;
     try {
-      const bundle = exportTrajectoryBundle({
+      const bundle = await exportTrajectoryBundle({
         outputDir,
         sessionFile,
         sessionId: "session-1",
@@ -395,8 +1379,8 @@ describe("exportTrajectoryBundle", () => {
       });
 
       expect(bundle.runtimeFile).toBe(recordedRuntimeFile);
-      expect(bundle.events.some((event) => event.type === "recorded-runtime")).toBe(true);
-      expect(bundle.events.some((event) => event.type === "env-runtime")).toBe(false);
+      expect(eventTypes(bundle.events)).toContain("recorded-runtime");
+      expect(eventTypes(bundle.events)).not.toContain("env-runtime");
     } finally {
       if (previous === undefined) {
         delete process.env.OPENCLAW_TRAJECTORY_DIR;
@@ -406,7 +1390,7 @@ describe("exportTrajectoryBundle", () => {
     }
   });
 
-  it("ignores runtime pointers that do not look like this session's trajectory file", () => {
+  it("ignores runtime pointers that do not look like this session's trajectory file", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const outsideFile = path.join(tmpDir, "outside.jsonl");
@@ -438,7 +1422,7 @@ describe("exportTrajectoryBundle", () => {
       "utf8",
     );
 
-    const bundle = exportTrajectoryBundle({
+    const bundle = await exportTrajectoryBundle({
       outputDir,
       sessionFile,
       sessionId: "session-1",
@@ -446,10 +1430,57 @@ describe("exportTrajectoryBundle", () => {
     });
 
     expect(bundle.runtimeFile).toBeUndefined();
-    expect(bundle.events.some((event) => event.type === "outside-runtime")).toBe(false);
+    expect(eventTypes(bundle.events)).not.toContain("outside-runtime");
   });
 
-  it("does not fall back to runtime pointer targets that are not regular files", () => {
+  it("ignores oversized runtime pointers and falls back to the default trajectory file", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const defaultRuntimeFile = resolveTrajectoryFilePath({
+      env: {},
+      sessionFile,
+      sessionId: "session-1",
+    });
+    const outputDir = path.join(tmpDir, "bundle");
+    writeSimpleSessionFile(sessionFile);
+    fs.writeFileSync(
+      resolveTrajectoryPointerFilePath(sessionFile),
+      `${JSON.stringify({
+        traceSchema: "openclaw-trajectory-pointer",
+        schemaVersion: 1,
+        sessionId: "session-1",
+        runtimeFile: path.join(tmpDir, "recorded", "session-1.jsonl"),
+      })}\n${" ".repeat(TRAJECTORY_POINTER_FILE_MAX_BYTES)}`,
+      "utf8",
+    );
+    fs.writeFileSync(
+      defaultRuntimeFile,
+      `${JSON.stringify({
+        traceSchema: "openclaw-trajectory",
+        schemaVersion: 1,
+        traceId: "session-1",
+        source: "runtime",
+        type: "default-runtime",
+        ts: "2026-04-22T08:00:00.000Z",
+        seq: 1,
+        sourceSeq: 1,
+        sessionId: "session-1",
+      })}\n`,
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(bundle.runtimeFile).toBe(defaultRuntimeFile);
+    expect(eventTypes(bundle.events)).toContain("default-runtime");
+  });
+
+  it("does not fall back to runtime pointer targets that are not regular files", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const targetFile = path.join(tmpDir, "outside-target.jsonl");
@@ -484,7 +1515,7 @@ describe("exportTrajectoryBundle", () => {
     );
     fs.symlinkSync(targetFile, symlinkFile);
 
-    const bundle = exportTrajectoryBundle({
+    const bundle = await exportTrajectoryBundle({
       outputDir,
       sessionFile,
       sessionId: "session-1",
@@ -492,16 +1523,16 @@ describe("exportTrajectoryBundle", () => {
     });
 
     expect(bundle.runtimeFile).toBeUndefined();
-    expect(bundle.events.some((event) => event.type === "symlink-runtime")).toBe(false);
+    expect(eventTypes(bundle.events)).not.toContain("symlink-runtime");
   });
 
-  it("counts expanded transcript events when enforcing the total event limit", () => {
+  it("counts expanded transcript events when enforcing the total event limit", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const outputDir = path.join(tmpDir, "bundle");
     writeToolCallOnlySessionFile(sessionFile);
 
-    expect(() =>
+    await expect(
       exportTrajectoryBundle({
         outputDir,
         sessionFile,
@@ -509,10 +1540,10 @@ describe("exportTrajectoryBundle", () => {
         workspaceDir: tmpDir,
         maxTotalEvents: 1,
       }),
-    ).toThrow(/too many events \(2; limit 1\)/u);
+    ).rejects.toThrow(/too many events \(2; limit 1\)/u);
   });
 
-  it("skips runtime events for other sessions", () => {
+  it("skips runtime events for other sessions", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
@@ -534,7 +1565,7 @@ describe("exportTrajectoryBundle", () => {
       "utf8",
     );
 
-    const bundle = exportTrajectoryBundle({
+    const bundle = await exportTrajectoryBundle({
       outputDir,
       sessionFile,
       sessionId: "session-1",
@@ -542,10 +1573,11 @@ describe("exportTrajectoryBundle", () => {
     });
 
     expect(bundle.manifest.runtimeEventCount).toBe(0);
-    expect(bundle.events.some((event) => event.type === "other-runtime")).toBe(false);
+    expect(eventTypes(bundle.events)).not.toContain("other-runtime");
+    expect(bundle.manifest.warnings).toBeUndefined();
   });
 
-  it("redacts non-workspace paths in strings that also contain workspace paths", () => {
+  it("redacts non-workspace paths in strings that also contain workspace paths", async () => {
     const tmpDir = makeTempDir();
     const homeDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
@@ -577,7 +1609,7 @@ describe("exportTrajectoryBundle", () => {
 
     process.env.HOME = homeDir;
     try {
-      exportTrajectoryBundle({
+      await exportTrajectoryBundle({
         outputDir,
         sessionFile,
         sessionId: "session-1",
@@ -599,7 +1631,7 @@ describe("exportTrajectoryBundle", () => {
     expect(events).not.toContain(homeDir);
   });
 
-  it("exports merged runtime and transcript events plus convenience files", () => {
+  it("exports merged runtime and transcript events plus convenience files", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
     const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
@@ -699,6 +1731,7 @@ describe("exportTrajectoryBundle", () => {
         sessionId: "session-1",
         data: {
           finalStatus: "success",
+          terminalError: "non_deliverable_terminal_turn",
           assistantTexts: ["done"],
           finalPromptText: `final prompt from ${path.join(tmpDir, "prompt.txt")}`,
           itemLifecycle: {
@@ -715,7 +1748,7 @@ describe("exportTrajectoryBundle", () => {
       "utf8",
     );
 
-    const bundle = exportTrajectoryBundle({
+    const bundle = await exportTrajectoryBundle({
       outputDir,
       sessionFile,
       sessionId: "session-1",
@@ -744,9 +1777,10 @@ describe("exportTrajectoryBundle", () => {
       .trim()
       .split(/\r?\n/u)
       .map((line) => JSON.parse(line) as TrajectoryEvent);
-    expect(exportedEvents.some((event) => event.type === "tool.call")).toBe(true);
-    expect(exportedEvents.some((event) => event.type === "tool.result")).toBe(true);
-    expect(exportedEvents.some((event) => event.type === "context.compiled")).toBe(true);
+    const types = eventTypes(exportedEvents);
+    expect(types).toContain("tool.call");
+    expect(types).toContain("tool.result");
+    expect(types).toContain("context.compiled");
     expect(JSON.stringify(exportedEvents)).toContain("$WORKSPACE_DIR/inside.txt");
     expect(JSON.stringify(exportedEvents)).not.toContain("$WORKSPACE_DIR2");
 
@@ -767,23 +1801,59 @@ describe("exportTrajectoryBundle", () => {
       "system-prompt.txt",
       "tools.json",
     ]);
-    expect(manifest.contents?.every((entry) => entry.bytes > 0)).toBe(true);
+    const emptyContents = (manifest.contents ?? []).filter((entry) => entry.bytes <= 0);
+    expect(emptyContents).toStrictEqual([]);
 
     const metadata = JSON.parse(fs.readFileSync(path.join(outputDir, "metadata.json"), "utf8")) as {
       skills?: { entries?: Array<{ id?: string; invoked?: boolean }> };
     };
-    expect(metadata.skills?.entries?.[0]).toMatchObject({
-      id: "weather",
-      invoked: true,
-    });
+    expect(metadata.skills?.entries?.[0]?.id).toBe("weather");
+    expect(metadata.skills?.entries?.[0]?.invoked).toBe(true);
     const prompts = fs.readFileSync(path.join(outputDir, "prompts.json"), "utf8");
     const artifacts = fs.readFileSync(path.join(outputDir, "artifacts.json"), "utf8");
     const systemPrompt = fs.readFileSync(path.join(outputDir, "system-prompt.txt"), "utf8");
     const tools = fs.readFileSync(path.join(outputDir, "tools.json"), "utf8");
     expect(prompts).toContain("$WORKSPACE_DIR/AGENTS.md");
     expect(artifacts).toContain("$WORKSPACE_DIR/prompt.txt");
+    expect(artifacts).toContain("non_deliverable_terminal_turn");
     expect(systemPrompt).toContain("$WORKSPACE_DIR/instructions.md");
     expect(tools).toContain("$WORKSPACE_DIR/docs");
     expect(`${prompts}\n${artifacts}\n${systemPrompt}\n${tools}`).not.toContain(tmpDir);
   });
+
+  it("exports the transcript for a legacy v1 session without entry timestamps", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    const header = {
+      type: "session",
+      version: 1,
+      id: "session-1",
+      cwd: tmpDir,
+    };
+    const userEntry = {
+      type: "message",
+      message: userMessage("hello"),
+    };
+    const assistantEntry = {
+      type: "message",
+      message: assistantMessage([{ type: "text", text: "done" }]),
+    };
+    fs.writeFileSync(
+      sessionFile,
+      `${[header, userEntry, assistantEntry].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+      "utf8",
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    expect(bundle.manifest.transcriptEventCount).toBe(2);
+    expect(eventTypes(bundle.events)).toEqual(["user.message", "assistant.message"]);
+  });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

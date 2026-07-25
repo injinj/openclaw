@@ -1,104 +1,129 @@
-import { setTimeout as sleep } from "node:timers/promises";
-import { GatewayClient } from "openclaw/plugin-sdk/gateway-runtime";
+import {
+  GatewayClient,
+  startGatewayClientWhenEventLoopReady,
+} from "openclaw/plugin-sdk/gateway-runtime";
+// Google Meet keeps its labels/config; core owns the voicecall.* delegation contract.
+import {
+  createMeetingVoiceCallGateway,
+  endMeetingVoiceCallGatewayCall,
+  getMeetingVoiceCallGatewayCall,
+  isMeetingVoiceCallMissingError,
+  joinMeetingViaVoiceCallGateway,
+  speakMeetingViaVoiceCallGateway,
+  type MeetingVoiceCallConfig,
+  type MeetingVoiceCallGateway,
+  type MeetingVoiceCallGatewayClient,
+  type MeetingVoiceCallSurface,
+} from "openclaw/plugin-sdk/meeting-runtime";
+import type { PluginRuntime, RuntimeLogger } from "openclaw/plugin-sdk/plugin-runtime";
 import type { GoogleMeetConfig } from "./config.js";
 
-type VoiceCallGatewayClient = InstanceType<typeof GatewayClient>;
+export type VoiceCallGateway = MeetingVoiceCallGateway;
 
-type VoiceCallStartResult = {
-  callId?: string;
-  initiated?: boolean;
-  error?: string;
+const GOOGLE_MEET_VOICE_CALL_SURFACE: MeetingVoiceCallSurface = {
+  clientDisplayName: "Google Meet plugin",
+  configPath: "google-meet voiceCall.gatewayUrl",
+  logScope: "[google-meet]",
+  meetingLabel: "Meet",
+  providerLabel: "Twilio",
 };
 
-export type VoiceCallMeetJoinResult = {
-  callId: string;
-  dtmfSent: boolean;
-};
-
-async function createConnectedGatewayClient(
-  config: GoogleMeetConfig,
-): Promise<VoiceCallGatewayClient> {
-  let client: VoiceCallGatewayClient;
+async function createConnectedGatewayClient(params: {
+  config: MeetingVoiceCallConfig;
+  surface: MeetingVoiceCallSurface;
+}): Promise<MeetingVoiceCallGatewayClient> {
+  let client: InstanceType<typeof GatewayClient>;
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error("gateway connect timeout")),
-      config.voiceCall.requestTimeoutMs,
-    );
+    const abortStart = new AbortController();
+    const timer = setTimeout(() => {
+      abortStart.abort();
+      reject(new Error("gateway connect timeout"));
+    }, params.config.requestTimeoutMs);
     client = new GatewayClient({
-      url: config.voiceCall.gatewayUrl,
-      token: config.voiceCall.token,
-      requestTimeoutMs: config.voiceCall.requestTimeoutMs,
+      url: params.config.gatewayUrl,
+      token: params.config.token,
+      requestTimeoutMs: params.config.requestTimeoutMs,
       clientName: "cli",
-      clientDisplayName: "Google Meet plugin",
+      clientDisplayName: params.surface.clientDisplayName,
       scopes: ["operator.write"],
       onHelloOk: () => {
         clearTimeout(timer);
         resolve();
       },
-      onConnectError: (err) => {
+      onConnectError: (error) => {
         clearTimeout(timer);
-        reject(err);
+        abortStart.abort();
+        reject(error);
       },
     });
-    client.start();
+    void startGatewayClientWhenEventLoopReady(client, {
+      timeoutMs: params.config.requestTimeoutMs,
+      signal: abortStart.signal,
+    })
+      .then((readiness) => {
+        if (!readiness.ready && !readiness.aborted) {
+          clearTimeout(timer);
+          reject(new Error("gateway event loop readiness timeout"));
+        }
+      })
+      .catch((error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
   });
   return client!;
 }
 
+export function createVoiceCallGateway(params: {
+  config: GoogleMeetConfig;
+  runtime: PluginRuntime;
+}): VoiceCallGateway {
+  return createMeetingVoiceCallGateway({
+    config: params.config.voiceCall,
+    runtime: params.runtime,
+    surface: GOOGLE_MEET_VOICE_CALL_SURFACE,
+    connectClient: createConnectedGatewayClient,
+  });
+}
+
+export const isVoiceCallMissingError = isMeetingVoiceCallMissingError;
+
 export async function joinMeetViaVoiceCallGateway(params: {
   config: GoogleMeetConfig;
+  gateway: VoiceCallGateway;
   dialInNumber: string;
   dtmfSequence?: string;
-}): Promise<VoiceCallMeetJoinResult> {
-  let client: VoiceCallGatewayClient | undefined;
-
-  try {
-    client = await createConnectedGatewayClient(params.config);
-    const start = (await client.request(
-      "voicecall.start",
-      {
-        to: params.dialInNumber,
-        message: params.config.voiceCall.introMessage,
-        mode: "conversation",
-      },
-      { timeoutMs: params.config.voiceCall.requestTimeoutMs },
-    )) as VoiceCallStartResult;
-    if (!start.callId) {
-      throw new Error(start.error || "voicecall.start did not return callId");
-    }
-    if (params.dtmfSequence) {
-      await sleep(params.config.voiceCall.dtmfDelayMs);
-      await client.request(
-        "voicecall.dtmf",
-        {
-          callId: start.callId,
-          digits: params.dtmfSequence,
-        },
-        { timeoutMs: params.config.voiceCall.requestTimeoutMs },
-      );
-    }
-    return { callId: start.callId, dtmfSent: Boolean(params.dtmfSequence) };
-  } finally {
-    await client?.stopAndWait({ timeoutMs: 1_000 });
-  }
+  logger?: RuntimeLogger;
+  message?: string;
+  requesterSessionKey?: string;
+  agentId?: string;
+  sessionKey?: string;
+}): Promise<{ callId: string; dtmfSent: boolean; introSent: boolean }> {
+  return await joinMeetingViaVoiceCallGateway({
+    ...params,
+    config: params.config.voiceCall,
+    surface: GOOGLE_MEET_VOICE_CALL_SURFACE,
+  });
 }
 
 export async function endMeetVoiceCallGatewayCall(params: {
-  config: GoogleMeetConfig;
+  gateway: VoiceCallGateway;
   callId: string;
 }): Promise<void> {
-  let client: VoiceCallGatewayClient | undefined;
+  await endMeetingVoiceCallGatewayCall(params);
+}
 
-  try {
-    client = await createConnectedGatewayClient(params.config);
-    await client.request(
-      "voicecall.end",
-      {
-        callId: params.callId,
-      },
-      { timeoutMs: params.config.voiceCall.requestTimeoutMs },
-    );
-  } finally {
-    await client?.stopAndWait({ timeoutMs: 1_000 });
-  }
+export async function getMeetVoiceCallGatewayCall(params: {
+  gateway: VoiceCallGateway;
+  callId: string;
+}): Promise<{ found?: boolean; call?: unknown }> {
+  return await getMeetingVoiceCallGatewayCall(params);
+}
+
+export async function speakMeetViaVoiceCallGateway(params: {
+  gateway: VoiceCallGateway;
+  callId: string;
+  message: string;
+}): Promise<void> {
+  await speakMeetingViaVoiceCallGateway(params);
 }

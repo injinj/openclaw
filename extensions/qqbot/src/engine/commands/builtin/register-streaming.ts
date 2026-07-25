@@ -1,3 +1,4 @@
+// Qqbot plugin module implements register streaming behavior.
 import type { ApproveRuntimeGetter } from "../../adapter/commands.port.js";
 import type { SlashCommandRegistry } from "../slash-commands.js";
 import {
@@ -7,29 +8,22 @@ import {
 } from "./state.js";
 
 function isStreamingConfigEnabled(streaming: unknown): boolean {
-  if (streaming === true) {
-    return true;
-  }
-  if (streaming === false || streaming === undefined || streaming === null) {
+  if (!streaming || typeof streaming !== "object") {
     return false;
   }
-  if (typeof streaming === "object") {
-    const o = streaming as Record<string, unknown>;
-    if (o.c2cStreamApi === true) {
-      return true;
-    }
-    if (o.mode === "off") {
-      return false;
-    }
+  const o = streaming as Record<string, unknown>;
+  if (o.nativeTransport === true) {
     return true;
   }
-  return false;
+  return o.mode !== "off";
 }
 
 export function registerStreamingCommands(registry: SlashCommandRegistry): void {
   registry.register({
     name: "bot-streaming",
     description: "一键开关流式消息",
+    requireAuth: true,
+    c2cOnly: true,
     usage: [
       `/bot-streaming on     开启流式消息`,
       `/bot-streaming off    关闭流式消息`,
@@ -39,10 +33,6 @@ export function registerStreamingCommands(registry: SlashCommandRegistry): void 
       `注意：仅 C2C（私聊）支持流式消息。`,
     ].join("\n"),
     handler: async (ctx) => {
-      if (ctx.type !== "c2c") {
-        return `❌ 流式消息仅支持私聊场景，请在私聊中使用 /bot-streaming 指令`;
-      }
-
       const arg = ctx.args.trim().toLowerCase();
       const currentOn = isStreamingConfigEnabled(ctx.accountConfig?.streaming);
 
@@ -84,7 +74,7 @@ export function registerStreamingCommands(registry: SlashCommandRegistry): void 
           ``,
           `\`\`\`shell`,
           `# 1. 开启流式消息`,
-          `openclaw config set channels.qqbot.streaming true`,
+          `openclaw config set channels.qqbot.streaming.nativeTransport true`,
           ``,
           `# 2. 重启网关使配置生效`,
           `openclaw gateway restart`,
@@ -104,7 +94,11 @@ export function registerStreamingCommands(registry: SlashCommandRegistry): void 
         }
 
         const accountId = ctx.accountId;
-        const newVal: unknown = wantOn;
+        // Nested-only spelling: "on" is the retired `streaming: true` shape
+        // (block streaming + official C2C stream), "off" disables both.
+        const newVal: unknown = wantOn
+          ? { mode: "partial", nativeTransport: true }
+          : { mode: "off" };
 
         if (accountId !== "default") {
           const prevAccounts =

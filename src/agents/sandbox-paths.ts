@@ -1,6 +1,12 @@
+/**
+ * Sandbox input path normalization and boundary checks.
+ *
+ * Handles host paths, file URLs, temporary media paths, and workspace root assertions.
+ */
 import os from "node:os";
 import path from "node:path";
 import { URL } from "node:url";
+import { isPassThroughRemoteMediaSource } from "@openclaw/media-core/media-source-url";
 import { isWindowsDrivePath } from "../infra/archive-path.js";
 import {
   assertNoWindowsNetworkPath,
@@ -10,8 +16,7 @@ import {
 import { assertNoPathAliasEscape, type PathAliasPolicy } from "../infra/path-alias-guards.js";
 import { isPathInside } from "../infra/path-guards.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
-import { isPassThroughRemoteMediaSource } from "../media/media-source-url.js";
-import { resolveConfigDir } from "../utils.js";
+import { resolveConfigDir, shortenHomePath } from "../utils.js";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const DATA_URL_RE = /^data:/i;
@@ -68,8 +73,16 @@ export function resolveSandboxPath(params: { filePath: string; cwd: string; root
   if (!relative || relative === "") {
     return { resolved, relative: "" };
   }
-  if (relative.startsWith("..") || path.isAbsolute(relative) || isWindowsDrivePath(relative)) {
-    throw new Error(`Path escapes sandbox root (${shortPath(rootResolved)}): ${params.filePath}`);
+  if (
+    relative === ".." ||
+    relative.startsWith("../") ||
+    relative.startsWith("..\\") ||
+    path.isAbsolute(relative) ||
+    isWindowsDrivePath(relative)
+  ) {
+    throw new Error(
+      `Path escapes sandbox root (${shortenHomePath(rootResolved)}): ${params.filePath}`,
+    );
   }
   return { resolved, relative };
 }
@@ -108,10 +121,15 @@ function isManagedMediaPathUnderRoot(candidate: string): boolean {
     return false;
   }
   const mediaRoot = path.join(resolveConfigDir(), "media");
-  const relative = path.relative(path.resolve(mediaRoot), path.resolve(expanded));
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+  const resolvedMediaRoot = path.resolve(mediaRoot);
+  const resolvedExpanded = path.resolve(expanded);
+  if (
+    resolvedExpanded === resolvedMediaRoot ||
+    !isPathInside(resolvedMediaRoot, resolvedExpanded)
+  ) {
     return false;
   }
+  const relative = path.relative(resolvedMediaRoot, resolvedExpanded);
   const firstSegment = relative.split(path.sep)[0] ?? "";
   return MANAGED_MEDIA_SUBDIRS.has(firstSegment) || firstSegment.startsWith("tool-");
 }
@@ -284,11 +302,4 @@ async function assertNoTmpAliasEscape(params: {
     rootPath: params.tmpRoot,
     boundaryLabel: "tmp root",
   });
-}
-
-function shortPath(value: string) {
-  if (value.startsWith(os.homedir())) {
-    return `~${value.slice(os.homedir().length)}`;
-  }
-  return value;
 }

@@ -1,25 +1,37 @@
-import type { Command } from "commander";
+// Qa Lab plugin module implements cli behavior.
 import {
+  createLiveTransportQaAdapterFactory,
   createLazyCliRuntimeLoader,
   createLiveTransportQaCliRegistration,
+  loadLiveTransportQaSuiteRuntime,
   type LiveTransportQaCliRegistration,
   type LiveTransportQaCommandOptions,
 } from "../shared/live-transport-cli.js";
+import { resolveDiscordQaScenarioIds } from "./scenario-selection.js";
 
-type DiscordQaCliRuntime = typeof import("./cli.runtime.js");
-
-const loadDiscordQaCliRuntime = createLazyCliRuntimeLoader<DiscordQaCliRuntime>(
-  () => import("./cli.runtime.js"),
-);
+const loadDiscordQaAdapterRuntime = createLazyCliRuntimeLoader<
+  typeof import("./adapter.runtime.js")
+>(() => import("./adapter.runtime.js"));
 
 async function runQaDiscord(opts: LiveTransportQaCommandOptions) {
-  const runtime = await loadDiscordQaCliRuntime();
-  await runtime.runQaDiscordCommand(opts);
+  const runtime = await loadLiveTransportQaSuiteRuntime();
+  await runtime.runLiveTransportQaSuiteCommand({
+    channelId: "discord",
+    defaultProviderMode: "live-frontier",
+    options: opts,
+    selectScenarioIds: resolveDiscordQaScenarioIds,
+  });
 }
 
 export const discordQaCliRegistration: LiveTransportQaCliRegistration =
   createLiveTransportQaCliRegistration({
     commandName: "discord",
+    adapterFactory: createLiveTransportQaAdapterFactory({
+      id: "discord",
+      async create(context) {
+        return (await loadDiscordQaAdapterRuntime()).createDiscordQaTransportAdapter(context);
+      },
+    }),
     credentialOptions: {
       sourceDescription: "Credential source for Discord QA: env or convex (default: env)",
       roleDescription:
@@ -31,7 +43,3 @@ export const discordQaCliRegistration: LiveTransportQaCliRegistration =
     sutAccountHelp: "Temporary Discord account id inside the QA gateway config",
     run: runQaDiscord,
   });
-
-export function registerDiscordQaCli(qa: Command) {
-  discordQaCliRegistration.register(qa);
-}

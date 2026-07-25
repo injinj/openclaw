@@ -139,13 +139,6 @@ export interface UploadPrepareResponse {
   retry_timeout?: number;
 }
 
-/** Complete upload response. */
-export interface MediaUploadResponse {
-  file_uuid: string;
-  file_info: string;
-  ttl: number;
-}
-
 /** File hash information for upload_prepare. */
 export interface UploadPrepareHashes {
   /** Whole-file MD5 (hex). */
@@ -272,12 +265,10 @@ export interface QQBotAccountConfigView {
   dmPolicy?: QQBotDmPolicy;
   groupPolicy?: QQBotGroupPolicy;
   groups?: Record<string, Record<string, unknown>>;
-  streaming?:
-    | boolean
-    | {
-        mode?: string;
-        c2cStreamApi?: boolean;
-      };
+  streaming?: {
+    mode?: string;
+    nativeTransport?: boolean;
+  };
   audioFormatPolicy?: {
     uploadDirectFormats?: string[];
     transcodeEnabled?: boolean;
@@ -304,13 +295,11 @@ export interface GatewayAccount {
     groupAllowFrom?: Array<string | number>;
     dmPolicy?: "open" | "allowlist" | "disabled";
     groupPolicy?: "open" | "allowlist" | "disabled";
-    streaming?:
-      | boolean
-      | {
-          mode?: string;
-          /** When true, use QQ C2C `stream_messages` for DMs. Boolean `true` is equivalent. */
-          c2cStreamApi?: boolean;
-        };
+    streaming?: {
+      mode?: string;
+      /** When true, use QQ's official C2C `stream_messages` API for DMs. */
+      nativeTransport?: boolean;
+    };
     audioFormatPolicy?: {
       uploadDirectFormats?: string[];
       transcodeEnabled?: boolean;

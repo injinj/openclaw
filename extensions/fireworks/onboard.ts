@@ -1,3 +1,4 @@
+// Fireworks setup module handles plugin onboarding behavior.
 import {
   createDefaultModelsPresetAppliers,
   type OpenClawConfig,
@@ -20,14 +21,10 @@ const fireworksPresetAppliers = createDefaultModelsPresetAppliers({
       baseUrl: defaultProvider.baseUrl,
       defaultModels: buildFireworksCatalogModels(),
       defaultModelId: FIREWORKS_DEFAULT_MODEL_ID,
-      aliases: [{ modelRef: FIREWORKS_DEFAULT_MODEL_REF, alias: "Kimi K2.5 Turbo" }],
+      aliases: [{ modelRef: FIREWORKS_DEFAULT_MODEL_REF, alias: "Kimi K2.6 Turbo" }],
     };
   },
 });
-
-export function applyFireworksProviderConfig(cfg: OpenClawConfig): OpenClawConfig {
-  return fireworksPresetAppliers.applyProviderConfig(cfg);
-}
 
 export function applyFireworksConfig(cfg: OpenClawConfig): OpenClawConfig {
   return fireworksPresetAppliers.applyConfig(cfg);

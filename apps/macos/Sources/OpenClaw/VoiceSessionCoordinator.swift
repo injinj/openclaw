@@ -86,7 +86,6 @@ final class VoiceSessionCoordinator {
             token: token,
             transcript: text,
             autoSendAfter: autoSendAfter,
-            sendChime: sendChime,
             attributed: attributed)
     }
 
@@ -103,10 +102,9 @@ final class VoiceSessionCoordinator {
         }
         VoiceWakeOverlayController.shared.beginSendUI(token: token, sendChime: sendChime)
         Task.detached {
-            _ = await VoiceWakeForwarder.forward(
+            _ = await VoiceWakeForwarder.forwardToSelectedSession(
                 transcript: text,
-                options: .init(
-                    voiceWakeTrigger: voiceWakeTrigger))
+                voiceWakeTrigger: voiceWakeTrigger)
         }
     }
 

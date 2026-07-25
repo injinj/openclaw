@@ -1,14 +1,15 @@
+// Console logging helpers format and write messages to console streams.
 import util from "node:util";
+import { stripAnsi } from "../../packages/terminal-core/src/ansi.js";
 import type { OpenClawConfig } from "../config/types.js";
 import { isVerbose } from "../global-state.js";
-import { stripAnsi } from "../terminal/ansi.js";
 import { readLoggingConfig, shouldSkipMutatingLoggingConfigRead } from "./config.js";
 import { resolveEnvLogLevelOverride } from "./env-log-level.js";
 import { type LogLevel, normalizeLogLevel } from "./levels.js";
 import { getLogger } from "./logger.js";
 import { redactSensitiveText } from "./redact.js";
 import { loggingState } from "./state.js";
-import { formatLocalIsoWithOffset, formatTimestamp } from "./timestamps.js";
+import { formatTimestamp } from "./timestamps.js";
 import type { ConsoleStyle, LoggerSettings } from "./types.js";
 
 export type { ConsoleStyle } from "./types.js";
@@ -60,7 +61,7 @@ function resolveConsoleSettings(): ConsoleSettings {
     return { level: "silent", style: normalizeConsoleStyle(undefined) };
   }
 
-  let cfg: OpenClawConfig["logging"] | undefined =
+  let cfg: OpenClawConfig["logging"] | LoggerSettings | undefined =
     (loggingState.overrideSettings as LoggerSettings | null) ?? readLoggingConfig();
   if (!cfg && !shouldSkipMutatingLoggingConfigRead()) {
     if (loggingState.resolvingConsoleSettings) {
@@ -114,6 +115,19 @@ export function setConsoleSubsystemFilter(filters?: string[] | null): void {
   loggingState.consoleSubsystemFilter = normalized.length > 0 ? normalized : null;
 }
 
+/** Hides subsystem console lines for TTY-owned work while preserving file logging. */
+export async function withConsoleSubsystemsSuppressed<T>(work: () => Promise<T>): Promise<T> {
+  const previousFilter = loggingState.consoleSubsystemFilter
+    ? [...loggingState.consoleSubsystemFilter]
+    : null;
+  setConsoleSubsystemFilter(["__openclaw_tui_quiet__"]);
+  try {
+    return await work();
+  } finally {
+    setConsoleSubsystemFilter(previousFilter);
+  }
+}
+
 export function setConsoleTimestampPrefix(enabled: boolean): void {
   loggingState.consoleTimestampPrefix = enabled;
 }
@@ -149,11 +163,11 @@ const SUPPRESSED_CONSOLE_PREFIXES = [
 ] as const;
 
 function shouldSuppressConsoleMessage(message: string): boolean {
-  if (isVerbose()) {
-    return false;
-  }
   if (SUPPRESSED_CONSOLE_PREFIXES.some((prefix) => message.startsWith(prefix))) {
     return true;
+  }
+  if (isVerbose()) {
+    return false;
   }
   return false;
 }
@@ -168,7 +182,7 @@ export function formatConsoleTimestamp(style: ConsoleStyle): string {
   if (style === "pretty") {
     return formatTimestamp(now, { style: "short" }).replace(/[+-]\d{2}:\d{2}$/, "");
   }
-  return formatLocalIsoWithOffset(now);
+  return formatTimestamp(now, { style: "long" });
 }
 
 function hasTimestampPrefix(value: string): boolean {
@@ -198,6 +212,11 @@ export function enableConsoleCapture(): void {
     for (const stream of [process.stdout, process.stderr]) {
       stream.on("error", (err) => {
         if (isEpipeError(err)) {
+          // stdout/stderr broken means the process is orphaned (e.g. the parent
+          // service restarted and closed the journal pipe). Exit cleanly instead
+          // of spinning in a tight loop where every log attempt re-triggers EPIPE.
+          const exitCode = process.exitCode;
+          process.exit(exitCode !== undefined && exitCode !== 0 && exitCode !== "0" ? exitCode : 0);
           return;
         }
         throw err;

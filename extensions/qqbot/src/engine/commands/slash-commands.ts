@@ -10,6 +10,9 @@
  * Zero external dependencies.
  */
 
+import type { QQBotGroupCommandLevel } from "../config/group.js";
+import { PRIVATE_CHAT_ONLY_TEXT } from "./command-visibility.js";
+
 // ============ Types ============
 
 /** Slash command context (message metadata plus runtime state). */
@@ -42,8 +45,12 @@ export interface SlashCommandContext {
   accountConfig?: Record<string, unknown>;
   /** Whether the sender is authorized per the allowFrom config. */
   commandAuthorized: boolean;
+  /** Effective per-group command level for group invocations. */
+  groupCommandLevel?: QQBotGroupCommandLevel;
   /** Queue snapshot for the current sender. */
   queueSnapshot: QueueSnapshot;
+  /** Durable guard for non-idempotent effects during ingress drain dispatch. */
+  runIngressEffectOnce?: SlashCommandIngressEffectRunner;
 }
 
 /** Queue status snapshot. */
@@ -54,18 +61,23 @@ export interface QueueSnapshot {
   senderPending: number;
 }
 
+type SlashCommandIngressEffectRunner = <T>(params: {
+  effect: string;
+  run: () => Promise<T>;
+}) => Promise<{ kind: "executed"; value: T } | { kind: "replayed" }>;
+
 /** Slash command result: text, a text+file result, or null to skip handling. */
 export type SlashCommandResult = string | SlashCommandFileResult | null;
 
 /** Slash command result that sends text first and then a local file. */
-export interface SlashCommandFileResult {
+interface SlashCommandFileResult {
   text: string;
   /** Local file path to send. */
   filePath: string;
 }
 
 /** Slash command definition. */
-export interface SlashCommand {
+interface SlashCommand {
   /** Command name without the leading slash. */
   name: string;
   /** Short description. */
@@ -74,6 +86,8 @@ export interface SlashCommand {
   usage?: string;
   /** When true, the command requires the sender to pass the allowFrom authorization check. */
   requireAuth?: boolean;
+  /** When true, the command is only available in c2c (private) chat. Group invocations are rejected automatically. */
+  c2cOnly?: boolean;
   /** Command handler. */
   handler: (ctx: SlashCommandContext) => SlashCommandResult | Promise<SlashCommandResult>;
 }
@@ -83,6 +97,7 @@ export interface QQBotFrameworkCommand {
   name: string;
   description: string;
   usage?: string;
+  c2cOnly?: boolean;
   handler: (ctx: SlashCommandContext) => SlashCommandResult | Promise<SlashCommandResult>;
 }
 
@@ -97,8 +112,8 @@ function lc(s: string): string {
  * Slash command registry.
  *
  * Maintains two maps:
- * - `commands` — pre-dispatch commands (requireAuth: false)
- * - `frameworkCommands` — auth-gated commands (requireAuth: true)
+ * - `commands` — QQBot message-flow commands
+ * - `frameworkCommands` — auth-gated commands that are safe on the framework surface
  */
 export class SlashCommandRegistry {
   private readonly commands = new Map<string, SlashCommand>();
@@ -106,26 +121,27 @@ export class SlashCommandRegistry {
 
   /** Register one command. */
   register(cmd: SlashCommand): void {
+    const key = lc(cmd.name);
+    // Always register in the pre-dispatch map so QQ message-flow slash
+    // commands can match and execute directly (with requireAuth gating).
+    this.commands.set(key, cmd);
+    // Auth-gated commands are exposed to the framework command surface.
+    // Private-chat-only metadata is preserved so the bridge can enforce the
+    // same routing restriction before dispatching handlers.
     if (cmd.requireAuth) {
-      this.frameworkCommands.set(lc(cmd.name), cmd);
-    } else {
-      this.commands.set(lc(cmd.name), cmd);
+      this.frameworkCommands.set(key, cmd);
     }
   }
 
-  /** Return all auth-gated commands for framework registration. */
+  /** Return all commands that may be registered on the framework surface. */
   getFrameworkCommands(): QQBotFrameworkCommand[] {
     return Array.from(this.frameworkCommands.values()).map((cmd) => ({
       name: cmd.name,
       description: cmd.description,
       usage: cmd.usage,
+      c2cOnly: cmd.c2cOnly,
       handler: cmd.handler,
     }));
-  }
-
-  /** Return all pre-dispatch commands. */
-  getPreDispatchCommands(): Map<string, SlashCommand> {
-    return this.commands;
   }
 
   /** Return all registered commands (both maps) for help listing. */
@@ -164,12 +180,24 @@ export class SlashCommandRegistry {
       return null;
     }
 
+    const isGroup = ctx.type === "group" || ctx.type === "guild";
+    const groupCommandLevel = ctx.groupCommandLevel ?? "all";
+    if (isGroup && groupCommandLevel === "strict") {
+      return PRIVATE_CHAT_ONLY_TEXT;
+    }
+
+    // Reject c2cOnly commands when invoked outside private chat.
+    if (cmd.c2cOnly && ctx.type !== "c2c") {
+      return PRIVATE_CHAT_ONLY_TEXT;
+    }
+
     // Gate sensitive commands behind the allowFrom authorization check.
     if (cmd.requireAuth && !ctx.commandAuthorized) {
       log?.info?.(
         `[qqbot] Slash command /${cmd.name} rejected: sender ${ctx.senderId} is not authorized`,
       );
-      return `⛔ 权限不足：/${cmd.name} 需要管理员权限。`;
+      const configHint = isGroup ? "groupAllowFrom" : "allowFrom";
+      return `⛔ 权限不足：请先在 channels.qqbot.${configHint} 中配置明确的发送者列表后再使用 /${cmd.name}。`;
     }
 
     // `/command ?` returns usage help.

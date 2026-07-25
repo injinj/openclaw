@@ -1,12 +1,13 @@
+// Lmstudio plugin entrypoint registers its OpenClaw integration.
 import {
   definePluginEntry,
-  OpenClawConfig,
   type OpenClawPluginApi,
   type ProviderAuthContext,
   type ProviderAuthMethodNonInteractiveContext,
   type ProviderAuthResult,
   type ProviderRuntimeModel,
 } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { CUSTOM_LOCAL_AUTH_MARKER } from "openclaw/plugin-sdk/provider-auth";
 import { lmstudioMemoryEmbeddingProviderAdapter } from "./memory-embedding-adapter.js";
 import {
@@ -65,6 +66,24 @@ export default definePluginEntry({
           label: LMSTUDIO_PROVIDER_LABEL,
           hint: "Local/self-hosted LM Studio server",
           kind: "custom",
+          appGuidedSetup: {
+            detect: async (ctx) => {
+              const providerSetup = await loadProviderSetup();
+              const result = await providerSetup.prepareAppGuidedLmstudioSetup(ctx);
+              if (!result?.defaultModel) {
+                return null;
+              }
+              const provider = result.configPatch?.models?.providers?.[PROVIDER_ID];
+              return {
+                modelRef: result.defaultModel,
+                detail: `${result.defaultModel.slice(`${PROVIDER_ID}/`.length)} at ${provider?.baseUrl ?? "LM Studio"}`,
+              };
+            },
+            prepare: async (ctx) => {
+              const providerSetup = await loadProviderSetup();
+              return await providerSetup.prepareAppGuidedLmstudioSetup(ctx);
+            },
+          },
           run: async (ctx: ProviderAuthContext): Promise<ProviderAuthResult> => {
             const providerSetup = await loadProviderSetup();
             return await providerSetup.promptAndConfigureLmstudioInteractive({
@@ -81,7 +100,7 @@ export default definePluginEntry({
           },
         },
       ],
-      discovery: {
+      catalog: {
         // Run after early providers so local LM Studio detection does not dominate resolution.
         order: "late",
         run: async (ctx) => {

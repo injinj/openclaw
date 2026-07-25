@@ -7,12 +7,25 @@
  */
 
 /** Supported target types. */
-export type TargetType = "c2c" | "group" | "channel";
+type TargetType = "c2c" | "group" | "channel";
 
 /** Parsed delivery target. */
-export interface ParsedTarget {
+interface ParsedTarget {
   type: TargetType;
   id: string;
+}
+
+const TYPED_TARGET_RE = /^(c2c|group|channel):/i;
+
+function parseTypedTarget(value: string): ParsedTarget | undefined {
+  const match = TYPED_TARGET_RE.exec(value);
+  if (!match?.[1]) {
+    return undefined;
+  }
+  return {
+    type: match[1].toLowerCase() as TargetType,
+    id: value.slice(match[0].length),
+  };
 }
 
 /**
@@ -32,30 +45,14 @@ export interface ParsedTarget {
  * @throws {Error} When the target format is invalid.
  */
 export function parseTarget(to: string): ParsedTarget {
-  let id = to.replace(/^qqbot:/i, "");
-
-  if (id.startsWith("c2c:")) {
-    const userId = id.slice(4);
-    if (!userId) {
-      throw new Error(`Invalid c2c target format: ${to} - missing user ID`);
+  const id = to.replace(/^qqbot:/i, "");
+  const typedTarget = parseTypedTarget(id);
+  if (typedTarget) {
+    if (!typedTarget.id) {
+      const idKind = typedTarget.type === "c2c" ? "user" : typedTarget.type;
+      throw new Error(`Invalid ${typedTarget.type} target format: ${to} - missing ${idKind} ID`);
     }
-    return { type: "c2c", id: userId };
-  }
-
-  if (id.startsWith("group:")) {
-    const groupId = id.slice(6);
-    if (!groupId) {
-      throw new Error(`Invalid group target format: ${to} - missing group ID`);
-    }
-    return { type: "group", id: groupId };
-  }
-
-  if (id.startsWith("channel:")) {
-    const channelId = id.slice(8);
-    if (!channelId) {
-      throw new Error(`Invalid channel target format: ${to} - missing channel ID`);
-    }
-    return { type: "channel", id: channelId };
+    return typedTarget;
   }
 
   if (!id) {
@@ -67,32 +64,15 @@ export function parseTarget(to: string): ParsedTarget {
 }
 
 /**
- * Map a parsed target type to a ChatScope for API calls.
- *
- * Channel and DM targets are not C2C/Group scoped and should be handled
- * separately by the caller.
- *
- * @returns `'c2c'` or `'group'`, or `undefined` for channel targets.
- */
-export function targetToChatScope(target: ParsedTarget): "c2c" | "group" | undefined {
-  if (target.type === "c2c") {
-    return "c2c";
-  }
-  if (target.type === "group") {
-    return "group";
-  }
-  return undefined;
-}
-
-/**
  * Normalize a QQ Bot target string into the canonical `qqbot:...` form.
  *
  * Returns `undefined` when the target does not look like a QQ Bot address.
  */
 export function normalizeTarget(target: string): string | undefined {
   const id = target.replace(/^qqbot:/i, "");
-  if (id.startsWith("c2c:") || id.startsWith("group:") || id.startsWith("channel:")) {
-    return `qqbot:${id}`;
+  const typedTarget = parseTypedTarget(id);
+  if (typedTarget) {
+    return `qqbot:${typedTarget.type}:${typedTarget.id}`;
   }
   // 32-char hex openid
   if (/^[0-9a-fA-F]{32}$/.test(id)) {
@@ -109,10 +89,8 @@ export function normalizeTarget(target: string): string | undefined {
  * Return true when the string looks like a QQ Bot target ID.
  */
 export function looksLikeQQBotTarget(id: string): boolean {
-  if (/^qqbot:(c2c|group|channel):/i.test(id)) {
-    return true;
-  }
-  if (/^(c2c|group|channel):/i.test(id)) {
+  const unqualifiedId = id.replace(/^qqbot:/i, "");
+  if (parseTypedTarget(unqualifiedId)) {
     return true;
   }
   if (/^[0-9a-fA-F]{32}$/.test(id)) {

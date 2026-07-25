@@ -1,8 +1,11 @@
+// Migrate Claude plugin module implements apply behavior.
 import path from "node:path";
 import { summarizeMigrationItems } from "openclaw/plugin-sdk/migration";
 import {
   archiveMigrationItem,
+  copyMemoryMigrationFileItem,
   copyMigrationFileItem,
+  withCachedMigrationConfigRuntime,
   writeMigrationReport,
 } from "openclaw/plugin-sdk/migration-runtime";
 import type {
@@ -15,54 +18,7 @@ import { applyConfigItem, applyManualItem } from "./config.js";
 import { appendItem } from "./helpers.js";
 import { buildClaudePlan } from "./plan.js";
 import { applyGeneratedSkillItem } from "./skills.js";
-
-function withCachedConfigRuntime(
-  runtime: MigrationProviderContext["runtime"] | undefined,
-  fallbackConfig: MigrationProviderContext["config"],
-): MigrationProviderContext["runtime"] | undefined {
-  if (!runtime) {
-    return undefined;
-  }
-  const configApi = runtime.config;
-  if (!configApi?.current || !configApi.mutateConfigFile) {
-    return runtime;
-  }
-  let cachedConfig: MigrationProviderContext["config"] | undefined;
-  const current = (): ReturnType<typeof configApi.current> => {
-    cachedConfig ??= structuredClone(
-      (configApi.current() ?? fallbackConfig) as MigrationProviderContext["config"],
-    );
-    return cachedConfig;
-  };
-  return {
-    ...runtime,
-    config: {
-      ...runtime.config,
-      current,
-      mutateConfigFile: async (params) => {
-        const result = await configApi.mutateConfigFile({
-          ...params,
-          mutate: async (draft, context) => {
-            const mutationResult = await params.mutate(draft, context);
-            cachedConfig = structuredClone(draft);
-            return mutationResult;
-          },
-        });
-        cachedConfig = structuredClone(result.nextConfig);
-        return result;
-      },
-      ...(configApi.replaceConfigFile
-        ? {
-            replaceConfigFile: async (params) => {
-              const result = await configApi.replaceConfigFile(params);
-              cachedConfig = structuredClone(result.nextConfig);
-              return result;
-            },
-          }
-        : {}),
-    },
-  };
-}
+import { resolveTargets } from "./targets.js";
 
 export async function applyClaudePlan(params: {
   ctx: MigrationProviderContext;
@@ -71,7 +27,11 @@ export async function applyClaudePlan(params: {
 }): Promise<MigrationApplyResult> {
   const plan = params.plan ?? (await buildClaudePlan(params.ctx));
   const reportDir = params.ctx.reportDir ?? path.join(params.ctx.stateDir, "migration", "claude");
-  const runtime = withCachedConfigRuntime(params.ctx.runtime ?? params.runtime, params.ctx.config);
+  const runtime = withCachedMigrationConfigRuntime(
+    params.ctx.runtime ?? params.runtime,
+    params.ctx.config,
+  );
+  const targets = resolveTargets(params.ctx);
   const applyCtx = { ...params.ctx, runtime };
   const items: MigrationItem[] = [];
   for (const item of plan.items) {
@@ -89,6 +49,13 @@ export async function applyClaudePlan(params: {
       items.push(await appendItem(item));
     } else if (item.action === "create" && item.kind === "skill") {
       items.push(await applyGeneratedSkillItem(item, { overwrite: params.ctx.overwrite }));
+    } else if (item.kind === "memory") {
+      items.push(
+        await copyMemoryMigrationFileItem(item, reportDir, {
+          workspaceDir: targets.workspaceDir,
+          overwrite: params.ctx.overwrite,
+        }),
+      );
     } else {
       items.push(await copyMigrationFileItem(item, reportDir, { overwrite: params.ctx.overwrite }));
     }

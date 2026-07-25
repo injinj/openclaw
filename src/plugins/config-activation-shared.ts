@@ -1,27 +1,23 @@
+// Shares plugin activation state helpers across config and registry code.
+import { normalizePluginPolicyId } from "./plugin-policy-id.js";
+
 type EnableStateLike = {
   enabled: boolean;
   reason?: string;
-};
-
-type EnableStateParamsLike = {
-  id: string;
-  origin: string;
-  config: unknown;
-  enabledByDefault?: boolean;
 };
 
 type PluginKindLike = string | readonly string[] | undefined;
 
 export type PluginActivationSource = "disabled" | "explicit" | "auto" | "default";
 
-export type PluginExplicitSelectionCause =
+type PluginExplicitSelectionCause =
   | "enabled-in-config"
   | "bundled-channel-enabled-in-config"
   | "selected-memory-slot"
   | "selected-context-engine-slot"
   | "selected-in-allowlist";
 
-export type PluginActivationCause =
+type PluginActivationCause =
   | PluginExplicitSelectionCause
   | "plugins-disabled"
   | "blocked-by-denylist"
@@ -41,7 +37,7 @@ export type PluginActivationStateLike = {
   reason?: string;
 };
 
-export type PluginActivationDecision = PluginActivationStateLike & {
+type PluginActivationDecision = PluginActivationStateLike & {
   cause?: PluginActivationCause;
 };
 
@@ -61,7 +57,7 @@ export type PluginActivationConfigSourceLike<TRootConfig> = {
   rootConfig?: TRootConfig;
 };
 
-export const PLUGIN_ACTIVATION_REASON_BY_CAUSE: Record<PluginActivationCause, string> = {
+const PLUGIN_ACTIVATION_REASON_BY_CAUSE: Record<PluginActivationCause, string> = {
   "enabled-in-config": "enabled in config",
   "bundled-channel-enabled-in-config": "channel enabled in config",
   "selected-memory-slot": "selected memory slot",
@@ -78,7 +74,7 @@ export const PLUGIN_ACTIVATION_REASON_BY_CAUSE: Record<PluginActivationCause, st
   "bundled-disabled-by-default": "bundled (disabled by default)",
 };
 
-export function resolvePluginActivationReason(
+function resolvePluginActivationReason(
   cause?: PluginActivationCause,
   reason?: string,
 ): string | undefined {
@@ -110,7 +106,8 @@ function resolveExplicitPluginSelectionShared<TRootConfig>(params: {
     pluginId: string,
   ) => boolean;
 }): { explicitlyEnabled: boolean; cause?: PluginExplicitSelectionCause } {
-  if (params.config.entries[params.id]?.enabled === true) {
+  const policyId = normalizePluginPolicyId(params.id);
+  if (params.config.entries[policyId]?.enabled === true) {
     return { explicitlyEnabled: true, cause: "enabled-in-config" };
   }
   if (
@@ -125,7 +122,7 @@ function resolveExplicitPluginSelectionShared<TRootConfig>(params: {
   if (params.config.slots.contextEngine === params.id) {
     return { explicitlyEnabled: true, cause: "selected-context-engine-slot" };
   }
-  if (params.origin !== "bundled" && params.config.allow.includes(params.id)) {
+  if (params.origin !== "bundled" && params.config.allow.includes(policyId)) {
     return { explicitlyEnabled: true, cause: "selected-in-allowlist" };
   }
   return { explicitlyEnabled: false };
@@ -166,7 +163,8 @@ export function resolvePluginActivationDecisionShared<TRootConfig>(params: {
       cause: "plugins-disabled",
     };
   }
-  if (params.config.deny.includes(params.id)) {
+  const policyId = normalizePluginPolicyId(params.id);
+  if (params.config.deny.includes(policyId)) {
     return {
       enabled: false,
       activated: false,
@@ -175,7 +173,7 @@ export function resolvePluginActivationDecisionShared<TRootConfig>(params: {
       cause: "blocked-by-denylist",
     };
   }
-  const entry = params.config.entries[params.id];
+  const entry = params.config.entries[policyId];
   if (entry?.enabled === false) {
     return {
       enabled: false,
@@ -185,7 +183,7 @@ export function resolvePluginActivationDecisionShared<TRootConfig>(params: {
       cause: "disabled-in-config",
     };
   }
-  const explicitlyAllowed = params.config.allow.includes(params.id);
+  const explicitlyAllowed = params.config.allow.includes(policyId);
   if (
     params.origin === "workspace" &&
     !explicitlyAllowed &&
@@ -304,22 +302,15 @@ export function resolvePluginActivationDecisionShared<TRootConfig>(params: {
   };
 }
 
-export function toEnableStateResult(state: EnableStateLike): { enabled: boolean; reason?: string } {
+function toEnableStateResult(state: EnableStateLike): { enabled: boolean; reason?: string } {
   return state.enabled ? { enabled: true } : { enabled: false, reason: state.reason };
 }
 
-export function resolveEnableStateResult<TParams>(
+function resolveEnableStateResult<TParams>(
   params: TParams,
   resolveState: (params: TParams) => EnableStateLike,
 ): { enabled: boolean; reason?: string } {
   return toEnableStateResult(resolveState(params));
-}
-
-export function resolveEnableStateShared<TParams extends EnableStateParamsLike>(
-  params: TParams,
-  resolveState: (params: TParams) => EnableStateLike,
-): { enabled: boolean; reason?: string } {
-  return resolveEnableStateResult(params, resolveState);
 }
 
 export function createPluginEnableStateResolver<TConfig, TOrigin extends string>(

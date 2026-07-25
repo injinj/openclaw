@@ -12,7 +12,7 @@ import { getPlatformAdapter } from "../adapter/index.js";
 import {
   asOptionalObjectRecord as asRecord,
   normalizeOptionalLowercaseString,
-  normalizeStringifiedOptionalString,
+  normalizeStringifiedEntries,
   readStringField as readString,
 } from "../utils/string-normalize.js";
 
@@ -41,7 +41,7 @@ interface QQBotChannelConfig {
  *
  * The outer config.ts layer extends this with clientSecret / secretSource.
  */
-export interface ResolvedAccountBase {
+interface ResolvedAccountBase {
   accountId: string;
   name?: string;
   enabled: boolean;
@@ -121,8 +121,9 @@ export function resolveDefaultAccountId(cfg: Record<string, unknown>): string {
   }
   if (qqbot?.accounts) {
     const ids = Object.keys(qqbot.accounts);
-    if (ids.length > 0) {
-      return ids[0];
+    const firstId = ids.at(0);
+    if (firstId !== undefined) {
+      return firstId;
     }
   }
   return DEFAULT_ACCOUNT_ID;
@@ -142,12 +143,15 @@ export function resolveAccountBase(
   const resolvedAccountId = accountId ?? resolveDefaultAccountId(cfg);
   const qqbot = readQQBotSection(cfg);
 
-  let accountConfig: Record<string, unknown> = {};
-  let appId = "";
+  let accountConfig: Record<string, unknown>;
+  let appId;
 
   if (resolvedAccountId === DEFAULT_ACCOUNT_ID) {
-    accountConfig = normalizeAccountConfig(asRecord(qqbot));
-    appId = normalizeAppId(qqbot?.appId);
+    accountConfig = normalizeAccountConfig({
+      ...asRecord(qqbot),
+      ...asRecord(qqbot?.accounts?.[DEFAULT_ACCOUNT_ID]),
+    });
+    appId = normalizeAppId(accountConfig.appId);
   } else {
     const account = qqbot?.accounts?.[resolvedAccountId];
     accountConfig = normalizeAccountConfig(asRecord(account));
@@ -171,7 +175,7 @@ export function resolveAccountBase(
 
 // ---- Account config apply ----
 
-export interface ApplyAccountInput {
+interface ApplyAccountInput {
   appId?: string;
   clientSecret?: string;
   clientSecretFile?: string;
@@ -239,7 +243,7 @@ export function applyAccountConfig(
 // ---- Account status helpers ----
 
 /** Resolved account shape expected by isAccountConfigured / describeAccount. */
-export interface AccountSnapshot {
+interface AccountSnapshot {
   accountId: string;
   name?: string;
   enabled: boolean;
@@ -275,9 +279,7 @@ export function describeAccount(account: AccountSnapshot | undefined) {
 
 /** Normalize allowFrom entries into uppercase strings without the qqbot: prefix. */
 export function formatAllowFrom(allowFrom: Array<string | number> | undefined | null): string[] {
-  return (allowFrom ?? [])
-    .map((entry) => normalizeStringifiedOptionalString(entry))
-    .filter((entry): entry is string => Boolean(entry))
+  return normalizeStringifiedEntries(allowFrom ?? [])
     .map((entry) => entry.replace(/^qqbot:/i, ""))
     .map((entry) => entry.toUpperCase());
 }

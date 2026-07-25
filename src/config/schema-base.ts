@@ -1,4 +1,5 @@
-import { isSensitiveUrlConfigPath } from "../shared/net/redact-sensitive-url.js";
+// Builds base config schema metadata shared across generated config surfaces.
+import { isSensitiveUrlConfigPath } from "@openclaw/net-policy/redact-sensitive-url";
 import { VERSION } from "../version.js";
 import { FIELD_HELP } from "./schema.help.js";
 import type { ConfigUiHints } from "./schema.hints.js";
@@ -11,6 +12,7 @@ import {
 import { FIELD_LABELS } from "./schema.labels.js";
 import { asSchemaObject, cloneSchema } from "./schema.shared.js";
 import { applyDerivedTags } from "./schema.tags.js";
+import { applyResolvedConfigTierHints } from "./schema.tiers.js";
 import { OpenClawSchema } from "./zod-schema.js";
 
 type ConfigSchema = Record<string, unknown>;
@@ -145,7 +147,7 @@ function applyNodeDocumentation(
   }
 }
 
-export type BaseConfigSchemaResponse = {
+type BaseConfigSchemaResponse = {
   schema: ConfigSchema;
   uiHints: ConfigUiHints;
   version: string;
@@ -230,6 +232,7 @@ function computeBaseConfigSchemaStablePayload(): BaseConfigSchemaStablePayload {
     };
   }
   const schema = OpenClawSchema.toJSONSchema({
+    io: "input",
     target: "draft-07",
     unrepresentable: "any",
   });
@@ -244,10 +247,16 @@ function computeBaseConfigSchemaStablePayload(): BaseConfigSchemaStablePayload {
     "",
     isSensitiveUrlConfigPath,
   );
+  const publicSchema = stripLegacyCompatSchemaPaths(stripChannelSchema(schema));
   const stablePayload = {
-    schema: stripLegacyCompatSchemaPaths(stripChannelSchema(schema)),
-    uiHints: stripLegacyCompatHints(
-      applyDerivedTags(applySensitiveUrlHints(baseHints, sensitiveUrlPaths)),
+    schema: publicSchema,
+    uiHints: applyDerivedTags(
+      applyResolvedConfigTierHints(
+        publicSchema,
+        stripLegacyCompatHints(
+          applyDerivedTags(applySensitiveUrlHints(baseHints, sensitiveUrlPaths)),
+        ),
+      ),
     ),
     version: VERSION,
   } satisfies BaseConfigSchemaStablePayload;

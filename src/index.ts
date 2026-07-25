@@ -1,6 +1,10 @@
 #!/usr/bin/env node
+// Re-exports the OpenClaw CLI entry point for package execution.
+// Package executable entrypoint that forwards to the CLI bootstrap.
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { formatCliFailureLines } from "./cli/failure-output.js";
+import { runCliWithExitFinalization } from "./cli/one-shot-exit.js";
 import { formatUncaughtError } from "./infra/errors.js";
 import { runFatalErrorHooks } from "./infra/fatal-error-hooks.js";
 import { isMainModule } from "./infra/is-main.js";
@@ -27,6 +31,7 @@ export let ensurePortAvailable: LibraryExports["ensurePortAvailable"];
 export let getReplyFromConfig: LibraryExports["getReplyFromConfig"];
 export let handlePortError: LibraryExports["handlePortError"];
 export let loadConfig: LibraryExports["loadConfig"];
+/** @deprecated Use SQLite-backed session APIs. Scheduled for removal after 2026-10-12. */
 export let loadSessionStore: LibraryExports["loadSessionStore"];
 export let monitorWebChannel: LibraryExports["monitorWebChannel"];
 export let normalizeE164: LibraryExports["normalizeE164"];
@@ -36,6 +41,7 @@ export let resolveSessionKey: LibraryExports["resolveSessionKey"];
 export let resolveStorePath: LibraryExports["resolveStorePath"];
 export let runCommandWithTimeout: LibraryExports["runCommandWithTimeout"];
 export let runExec: LibraryExports["runExec"];
+/** @deprecated Use SQLite-backed session APIs. Scheduled for removal after 2026-10-12. */
 export let saveSessionStore: LibraryExports["saveSessionStore"];
 export let waitForever: LibraryExports["waitForever"];
 
@@ -83,7 +89,7 @@ if (!isMain) {
 }
 
 if (isMain) {
-  const { restoreTerminalState } = await import("./terminal/restore.js");
+  const { restoreTerminalState } = await import("../packages/terminal-core/src/restore.js");
 
   // Global error handlers to prevent silent crashes from unhandled rejections/exceptions.
   // These log the error and exit gracefully instead of crashing without trace.
@@ -100,7 +106,13 @@ if (isMain) {
       );
       return;
     }
-    console.error("[openclaw] Uncaught exception:", formatUncaughtError(error));
+    for (const line of formatCliFailureLines({
+      title: "OpenClaw hit an unexpected runtime error.",
+      error,
+      argv: process.argv,
+    })) {
+      console.error(line);
+    }
     for (const message of runFatalErrorHooks({ reason: "uncaught_exception", error })) {
       console.error("[openclaw]", message);
     }
@@ -108,12 +120,21 @@ if (isMain) {
     process.exit(1);
   });
 
-  void runLegacyCliEntry(process.argv).catch((err) => {
-    console.error("[openclaw] CLI failed:", formatUncaughtError(err));
-    for (const message of runFatalErrorHooks({ reason: "legacy_cli_failure", error: err })) {
-      console.error("[openclaw]", message);
-    }
-    restoreTerminalState("legacy cli failure", { resumeStdinIfPaused: false });
-    process.exit(1);
+  void runCliWithExitFinalization({
+    run: async () => await runLegacyCliEntry(process.argv),
+    onError: (err) => {
+      for (const line of formatCliFailureLines({
+        title: "The CLI command failed.",
+        error: err,
+        argv: process.argv,
+      })) {
+        console.error(line);
+      }
+      for (const message of runFatalErrorHooks({ reason: "legacy_cli_failure", error: err })) {
+        console.error("[openclaw]", message);
+      }
+      restoreTerminalState("legacy cli failure", { resumeStdinIfPaused: false });
+      process.exitCode = 1;
+    },
   });
 }

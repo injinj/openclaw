@@ -1,15 +1,18 @@
+// Regresses known config schema edge cases and compatibility expectations.
 import { describe, expect, it } from "vitest";
 import { validateConfigObject } from "./validation.js";
 
 describe("config schema regressions", () => {
   it('accepts memorySearch fallback "voyage"', () => {
     const res = validateConfigObject({
-      agents: {
-        defaults: {
-          memorySearch: {
-            fallback: "voyage",
-          },
+      memory: {
+        search: {
+          fallback: "voyage",
         },
+      },
+
+      agents: {
+        defaults: {},
       },
     });
 
@@ -18,12 +21,14 @@ describe("config schema regressions", () => {
 
   it('accepts memorySearch provider "mistral"', () => {
     const res = validateConfigObject({
-      agents: {
-        defaults: {
-          memorySearch: {
-            provider: "mistral",
-          },
+      memory: {
+        search: {
+          provider: "mistral",
         },
+      },
+
+      agents: {
+        defaults: {},
       },
     });
 
@@ -32,51 +37,75 @@ describe("config schema regressions", () => {
 
   it('accepts memorySearch provider "bedrock"', () => {
     const res = validateConfigObject({
-      agents: {
-        defaults: {
-          memorySearch: {
-            provider: "bedrock",
-          },
+      memory: {
+        search: {
+          provider: "bedrock",
         },
+      },
+
+      agents: {
+        defaults: {},
       },
     });
 
     expect(res.ok).toBe(true);
+  });
+
+  it("rejects local memorySearch GPU policy", () => {
+    const res = validateConfigObject({
+      memory: {
+        search: {
+          provider: "local",
+          local: {
+            gpu: "cpu",
+          },
+        },
+      },
+
+      agents: {
+        defaults: {},
+      },
+    });
+
+    expect(res.ok).toBe(false);
   });
 
   it("accepts memorySearch.qmd.extraCollections", () => {
     const res = validateConfigObject({
-      agents: {
-        defaults: {
-          memorySearch: {
-            qmd: {
-              extraCollections: [
-                { path: "/shared/team-notes", name: "team-notes", pattern: "**/*.md" },
-              ],
-            },
+      memory: {
+        search: {
+          qmd: {
+            extraCollections: [
+              { path: "/shared/team-notes", name: "team-notes", pattern: "**/*.md" },
+            ],
           },
         },
+      },
+
+      agents: {
+        defaults: {},
       },
     });
 
     expect(res.ok).toBe(true);
   });
 
-  it("accepts agents.list[].memorySearch.qmd.extraCollections", () => {
+  it("accepts agents.entries.*.memory.search.qmd.extraCollections", () => {
     const res = validateConfigObject({
       agents: {
-        list: [
-          {
-            id: "main",
-            memorySearch: {
-              qmd: {
-                extraCollections: [
-                  { path: "/shared/team-notes", name: "team-notes", pattern: "**/*.md" },
-                ],
+        entries: {
+          main: {
+            memory: {
+              search: {
+                qmd: {
+                  extraCollections: [
+                    { path: "/shared/team-notes", name: "team-notes", pattern: "**/*.md" },
+                  ],
+                },
               },
             },
           },
-        ],
+        },
       },
     });
 
@@ -117,20 +146,17 @@ describe("config schema regressions", () => {
     expect(res.ok).toBe(false);
   });
 
-  it("accepts agents.defaults and agents.list contextLimits overrides", () => {
+  it("accepts agents.defaults and agents.entries contextLimits overrides", () => {
     const res = validateConfigObject({
       agents: {
         defaults: {
           contextLimits: {
             memoryGetMaxChars: 20_000,
-            memoryGetDefaultLines: 180,
-            toolResultMaxChars: 24_000,
             postCompactionMaxChars: 4_000,
           },
         },
-        list: [
-          {
-            id: "writer",
+        entries: {
+          writer: {
             skillsLimits: {
               maxSkillsPromptChars: 30_000,
             },
@@ -138,7 +164,23 @@ describe("config schema regressions", () => {
               memoryGetMaxChars: 24_000,
             },
           },
-        ],
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("accepts agents.entries experimental localModelLean overrides", () => {
+    const res = validateConfigObject({
+      agents: {
+        entries: {
+          gemma: {
+            experimental: {
+              localModelLean: true,
+            },
+          },
+        },
       },
     });
 
@@ -159,6 +201,65 @@ describe("config schema regressions", () => {
 
     expect(res.ok).toBe(true);
   });
+
+  it("accepts Matrix queue byChannel overrides", () => {
+    const res = validateConfigObject({
+      messages: {
+        queue: {
+          byChannel: {
+            matrix: "steer",
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("accepts Matrix interrupt queue byChannel overrides", () => {
+    const res = validateConfigObject({
+      messages: {
+        queue: {
+          byChannel: {
+            matrix: "interrupt",
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("keeps queue byChannel schema and config type providers aligned", () => {
+    const res = validateConfigObject({
+      messages: {
+        queue: {
+          byChannel: {
+            googlechat: "followup",
+            mattermost: "collect",
+            matrix: "steer",
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects unknown queue byChannel providers", () => {
+    const res = validateConfigObject({
+      messages: {
+        queue: {
+          byChannel: {
+            unknown: "steer",
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(false);
+  });
+
   it("accepts string values for agents defaults model inputs", () => {
     const res = validateConfigObject({
       agents: {
@@ -180,7 +281,7 @@ describe("config schema regressions", () => {
             primary: "anthropic/claude-opus-4-6",
             fallbacks: ["openai/gpt-5.4-mini"],
           },
-          pdfMaxBytesMb: 12,
+          pdfMaxMb: 12,
           pdfMaxPages: 25,
         },
       },
@@ -194,7 +295,7 @@ describe("config schema regressions", () => {
       agents: {
         defaults: {
           pdfModel: { primary: "openai/gpt-5.4-mini" },
-          pdfMaxBytesMb: 0,
+          pdfMaxMb: 0,
           pdfMaxPages: 0,
         },
       },
@@ -202,7 +303,9 @@ describe("config schema regressions", () => {
 
     expect(res.ok).toBe(false);
     if (!res.ok) {
-      expect(res.issues.some((issue) => issue.path.includes("agents.defaults.pdfMax"))).toBe(true);
+      const issuePaths = res.issues.map((issue) => issue.path);
+      expect(issuePaths).toContain("agents.defaults.pdfMaxMb");
+      expect(issuePaths).toContain("agents.defaults.pdfMaxPages");
     }
   });
 
@@ -216,28 +319,6 @@ describe("config schema regressions", () => {
     expect(res.ok).toBe(true);
   });
 
-  it("accepts browser local startup timeout settings", () => {
-    const res = validateConfigObject({
-      browser: {
-        localLaunchTimeoutMs: 45_000,
-        localCdpReadyTimeoutMs: 30_000,
-      },
-    });
-
-    expect(res.ok).toBe(true);
-  });
-
-  it("rejects out-of-range browser local startup timeout settings", () => {
-    const res = validateConfigObject({
-      browser: {
-        localLaunchTimeoutMs: 120_001,
-        localCdpReadyTimeoutMs: 0,
-      },
-    });
-
-    expect(res.ok).toBe(false);
-  });
-
   it("rejects browser.extraArgs with non-array value", () => {
     const res = validateConfigObject({
       browser: {
@@ -248,12 +329,115 @@ describe("config schema regressions", () => {
     expect(res.ok).toBe(false);
   });
 
-  it("accepts tools.media.asyncCompletion.directSend", () => {
+  it("rejects unknown keys under browser.tabCleanup", () => {
     const res = validateConfigObject({
-      tools: {
-        media: {
-          asyncCompletion: {
-            directSend: true,
+      browser: {
+        tabCleanup: {
+          unknownKey: true as unknown,
+        },
+      },
+    });
+
+    expect(res.ok).toBe(false);
+  });
+
+  it("accepts discovery.wideArea.domain for unicast DNS-SD", () => {
+    const res = validateConfigObject({
+      discovery: {
+        wideArea: {
+          domain: "openclaw.internal",
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects bindings referencing an agentId missing from agents.entries (openclaw#84692)", () => {
+    const res = validateConfigObject({
+      agents: {
+        entries: { alpha: { model: "anthropic/claude-3-5-sonnet" } },
+      },
+      bindings: [
+        {
+          type: "route",
+          agentId: "ghost",
+          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
+        },
+      ],
+    });
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.issues.some((iss) => iss.message.includes('Unknown agent id "ghost"'))).toBe(true);
+    }
+  });
+
+  it("accepts bindings whose agentId is present in agents.entries", () => {
+    const res = validateConfigObject({
+      agents: {
+        entries: { alpha: { model: "anthropic/claude-3-5-sonnet" } },
+      },
+      bindings: [
+        {
+          type: "route",
+          agentId: "alpha",
+          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
+        },
+      ],
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects non-addressable agents.entries keys", () => {
+    const res = validateConfigObject({
+      agents: {
+        entries: { "Team Ops": { model: "anthropic/claude-3-5-sonnet" } },
+      },
+    });
+
+    expect(res.ok).toBe(false);
+  });
+
+  it("rejects non-default bindings when the implicit-main roster is materialized", () => {
+    const res = validateConfigObject({
+      bindings: [
+        {
+          type: "route",
+          agentId: "alpha",
+          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
+        },
+      ],
+    });
+
+    expect(res.ok).toBe(false);
+  });
+
+  it("accepts a microsoft-foundry model entry carrying thinkingLevelMap (openclaw#91011)", () => {
+    // Foundry's writer (buildFoundryThinkingLevelMap) persists this during Entra ID onboarding; the
+    // strict schema used to reject thinkingLevelMap, so updateConfig rolled the whole write back.
+    const res = validateConfigObject({
+      models: {
+        providers: {
+          "microsoft-foundry": {
+            models: [
+              {
+                id: "gpt-5.1-chat",
+                name: "gpt-5.1-chat",
+                api: "openai-responses",
+                reasoning: true,
+                thinkingLevelMap: {
+                  off: "none",
+                  minimal: null,
+                  low: "low",
+                  medium: "medium",
+                  high: "high",
+                  xhigh: null,
+                  max: null,
+                },
+              },
+            ],
           },
         },
       },
@@ -261,16 +445,25 @@ describe("config schema regressions", () => {
 
     expect(res.ok).toBe(true);
   });
-  it("accepts discovery.wideArea.domain for unicast DNS-SD", () => {
+
+  it("rejects thinkingLevelMap keys outside the model thinking levels", () => {
+    // "adaptive" is a valid agent thinkingDefault but not a ModelThinkingLevel; the map stays strict.
     const res = validateConfigObject({
-      discovery: {
-        wideArea: {
-          enabled: true,
-          domain: "openclaw.internal",
+      models: {
+        providers: {
+          "microsoft-foundry": {
+            models: [
+              {
+                id: "gpt-5.1-chat",
+                name: "gpt-5.1-chat",
+                thinkingLevelMap: { adaptive: "high" },
+              },
+            ],
+          },
         },
       },
     });
 
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
   });
 });

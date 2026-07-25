@@ -1,9 +1,19 @@
+import { createHash } from "node:crypto";
+// Persists and formats per-session cost and usage records.
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { resolveAgentDir } from "../agents/agent-scope-config.js";
 import type { NormalizedUsage, UsageLike } from "../agents/usage.js";
 import { normalizeUsage } from "../agents/usage.js";
 import { stripInboundMetadata } from "../auto-reply/reply/strip-inbound-meta.js";
+import {
+  materializeSessionArchiveForRead,
+  SESSION_ARCHIVE_ZSTD_SUFFIX,
+} from "../config/sessions/archive-compression.js";
 import {
   isPrimarySessionTranscriptFileName,
   isSessionArchiveArtifactName,
@@ -12,16 +22,60 @@ import {
   parseUsageCountedSessionIdFromFileName,
 } from "../config/sessions/artifacts.js";
 import {
+  resolveDefaultSessionStorePath,
   resolveSessionFilePath,
   resolveSessionTranscriptsDirForAgent,
 } from "../config/sessions/paths.js";
+import {
+  listSessionTranscriptInstances,
+  loadTranscriptEventRowsAfterSeqSync,
+  loadTranscriptEventsSync,
+  readTranscriptEventAtSeqSync,
+  readTranscriptStatsSync,
+} from "../config/sessions/session-accessor.js";
+import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
+import {
+  formatSqliteSessionFileMarker,
+  parseSqliteSessionFileMarker,
+  type SqliteSessionFileMarker,
+} from "../config/sessions/sqlite-marker.js";
+import {
+  isCanonicalSessionTranscriptEntry,
+  isSessionTranscriptLeafControl,
+  scanSessionTranscriptTree,
+} from "../config/sessions/transcript-tree.js";
+import { selectVisibleTranscriptEvents } from "../config/sessions/transcript-visible-events.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { normalizeAgentId } from "../routing/session-key.js";
 import { stripEnvelope, stripMessageIdHints } from "../shared/chat-envelope.js";
-import { asFiniteNumber } from "../shared/number-coercion.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
+import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.js";
+import { runTasksWithConcurrency } from "../utils/run-with-concurrency.js";
 import { countToolResults, extractToolCallNames } from "../utils/transcript-tools.js";
-import { estimateUsageCost, resolveModelCostConfig } from "../utils/usage-format.js";
+import {
+  estimateUsageCost,
+  resolveModelCostConfig,
+  resolveModelCostConfigFingerprint,
+} from "../utils/usage-format.js";
+import { formatErrorMessage } from "./errors.js";
+import { createTimeZoneDayKeyFormatter } from "./format-time/format-datetime.js";
+import {
+  acquireSessionCostUsageRefreshLock,
+  deleteSessionCostUsageRollupsExcept,
+  isSessionCostUsageRefreshRunning,
+  readSessionCostUsageRollupRows,
+  writeSessionCostUsageRollup,
+} from "./session-cost-usage-cache.sqlite.js";
+import {
+  addRollupToCostUsageSummary,
+  appendSessionUsageRollupContribution,
+  buildSessionCostSummaryFromRollup,
+  cloneSessionUsageRollupData,
+  createSessionUsageRollupData,
+  type SessionUsageRollupData,
+} from "./session-cost-usage-rollup.js";
+import { createEmptyCostUsageTotals as emptyTotals } from "./session-cost-usage-totals.js";
 import type {
   CostBreakdown,
   CostUsageTotals,
@@ -30,51 +84,353 @@ import type {
   ParsedTranscriptEntry,
   ParsedUsageEntry,
   SessionCostSummary,
-  SessionDailyLatency,
-  SessionDailyMessageCounts,
-  SessionDailyModelUsage,
-  SessionDailyUsage,
-  SessionLatencyStats,
   SessionLogEntry,
-  SessionMessageCounts,
-  SessionModelUsage,
-  SessionToolUsage,
   SessionUsageTimePoint,
   SessionUsageTimeSeries,
+  UsageCacheStatus,
+  UsageDailyBucket,
 } from "./session-cost-usage.types.js";
 
 export type {
-  CostUsageDailyEntry,
   CostUsageSummary,
   CostUsageTotals,
   DiscoveredSession,
   SessionCostSummary,
   SessionDailyLatency,
-  SessionDailyMessageCounts,
   SessionDailyModelUsage,
-  SessionDailyUsage,
   SessionLatencyStats,
-  SessionLogEntry,
   SessionMessageCounts,
   SessionModelUsage,
   SessionToolUsage,
-  SessionUsageTimePoint,
-  SessionUsageTimeSeries,
+  UsageCacheStatus,
+  UsageDailyBucket,
 } from "./session-cost-usage.types.js";
 
-const emptyTotals = (): CostUsageTotals => ({
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  totalCost: 0,
-  inputCost: 0,
-  outputCost: 0,
-  cacheReadCost: 0,
-  cacheWriteCost: 0,
-  missingCostEntries: 0,
-});
+// Cache data is rebuildable. Semantic changes get a new version; old rows are
+// ignored and rebuilt instead of normalized through a runtime compatibility path.
+const USAGE_COST_ROLLUP_VERSION = 2;
+const USAGE_COST_TRANSCRIPT_STAT_CONCURRENCY = 32;
+const USAGE_COST_FILE_ANCHOR_BYTES = 4096;
+const USAGE_COST_DIRECT_REFRESH_RETRY_MS = 25;
+const USAGE_COST_REFRESH_RETRY_MIN_MS = 50;
+const USAGE_COST_REFRESH_RETRY_MAX_MS = 5_000;
+const logger = createSubsystemLogger("usage-cost-cache");
+
+type UsageCostRefreshState = {
+  agentId: string;
+  config?: OpenClawConfig;
+  databasePath: string;
+  fullRefreshRequested: boolean;
+  pendingSessionFiles: Set<string>;
+  running: boolean;
+  sessionsDir: string;
+  busyRetryDelayMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+};
+
+type UsageCostRefreshResult = "refreshed" | "busy";
+
+const usageCostRefreshes = new Map<string, UsageCostRefreshState>();
+
+function resolveUsageCostCacheDatabasePath(agentId: string): string {
+  return resolveOpenClawAgentSqlitePath({ agentId: normalizeAgentId(agentId) });
+}
+
+type UsageCostJsonlCheckpoint = {
+  kind: "jsonl";
+  parsedOffset: number;
+  observedSize: number;
+  observedMtimeMs: number;
+  device: number;
+  inode: number;
+  anchorHash: string;
+};
+
+type UsageCostSqliteCheckpoint = {
+  kind: "sqlite";
+  maxSeq: number;
+  eventCount: number;
+  size: number;
+  mtimeMs: number;
+  anchorHash: string;
+  visibleLeafId?: string;
+};
+
+type UsageCostRollupEntry = {
+  version: number;
+  pricingFingerprint: string;
+  checkpoint: UsageCostJsonlCheckpoint | UsageCostSqliteCheckpoint;
+  scannedAt: number;
+  parsedRecords: number;
+  countedRecords: number;
+  rollup: SessionUsageRollupData;
+};
+
+type UsageCostStoredRollup = {
+  entry: UsageCostRollupEntry;
+  valueJson: string;
+};
+
+type UsageCostTranscriptFile = {
+  filePath: string;
+  kind: "jsonl" | "sqlite";
+  size: number;
+  mtimeMs: number;
+  sessionId?: string;
+  device?: number;
+  inode?: number;
+  eventCount?: number;
+  maxSeq?: number;
+};
+
+function resolveUsageCostAgentDir(config: OpenClawConfig | undefined, agentId: string): string {
+  return resolveAgentDir(config ?? {}, agentId);
+}
+
+function resolveUsageCostPricingFingerprint(config?: OpenClawConfig, agentDir?: string): string {
+  return resolveModelCostConfigFingerprint(config, agentDir);
+}
+
+function resolveUsageCostSessionStorePath(params: {
+  agentId: string;
+  sessionsDir?: string;
+}): string {
+  return params.sessionsDir
+    ? path.join(params.sessionsDir, "sessions.json")
+    : resolveDefaultSessionStorePath(params.agentId);
+}
+
+function normalizeUsageCostRollup(
+  raw: unknown,
+  pricingFingerprint: string,
+): UsageCostRollupEntry | undefined {
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const record = raw as Partial<UsageCostRollupEntry>;
+  if (
+    record.version !== USAGE_COST_ROLLUP_VERSION ||
+    record.pricingFingerprint !== pricingFingerprint ||
+    !record.checkpoint ||
+    !record.rollup ||
+    typeof record.scannedAt !== "number" ||
+    typeof record.parsedRecords !== "number" ||
+    typeof record.countedRecords !== "number"
+  ) {
+    return undefined;
+  }
+  return record as UsageCostRollupEntry;
+}
+
+function readUsageCostRollups(
+  agentId: string,
+  pricingFingerprint: string,
+  databasePath?: string,
+): Map<string, UsageCostStoredRollup> {
+  const result = new Map<string, UsageCostStoredRollup>();
+  for (const row of readSessionCostUsageRollupRows(agentId, databasePath)) {
+    try {
+      const entry = normalizeUsageCostRollup(JSON.parse(row.valueJson), pricingFingerprint);
+      if (entry) {
+        result.set(row.key, { entry, valueJson: row.valueJson });
+      }
+    } catch {
+      // Rebuildable cache row. The refresh path replaces it.
+    }
+  }
+  return result;
+}
+
+async function listUsageCountedTranscriptFileStats(
+  agentId: string,
+  params?: { minMtimeMs?: number; sessionsDir?: string },
+): Promise<UsageCostTranscriptFile[]> {
+  const sessionsDir = params?.sessionsDir ?? resolveSessionTranscriptsDirForAgent(agentId);
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  const tasks = entries
+    .filter((entry) => entry.isFile() && isUsageCountedSessionTranscriptFileName(entry.name))
+    .map((entry) => async (): Promise<UsageCostTranscriptFile | undefined> => {
+      const filePath = path.join(sessionsDir, entry.name);
+      let stats: fs.Stats;
+      try {
+        stats = await fs.promises.stat(filePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return undefined;
+        }
+        throw error;
+      }
+      if (params?.minMtimeMs !== undefined && stats.mtimeMs < params.minMtimeMs) {
+        return undefined;
+      }
+      // Compressed archives normalize to their materialized plain-JSONL cache
+      // at discovery, so every downstream size, incremental offset, and cache
+      // signature measures decompressed bytes; mixing offset spaces would
+      // truncate or overcount archived usage.
+      if (filePath.endsWith(SESSION_ARCHIVE_ZSTD_SUFFIX)) {
+        try {
+          const materialized = materializeSessionArchiveForRead(filePath);
+          const materializedStats = await fs.promises.stat(materialized);
+          return {
+            filePath: materialized,
+            kind: "jsonl",
+            size: materializedStats.size,
+            mtimeMs: stats.mtimeMs,
+            device: materializedStats.dev,
+            inode: materializedStats.ino,
+          };
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return undefined;
+          }
+          throw error;
+        }
+      }
+      return {
+        filePath,
+        kind: "jsonl",
+        size: stats.size,
+        mtimeMs: stats.mtimeMs,
+        device: stats.dev,
+        inode: stats.ino,
+      };
+    });
+  const { firstError, hasError, results } = await runTasksWithConcurrency({
+    tasks,
+    limit: USAGE_COST_TRANSCRIPT_STAT_CONCURRENCY,
+  });
+  if (hasError) {
+    throw firstError;
+  }
+  return results.filter((file): file is UsageCostTranscriptFile => Boolean(file));
+}
+
+function listUsageCountedSqliteTranscriptStats(
+  agentId: string,
+  params?: { minMtimeMs?: number; sessionsDir?: string },
+): UsageCostTranscriptFile[] {
+  const storePath = resolveUsageCostSessionStorePath({
+    agentId,
+    ...(params?.sessionsDir ? { sessionsDir: params.sessionsDir } : {}),
+  });
+  const files: UsageCostTranscriptFile[] = [];
+  for (const instance of listSessionTranscriptInstances({ agentId, storePath })) {
+    const marker = parseSqliteSessionFileMarker(instance.entry.sessionFile);
+    if (!marker) {
+      continue;
+    }
+    const mtimeMs = instance.updatedAtMs;
+    if (params?.minMtimeMs !== undefined && mtimeMs < params.minMtimeMs) {
+      continue;
+    }
+    // Usage scans run across every session on hot paths; byte sizes come from
+    // a SQL aggregate so no transcript row is materialized (#86718 class).
+    const stats = readTranscriptStatsSync({
+      agentId: marker.agentId,
+      sessionId: marker.sessionId,
+      storePath: marker.storePath,
+    });
+    files.push({
+      filePath: formatCanonicalUsageCostSqliteMarker(marker),
+      kind: "sqlite",
+      mtimeMs,
+      sessionId: marker.sessionId,
+      size: stats.sizeBytes,
+      eventCount: stats.eventCount,
+      maxSeq: stats.maxSeq,
+    });
+  }
+  return files;
+}
+
+function formatCanonicalUsageCostSqliteMarker(marker: SqliteSessionFileMarker): string {
+  const storePath =
+    resolveSqliteTargetFromSessionStorePath(marker.storePath, { agentId: marker.agentId }).path ??
+    resolveOpenClawAgentSqlitePath({ agentId: marker.agentId });
+  return formatSqliteSessionFileMarker({ ...marker, storePath });
+}
+
+async function listUsageCountedTranscriptFiles(
+  agentId: string,
+  params?: { sessionsDir?: string },
+): Promise<UsageCostTranscriptFile[]> {
+  return await listUsageCountedTranscriptStats(agentId, params);
+}
+
+async function listUsageCountedTranscriptStats(
+  agentId: string,
+  params?: { minMtimeMs?: number; sessionsDir?: string },
+): Promise<UsageCostTranscriptFile[]> {
+  const fileBacked = await listUsageCountedTranscriptFileStats(agentId, params);
+  const sqliteBacked = listUsageCountedSqliteTranscriptStats(agentId, params);
+  const sqliteSessionIds = new Set(sqliteBacked.map((file) => file.sessionId).filter(Boolean));
+  const canonicalFileBacked = fileBacked.filter((file) => {
+    const sessionId = parseUsageCountedSessionIdFromFileName(path.basename(file.filePath));
+    return !sessionId || !sqliteSessionIds.has(sessionId);
+  });
+  return [...canonicalFileBacked, ...sqliteBacked];
+}
+
+async function resolveUsageCostTranscriptFile(
+  sessionFile: string,
+): Promise<UsageCostTranscriptFile | undefined> {
+  const marker = parseSqliteSessionFileMarker(sessionFile);
+  if (marker) {
+    const stats = readTranscriptStatsSync({
+      agentId: marker.agentId,
+      sessionId: marker.sessionId,
+      storePath: marker.storePath,
+    });
+    return {
+      filePath: formatCanonicalUsageCostSqliteMarker(marker),
+      kind: "sqlite",
+      mtimeMs: stats.lastMutationAtMs ?? 0,
+      sessionId: marker.sessionId,
+      size: stats.sizeBytes,
+      eventCount: stats.eventCount,
+      maxSeq: stats.maxSeq,
+    };
+  }
+  if (sessionFile.endsWith(SESSION_ARCHIVE_ZSTD_SUFFIX)) {
+    try {
+      const archiveStats = await fs.promises.stat(sessionFile);
+      const materialized = materializeSessionArchiveForRead(sessionFile);
+      const materializedStats = await fs.promises.stat(materialized);
+      return {
+        filePath: materialized,
+        kind: "jsonl",
+        size: materializedStats.size,
+        mtimeMs: archiveStats.mtimeMs,
+        device: materializedStats.dev,
+        inode: materializedStats.ino,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+  const stats = await fs.promises.stat(sessionFile).catch(() => null);
+  return stats
+    ? {
+        filePath: sessionFile,
+        kind: "jsonl",
+        size: stats.size,
+        mtimeMs: stats.mtimeMs,
+        device: stats.dev,
+        inode: stats.ino,
+      }
+    : undefined;
+}
+
+const normalizeUsageCostTotalOrigin = (value: unknown): CostBreakdown["totalOrigin"] =>
+  value === "provider-billed" ? value : undefined;
 
 const extractCostBreakdown = (usageRaw?: UsageLike | null): CostBreakdown | undefined => {
   if (!usageRaw || typeof usageRaw !== "object") {
@@ -97,21 +453,22 @@ const extractCostBreakdown = (usageRaw?: UsageLike | null): CostBreakdown | unde
     output: asFiniteNumber(cost.output),
     cacheRead: asFiniteNumber(cost.cacheRead),
     cacheWrite: asFiniteNumber(cost.cacheWrite),
+    totalOrigin: normalizeUsageCostTotalOrigin(cost.totalOrigin),
   };
 };
 
 const parseTimestamp = (entry: Record<string, unknown>): Date | undefined => {
-  const raw = entry.timestamp;
-  if (typeof raw === "string") {
-    const parsed = new Date(raw);
-    if (!Number.isNaN(parsed.valueOf())) {
-      return parsed;
-    }
-  }
   const message = entry.message as Record<string, unknown> | undefined;
   const messageTimestamp = asFiniteNumber(message?.timestamp);
   if (messageTimestamp !== undefined) {
     const parsed = new Date(messageTimestamp);
+    if (!Number.isNaN(parsed.valueOf())) {
+      return parsed;
+    }
+  }
+  const raw = entry.timestamp;
+  if (typeof raw === "string") {
+    const parsed = new Date(raw);
     if (!Number.isNaN(parsed.valueOf())) {
       return parsed;
     }
@@ -127,7 +484,8 @@ const parseTranscriptEntry = (entry: Record<string, unknown>): ParsedTranscriptE
 
   const roleRaw = message.role;
   const role = roleRaw === "user" || roleRaw === "assistant" ? roleRaw : undefined;
-  if (!role) {
+  const isStandaloneToolResult = roleRaw === "tool" || roleRaw === "toolResult";
+  if (!role && !isStandaloneToolResult) {
     return null;
   }
 
@@ -157,40 +515,285 @@ const parseTranscriptEntry = (entry: Record<string, unknown>): ParsedTranscriptE
     provider,
     model,
     stopReason,
-    toolNames: extractToolCallNames(message),
-    toolResultCounts: countToolResults(message),
+    toolNames: isStandaloneToolResult ? [] : extractToolCallNames(message),
+    toolResultCounts: isStandaloneToolResult
+      ? {
+          total: 1,
+          errors: message.isError === true || message.is_error === true ? 1 : 0,
+        }
+      : countToolResults(message),
   };
 };
 
-const formatDayKey = (date: Date): string =>
-  date.toLocaleDateString("en-CA", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+const formatUtcDayKey = (date: Date): string =>
+  `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
 
-const computeLatencyStats = (values: number[]): SessionLatencyStats | undefined => {
-  if (!values.length) {
-    return undefined;
+type UsageDayKeyFormatter = (date: Date) => string;
+
+const createUsageDayKeyFormatter = (dayBucket?: UsageDailyBucket): UsageDayKeyFormatter => {
+  if (dayBucket?.mode === "utc-offset") {
+    return (date) =>
+      formatUtcDayKey(new Date(date.getTime() + dayBucket.utcOffsetMinutes * 60 * 1000));
   }
-  const sorted = values.toSorted((a, b) => a - b);
-  const total = sorted.reduce((sum, v) => sum + v, 0);
-  const count = sorted.length;
-  const p95Index = Math.max(0, Math.ceil(count * 0.95) - 1);
+  const timeZone =
+    dayBucket?.mode === "time-zone"
+      ? dayBucket.timeZone
+      : Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return createTimeZoneDayKeyFormatter(timeZone);
+};
+
+/**
+ * Maximum window (in days) for which we will zero-fill missing calendar
+ * days. Bounded ranges from the UI's range filter top out at 90 days for
+ * the explicit picker and "All" is the wildcard escape hatch — anything
+ * wider than this threshold is treated as an all-time / open-ended range
+ * and falls back to sparse behavior (only days with activity), since a
+ * dense series at that scale would produce tens of thousands of zero
+ * buckets (e.g. a 1970-based startMs → ~20k entries) without any user
+ * value. 366 days covers a full year + leap-day cushion.
+ */
+const MAX_ZERO_FILL_DAYS = 366;
+
+/**
+ * Parse a `YYYY-MM-DD` day key into its UTC calendar-day timestamp. The
+ * timestamp is only used to enumerate calendar labels; usage timestamps stay
+ * in their requested timezone bucket.
+ */
+const parseDayKeyToUtcMs = (dayKey: string): number | null => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dayKey);
+  if (!match) {
+    return null;
+  }
+  const year = Number(match[1]);
+  const monthIdx = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const dayMs = Date.UTC(year, monthIdx, day);
+  const date = new Date(dayMs);
+  return date.getUTCFullYear() === year &&
+    date.getUTCMonth() === monthIdx &&
+    date.getUTCDate() === day
+    ? dayMs
+    : null;
+};
+
+/**
+ * Ensure the daily map has an entry for every calendar day in [startMs, endMs].
+ * Days without activity are inserted with a zero-valued totals bucket so the
+ * resulting `daily` series matches the requested range length (one bar per
+ * calendar day) instead of only covering days with recorded usage.
+ *
+ * Day keys must use the same calendar zone as the request range. Otherwise a
+ * remote Gateway can return local-date labels for UTC/browser-local ranges,
+ * which drops boundary usage when the UI compares calendar windows.
+ */
+const fillMissingDays = (
+  dailyMap: Map<string, CostUsageTotals>,
+  startMs: number,
+  endMs: number,
+  formatDayKey: UsageDayKeyFormatter,
+): void => {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+    return;
+  }
+  const dayMs = 24 * 60 * 60 * 1000;
+  const startKey = formatDayKey(new Date(startMs));
+  const endKey = formatDayKey(new Date(endMs));
+  const startDayMs = parseDayKeyToUtcMs(startKey);
+  const endDayMs = parseDayKeyToUtcMs(endKey);
+  if (startDayMs === null || endDayMs === null) {
+    // Defensive fallback — formatDayKey should always produce a YYYY-MM-DD
+    // key, but if locale data ever shifts under us, at least make sure the
+    // endpoint days are present so the chart isn't completely empty.
+    if (!dailyMap.has(startKey)) {
+      dailyMap.set(startKey, emptyTotals());
+    }
+    if (!dailyMap.has(endKey)) {
+      dailyMap.set(endKey, emptyTotals());
+    }
+    return;
+  }
+  // Bound the fill by calendar labels, not elapsed milliseconds: DST days can
+  // contain 23 or 25 hours. Wider ranges keep their sparse activity-only shape.
+  const spanDays = Math.floor((endDayMs - startDayMs) / dayMs) + 1;
+  if (spanDays > MAX_ZERO_FILL_DAYS) {
+    return;
+  }
+  const maxIterations = MAX_ZERO_FILL_DAYS + 1;
+  for (let cursorMs = startDayMs, i = 0; cursorMs <= endDayMs && i < maxIterations; i += 1) {
+    const key = formatUtcDayKey(new Date(cursorMs));
+    if (!dailyMap.has(key)) {
+      dailyMap.set(key, emptyTotals());
+    }
+    cursorMs += dayMs;
+  }
+  if (!dailyMap.has(endKey)) {
+    dailyMap.set(endKey, emptyTotals());
+  }
+};
+
+const countCalendarDays = (
+  startMs: number,
+  endMs: number,
+  formatDayKey: UsageDayKeyFormatter,
+): number => {
+  const startDayMs = parseDayKeyToUtcMs(formatDayKey(new Date(startMs)));
+  const endDayMs = parseDayKeyToUtcMs(formatDayKey(new Date(endMs)));
+  if (startDayMs === null || endDayMs === null || endDayMs < startDayMs) {
+    return Math.ceil((endMs - startMs) / (24 * 60 * 60 * 1000)) + 1;
+  }
+  return Math.floor((endDayMs - startDayMs) / (24 * 60 * 60 * 1000)) + 1;
+};
+
+function isUsageCostRollupFresh(params: {
+  stored: UsageCostStoredRollup | undefined;
+  file: UsageCostTranscriptFile;
+}): boolean {
+  const checkpoint = params.stored?.entry.checkpoint;
+  if (!checkpoint || checkpoint.kind !== params.file.kind) {
+    return false;
+  }
+  if (checkpoint.kind === "jsonl") {
+    return (
+      checkpoint.observedSize === params.file.size &&
+      checkpoint.observedMtimeMs === params.file.mtimeMs &&
+      checkpoint.device === params.file.device &&
+      checkpoint.inode === params.file.inode
+    );
+  }
+  return (
+    checkpoint.size === params.file.size &&
+    checkpoint.mtimeMs === params.file.mtimeMs &&
+    checkpoint.eventCount === params.file.eventCount &&
+    checkpoint.maxSeq === params.file.maxSeq
+  );
+}
+
+function canUseUsageCostRollupForPartial(params: {
+  stored: UsageCostStoredRollup | undefined;
+  file: UsageCostTranscriptFile;
+}): boolean {
+  const checkpoint = params.stored?.entry.checkpoint;
+  if (!checkpoint || checkpoint.kind !== params.file.kind) {
+    return false;
+  }
+  if (checkpoint.kind === "jsonl") {
+    return (
+      checkpoint.parsedOffset <= params.file.size &&
+      checkpoint.device === params.file.device &&
+      checkpoint.inode === params.file.inode
+    );
+  }
+  return checkpoint.maxSeq <= (params.file.maxSeq ?? 0);
+}
+
+function getUsageCostStaleRollupFiles(params: {
+  rollups: Map<string, UsageCostStoredRollup>;
+  files: UsageCostTranscriptFile[];
+}): UsageCostTranscriptFile[] {
+  return params.files.filter(
+    (file) => !isUsageCostRollupFresh({ stored: params.rollups.get(file.filePath), file }),
+  );
+}
+
+function countUsableUsageCostRollups(params: {
+  rollups: Map<string, UsageCostStoredRollup>;
+  files: UsageCostTranscriptFile[];
+}): number {
+  return params.files.reduce(
+    (count, file) =>
+      count +
+      (canUseUsageCostRollupForPartial({ stored: params.rollups.get(file.filePath), file })
+        ? 1
+        : 0),
+    0,
+  );
+}
+
+function latestUsageCostRollupScan(
+  rollups: Map<string, UsageCostStoredRollup>,
+): number | undefined {
+  let latest = 0;
+  for (const { entry } of rollups.values()) {
+    latest = Math.max(latest, entry.scannedAt);
+  }
+  return latest || undefined;
+}
+
+function buildCostUsageSummaryFromRollups(params: {
+  rollups: Map<string, UsageCostStoredRollup>;
+  files: UsageCostTranscriptFile[];
+  startMs: number;
+  endMs: number;
+  dayBucket?: UsageDailyBucket;
+  refreshing: boolean;
+}): CostUsageSummary {
+  const dailyMap = new Map<string, CostUsageTotals>();
+  const totals = emptyTotals();
+  const dayFormatter = createUsageDayKeyFormatter(params.dayBucket);
+  const staleFiles = getUsageCostStaleRollupFiles(params);
+  const cachedFiles = countUsableUsageCostRollups(params);
+  for (const file of params.files) {
+    const stored = params.rollups.get(file.filePath);
+    if (!canUseUsageCostRollupForPartial({ stored, file }) || !stored) {
+      continue;
+    }
+    addRollupToCostUsageSummary({
+      rollup: stored.entry.rollup,
+      startMs: params.startMs,
+      endMs: params.endMs,
+      formatDay: dayFormatter,
+      daily: dailyMap,
+      totals,
+    });
+  }
+  fillMissingDays(dailyMap, params.startMs, params.endMs, dayFormatter);
+  const status = params.refreshing
+    ? "refreshing"
+    : staleFiles.length > 0
+      ? cachedFiles > 0
+        ? "partial"
+        : "stale"
+      : "fresh";
   return {
-    count,
-    avgMs: total / count,
-    p95Ms: sorted[p95Index] ?? sorted[count - 1],
-    minMs: sorted[0],
-    maxMs: sorted[count - 1],
+    updatedAt: Date.now(),
+    days: countCalendarDays(params.startMs, params.endMs, dayFormatter),
+    daily: Array.from(dailyMap.entries())
+      .map(([date, bucket]) => Object.assign({ date }, bucket))
+      .toSorted((a, b) => a.date.localeCompare(b.date)),
+    totals,
+    cacheStatus: {
+      status,
+      cachedFiles,
+      pendingFiles: staleFiles.length,
+      staleFiles: staleFiles.length,
+      refreshedAt: latestUsageCostRollupScan(params.rollups),
+    },
+  };
+}
+
+const computeUsageTokenTotals = (usage: NormalizedUsage) => {
+  const input = usage.input ?? 0;
+  const output = usage.output ?? 0;
+  const cacheRead = usage.cacheRead ?? 0;
+  const cacheWrite = usage.cacheWrite ?? 0;
+  const componentTotal = input + output + cacheRead + cacheWrite;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    componentTotal,
+    totalTokens: usage.total ?? componentTotal,
   };
 };
 
 const applyUsageTotals = (totals: CostUsageTotals, usage: NormalizedUsage) => {
-  totals.input += usage.input ?? 0;
-  totals.output += usage.output ?? 0;
-  totals.cacheRead += usage.cacheRead ?? 0;
-  totals.cacheWrite += usage.cacheWrite ?? 0;
-  const totalTokens =
-    usage.total ??
-    (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-  totals.totalTokens += totalTokens;
+  const usageTotals = computeUsageTokenTotals(usage);
+  totals.input += usageTotals.input;
+  totals.output += usageTotals.output;
+  totals.cacheRead += usageTotals.cacheRead;
+  totals.cacheWrite += usageTotals.cacheWrite;
+  totals.totalTokens += usageTotals.totalTokens;
 };
 
 const applyCostBreakdown = (totals: CostUsageTotals, costBreakdown: CostBreakdown | undefined) => {
@@ -205,16 +808,184 @@ const applyCostBreakdown = (totals: CostUsageTotals, costBreakdown: CostBreakdow
 };
 
 // Legacy function for backwards compatibility (no cost breakdown available)
-const applyCostTotal = (totals: CostUsageTotals, costTotal: number | undefined) => {
+const applyCostTotal = (
+  totals: CostUsageTotals,
+  costTotal: number | undefined,
+  provider?: string,
+  model?: string,
+) => {
   if (costTotal === undefined) {
     totals.missingCostEntries += 1;
+    const modelKey = `${normalizeOptionalString(provider) ?? "unknown"}/${normalizeOptionalString(model) ?? "unknown"}`;
+    totals.missingCostByModel ??= {};
+    totals.missingCostByModel[modelKey] = (totals.missingCostByModel[modelKey] ?? 0) + 1;
     return;
   }
   totals.totalCost += costTotal;
 };
 
-async function* readJsonlRecords(filePath: string): AsyncGenerator<Record<string, unknown>> {
-  const fileStream = fs.createReadStream(filePath, { encoding: "utf-8" });
+// A resolved cost config only counts as "known" pricing when it carries at least one
+// positive per-token rate (or tiered pricing). An all-zero config is indistinguishable
+// from "pricing unknown": e.g. codex models ship cost {input:0,output:0,...} in the
+// generated models.json because the Codex backend exposes no per-token price. Treating
+// such a config as a real $0 makes usage-cost report confident zero spend, which
+// silently blinds every budget/spike safeguard that keys off totalCost.
+const isModelPricingKnown = (cost: ReturnType<typeof resolveModelCostConfig>): boolean => {
+  if (!cost) {
+    return false;
+  }
+  if (cost.tieredPricing && cost.tieredPricing.length > 0) {
+    return true;
+  }
+  return cost.input > 0 || cost.output > 0 || cost.cacheRead > 0 || cost.cacheWrite > 0;
+};
+
+const shouldPreserveRecordedZeroCost = (costBreakdown: CostBreakdown | undefined): boolean =>
+  costBreakdown?.total === 0 &&
+  (costBreakdown.totalOrigin === "provider-billed" ||
+    [
+      costBreakdown.input,
+      costBreakdown.output,
+      costBreakdown.cacheRead,
+      costBreakdown.cacheWrite,
+    ].some((value) => value !== undefined && value !== 0));
+
+const shouldRecomputeRecordedZeroCost = (params: {
+  cost: ReturnType<typeof resolveModelCostConfig>;
+  costBreakdown: CostBreakdown | undefined;
+  costTotal: number | undefined;
+  usage: NormalizedUsage;
+}): boolean =>
+  params.costTotal === 0 &&
+  !shouldPreserveRecordedZeroCost(params.costBreakdown) &&
+  isModelPricingKnown(params.cost) &&
+  computeUsageTokenTotals(params.usage).totalTokens > 0;
+
+type UsageCostResolver = (params: {
+  provider?: string;
+  model?: string;
+}) => ReturnType<typeof resolveModelCostConfig>;
+
+function createUsageCostResolver(params?: {
+  config?: OpenClawConfig;
+  agentDir?: string;
+}): UsageCostResolver {
+  const cache = new Map<string, ReturnType<typeof resolveModelCostConfig>>();
+  return ({ provider, model }) => {
+    const key = `${provider ?? ""}\0${model ?? ""}`;
+    if (cache.has(key)) {
+      return cache.get(key);
+    }
+    const cost = resolveModelCostConfig({
+      provider,
+      model,
+      config: params?.config,
+      agentDir: params?.agentDir,
+    });
+    cache.set(key, cost);
+    return cost;
+  };
+}
+
+function hashUsageCostCheckpoint(value: Buffer | string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+async function readJsonlAnchorHash(filePath: string, offset: number): Promise<string | undefined> {
+  const start = Math.max(0, offset - USAGE_COST_FILE_ANCHOR_BYTES);
+  const length = offset - start;
+  if (length === 0) {
+    return hashUsageCostCheckpoint("");
+  }
+  const handle = await fs.promises.open(filePath, "r").catch(() => null);
+  if (!handle) {
+    return undefined;
+  }
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return bytesRead === length ? hashUsageCostCheckpoint(buffer) : undefined;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function parseJsonlRecord(line: Buffer): Record<string, unknown> | undefined {
+  const text = line.toString("utf8").trim();
+  if (!text) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function scanJsonlRange(params: {
+  filePath: string;
+  startOffset: number;
+  endOffset: number;
+  onRecord: (record: Record<string, unknown>) => void;
+}): Promise<number> {
+  if (params.endOffset <= params.startOffset) {
+    return params.startOffset;
+  }
+  const stream = fs.createReadStream(params.filePath, {
+    start: params.startOffset,
+    end: params.endOffset - 1,
+  });
+  let carry = Buffer.alloc(0);
+  let carryStart = params.startOffset;
+  let processedOffset = params.startOffset;
+  try {
+    for await (const chunk of stream) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const data = carry.length === 0 ? bytes : Buffer.concat([carry, bytes]);
+      let lineStart = 0;
+      for (let newline = data.indexOf(10); newline >= 0; newline = data.indexOf(10, lineStart)) {
+        const record = parseJsonlRecord(data.subarray(lineStart, newline));
+        if (record) {
+          params.onRecord(record);
+        }
+        processedOffset = carryStart + newline + 1;
+        lineStart = newline + 1;
+      }
+      carry = data.subarray(lineStart);
+      carryStart = processedOffset;
+    }
+    if (carry.length > 0) {
+      const record = parseJsonlRecord(carry);
+      if (record) {
+        params.onRecord(record);
+        processedOffset = params.endOffset;
+      }
+    }
+    return processedOffset;
+  } finally {
+    stream.destroy();
+  }
+}
+
+async function* readJsonlRecords(
+  filePath: string,
+  startOffset = 0,
+  endOffset?: number,
+): AsyncGenerator<Record<string, unknown>> {
+  if (endOffset !== undefined && endOffset <= startOffset) {
+    return;
+  }
+  const streamOptions: Parameters<typeof fs.createReadStream>[1] = {
+    encoding: "utf-8",
+    start: Math.max(0, startOffset),
+  };
+  if (endOffset !== undefined) {
+    streamOptions.end = endOffset - 1;
+  }
+  const fileStream = fs.createReadStream(filePath, streamOptions);
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
   try {
     for await (const line of rl) {
@@ -238,36 +1009,110 @@ async function* readJsonlRecords(filePath: string): AsyncGenerator<Record<string
   }
 }
 
+function loadSqliteUsageTranscriptEvents(
+  marker: SqliteSessionFileMarker,
+): Record<string, unknown>[] {
+  return selectVisibleTranscriptEvents(
+    loadTranscriptEventsSync({
+      agentId: marker.agentId,
+      sessionId: marker.sessionId,
+      storePath: marker.storePath,
+    }),
+  ).filter(
+    (event): event is Record<string, unknown> =>
+      Boolean(event) && typeof event === "object" && !Array.isArray(event),
+  );
+}
+
+async function* readTranscriptRecords(
+  filePath: string,
+  startOffset = 0,
+  endOffset?: number,
+): AsyncGenerator<Record<string, unknown>> {
+  const marker = parseSqliteSessionFileMarker(filePath);
+  if (marker) {
+    for (const event of loadSqliteUsageTranscriptEvents(marker)) {
+      yield event;
+    }
+    return;
+  }
+  // Discovery normalizes compressed archives to their materialized cache, so
+  // this branch only serves direct callers that pass a raw .zst path; those
+  // callers never carry persisted offsets, keeping the range space coherent.
+  if (filePath.endsWith(SESSION_ARCHIVE_ZSTD_SUFFIX)) {
+    yield* readJsonlRecords(materializeSessionArchiveForRead(filePath), startOffset, endOffset);
+    return;
+  }
+  yield* readJsonlRecords(filePath, startOffset, endOffset);
+}
+
+async function* readTranscriptRecordsBestEffort(
+  filePath: string,
+): AsyncGenerator<Record<string, unknown>> {
+  try {
+    yield* readTranscriptRecords(filePath);
+  } catch {
+    // Diagnostic readers return the records available before a stream failure.
+    // Durable cache scans use the strict reader so partial data is never marked fresh.
+  }
+}
+
+function parseUsageCostTranscriptEntry(
+  parsed: Record<string, unknown>,
+  resolveCost: UsageCostResolver,
+): ParsedTranscriptEntry | null {
+  const entry = parseTranscriptEntry(parsed);
+  if (!entry?.usage) {
+    return entry;
+  }
+  const cost = resolveCost({ provider: entry.provider, model: entry.model });
+  const usageTotals = computeUsageTokenTotals(entry.usage);
+  const pricingKnown = isModelPricingKnown(cost);
+  const preserveRecordedZeroCost = shouldPreserveRecordedZeroCost(entry.costBreakdown);
+  if (cost?.tieredPricing && cost.tieredPricing.length > 0 && !preserveRecordedZeroCost) {
+    entry.costTotal = estimateUsageCost({ usage: entry.usage, cost });
+    entry.costBreakdown = undefined;
+  } else if (
+    !pricingKnown &&
+    !preserveRecordedZeroCost &&
+    (entry.costTotal === undefined || entry.costTotal === 0) &&
+    usageTotals.totalTokens > 0
+  ) {
+    entry.costTotal = undefined;
+    entry.costBreakdown = undefined;
+  } else if (
+    entry.costTotal === undefined ||
+    shouldRecomputeRecordedZeroCost({
+      usage: entry.usage,
+      cost,
+      costBreakdown: entry.costBreakdown,
+      costTotal: entry.costTotal,
+    })
+  ) {
+    entry.costTotal = estimateUsageCost({ usage: entry.usage, cost });
+    entry.costBreakdown = undefined;
+  }
+  return entry;
+}
+
 async function scanTranscriptFile(params: {
   filePath: string;
   config?: OpenClawConfig;
+  resolveCost?: UsageCostResolver;
+  startOffset?: number;
+  endOffset?: number;
   onEntry: (entry: ParsedTranscriptEntry) => void;
 }): Promise<void> {
-  for await (const parsed of readJsonlRecords(params.filePath)) {
-    const entry = parseTranscriptEntry(parsed);
+  const resolveCost = params.resolveCost ?? createUsageCostResolver({ config: params.config });
+  for await (const parsed of readTranscriptRecords(
+    params.filePath,
+    params.startOffset,
+    params.endOffset,
+  )) {
+    const entry = parseUsageCostTranscriptEntry(parsed, resolveCost);
     if (!entry) {
       continue;
     }
-
-    if (entry.usage) {
-      const cost = resolveModelCostConfig({
-        provider: entry.provider,
-        model: entry.model,
-        config: params.config,
-      });
-      if (cost?.tieredPricing && cost.tieredPricing.length > 0) {
-        // When tiered pricing is configured, always recompute to override
-        // the flat-rate cost that the transport layer wrote into the transcript.
-        // Clear costBreakdown so downstream aggregation uses the recomputed total
-        // instead of the stale flat-rate breakdown from the transport layer.
-        entry.costTotal = estimateUsageCost({ usage: entry.usage, cost });
-        entry.costBreakdown = undefined;
-      } else if (entry.costTotal === undefined) {
-        // Fill in missing cost estimates.
-        entry.costTotal = estimateUsageCost({ usage: entry.usage, cost });
-      }
-    }
-
     params.onEntry(entry);
   }
 }
@@ -275,11 +1120,17 @@ async function scanTranscriptFile(params: {
 async function scanUsageFile(params: {
   filePath: string;
   config?: OpenClawConfig;
+  resolveCost?: UsageCostResolver;
+  startOffset?: number;
+  endOffset?: number;
   onEntry: (entry: ParsedUsageEntry) => void;
 }): Promise<void> {
   await scanTranscriptFile({
     filePath: params.filePath,
     config: params.config,
+    resolveCost: params.resolveCost,
+    startOffset: params.startOffset,
+    endOffset: params.endOffset,
     onEntry: (entry) => {
       if (!entry.usage) {
         return;
@@ -300,12 +1151,23 @@ export function resolveExistingUsageSessionFile(params: {
   sessionId?: string;
   sessionEntry?: SessionEntry;
   sessionFile?: string;
-  agentId?: string;
+  agentId: string;
 }): string | undefined {
+  const sessionId = params.sessionId?.trim();
+  const entryMarker = parseSqliteSessionFileMarker(params.sessionEntry?.sessionFile);
+  const explicitMarker = parseSqliteSessionFileMarker(params.sessionFile);
+  const sqliteMarker = entryMarker ?? explicitMarker;
+  if (sqliteMarker) {
+    if (sessionId && sqliteMarker.sessionId !== sessionId) {
+      return undefined;
+    }
+    return formatSqliteSessionFileMarker(sqliteMarker);
+  }
+
   const candidate =
     params.sessionFile ??
-    (params.sessionId
-      ? resolveSessionFilePath(params.sessionId, params.sessionEntry, {
+    (sessionId
+      ? resolveSessionFilePath(sessionId, params.sessionEntry, {
           agentId: params.agentId,
         })
       : undefined);
@@ -313,8 +1175,6 @@ export function resolveExistingUsageSessionFile(params: {
   if (candidate && fs.existsSync(candidate)) {
     return candidate;
   }
-
-  const sessionId = params.sessionId?.trim();
   if (!sessionId) {
     return candidate;
   }
@@ -359,94 +1219,666 @@ export function resolveExistingUsageSessionFile(params: {
   }
 }
 
-export async function loadCostUsageSummary(params?: {
+export async function loadCostUsageSummary(params: {
   startMs?: number;
   endMs?: number;
-  days?: number; // Deprecated, for backwards compatibility
+  dayBucket?: UsageDailyBucket;
   config?: OpenClawConfig;
-  agentId?: string;
+  agentId: string;
 }): Promise<CostUsageSummary> {
-  const now = new Date();
-  let sinceTime: number;
-  let untilTime: number;
+  const now = Date.now();
+  const defaultStart = new Date(now);
+  defaultStart.setDate(defaultStart.getDate() - 29);
+  const startMs = params.startMs ?? defaultStart.getTime();
+  const endMs = params.endMs ?? now;
+  const agentDir = resolveUsageCostAgentDir(params.config, params.agentId);
+  const databasePath = resolveUsageCostCacheDatabasePath(params.agentId);
+  const result = await refreshCostUsageCacheForAgent({
+    config: params.config,
+    agentId: params.agentId,
+    agentDir,
+    databasePath,
+  });
+  const pricingFingerprint = resolveUsageCostPricingFingerprint(params.config, agentDir);
+  const rollups = readUsageCostRollups(params.agentId, pricingFingerprint, databasePath);
+  const files = await listUsageCountedTranscriptFiles(params.agentId);
+  return buildCostUsageSummaryFromRollups({
+    rollups,
+    files,
+    startMs,
+    endMs,
+    dayBucket: params.dayBucket,
+    refreshing:
+      result === "busy" ||
+      usageCostRefreshes.has(databasePath) ||
+      isSessionCostUsageRefreshRunning(params.agentId, databasePath),
+  });
+}
 
-  if (params?.startMs !== undefined && params?.endMs !== undefined) {
-    sinceTime = params.startMs;
-    untilTime = params.endMs;
-  } else {
-    // Fallback to days-based calculation for backwards compatibility
-    const days = Math.max(1, Math.floor(params?.days ?? 30));
-    const since = new Date(now);
-    since.setDate(since.getDate() - (days - 1));
-    sinceTime = since.getTime();
-    untilTime = now.getTime();
+function appendParsedEntryToRollup(
+  rollup: SessionUsageRollupData,
+  entry: ParsedTranscriptEntry,
+): { countedRecord: boolean; parsedRecord: boolean } {
+  let usageTotals: CostUsageTotals | undefined;
+  if (entry.usage) {
+    usageTotals = emptyTotals();
+    applyUsageTotals(usageTotals, entry.usage);
+    if (entry.costBreakdown?.total !== undefined) {
+      applyCostBreakdown(usageTotals, entry.costBreakdown);
+    } else {
+      applyCostTotal(usageTotals, entry.costTotal, entry.provider, entry.model);
+    }
   }
+  const timestamp = entry.timestamp?.getTime();
+  appendSessionUsageRollupContribution(rollup, {
+    timestamp,
+    role: entry.role,
+    durationMs: entry.durationMs,
+    provider: entry.provider,
+    model: entry.model,
+    stopReason: entry.stopReason,
+    toolNames: entry.toolNames,
+    toolResultCounts: entry.toolResultCounts,
+    usageTotals,
+  });
+  return { parsedRecord: Boolean(entry.usage), countedRecord: Boolean(entry.usage && timestamp) };
+}
 
-  const dailyMap = new Map<string, CostUsageTotals>();
-  const totals = emptyTotals();
+function scanRecordsIntoRollup(params: {
+  records: Iterable<Record<string, unknown>>;
+  rollup: SessionUsageRollupData;
+  resolveCost: UsageCostResolver;
+}): { countedRecords: number; parsedRecords: number } {
+  let countedRecords = 0;
+  let parsedRecords = 0;
+  for (const record of params.records) {
+    const entry = parseUsageCostTranscriptEntry(record, params.resolveCost);
+    if (!entry) {
+      continue;
+    }
+    const counted = appendParsedEntryToRollup(params.rollup, entry);
+    countedRecords += counted.countedRecord ? 1 : 0;
+    parsedRecords += counted.parsedRecord ? 1 : 0;
+  }
+  return { countedRecords, parsedRecords };
+}
 
-  const sessionsDir = resolveSessionTranscriptsDirForAgent(params?.agentId);
-  const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
-  const files = (
-    await Promise.all(
-      entries
-        .filter((entry) => entry.isFile() && isUsageCountedSessionTranscriptFileName(entry.name))
-        .map(async (entry) => {
-          const filePath = path.join(sessionsDir, entry.name);
-          const stats = await fs.promises.stat(filePath).catch(() => null);
-          if (!stats) {
-            return null;
-          }
-          // Include file if it was modified after our start time
-          if (stats.mtimeMs < sinceTime) {
-            return null;
-          }
-          return filePath;
-        }),
-    )
-  ).filter((filePath): filePath is string => Boolean(filePath));
+async function scanJsonlUsageRollup(params: {
+  file: UsageCostTranscriptFile;
+  previous?: UsageCostStoredRollup;
+  pricingFingerprint: string;
+  resolveCost: UsageCostResolver;
+}): Promise<UsageCostRollupEntry> {
+  const previousCheckpoint =
+    params.previous?.entry.checkpoint.kind === "jsonl"
+      ? params.previous.entry.checkpoint
+      : undefined;
+  const identityMatches =
+    previousCheckpoint &&
+    previousCheckpoint.device === params.file.device &&
+    previousCheckpoint.inode === params.file.inode &&
+    previousCheckpoint.parsedOffset <= params.file.size &&
+    params.file.size > previousCheckpoint.observedSize;
+  const previousAnchor = identityMatches
+    ? await readJsonlAnchorHash(params.file.filePath, previousCheckpoint.parsedOffset)
+    : undefined;
+  const appendOnly = Boolean(
+    identityMatches && previousAnchor === previousCheckpoint?.anchorHash && params.previous,
+  );
+  const startOffset = appendOnly ? (previousCheckpoint?.parsedOffset ?? 0) : 0;
+  const rollup =
+    appendOnly && params.previous
+      ? cloneSessionUsageRollupData(params.previous.entry.rollup)
+      : createSessionUsageRollupData();
+  let countedRecords = 0;
+  let parsedRecords = 0;
+  const processedOffset = await scanJsonlRange({
+    filePath: params.file.filePath,
+    startOffset,
+    endOffset: params.file.size,
+    onRecord: (record) => {
+      const entry = parseUsageCostTranscriptEntry(record, params.resolveCost);
+      if (!entry) {
+        return;
+      }
+      const counted = appendParsedEntryToRollup(rollup, entry);
+      countedRecords += counted.countedRecord ? 1 : 0;
+      parsedRecords += counted.parsedRecord ? 1 : 0;
+    },
+  });
+  const postStats = await fs.promises.stat(params.file.filePath);
+  if (
+    postStats.dev !== params.file.device ||
+    postStats.ino !== params.file.inode ||
+    postStats.size < params.file.size
+  ) {
+    throw new Error(`transcript changed identity while scanning: ${params.file.filePath}`);
+  }
+  const anchorHash = await readJsonlAnchorHash(params.file.filePath, processedOffset);
+  if (!anchorHash) {
+    throw new Error(`transcript checkpoint unavailable: ${params.file.filePath}`);
+  }
+  return {
+    version: USAGE_COST_ROLLUP_VERSION,
+    pricingFingerprint: params.pricingFingerprint,
+    checkpoint: {
+      kind: "jsonl",
+      parsedOffset: processedOffset,
+      observedSize: params.file.size,
+      observedMtimeMs: params.file.mtimeMs,
+      device: params.file.device ?? 0,
+      inode: params.file.inode ?? 0,
+      anchorHash,
+    },
+    scannedAt: Date.now(),
+    parsedRecords: (appendOnly ? (params.previous?.entry.parsedRecords ?? 0) : 0) + parsedRecords,
+    countedRecords:
+      (appendOnly ? (params.previous?.entry.countedRecords ?? 0) : 0) + countedRecords,
+    rollup,
+  };
+}
 
-  for (const filePath of files) {
-    await scanUsageFile({
-      filePath,
-      config: params?.config,
-      onEntry: (entry) => {
-        const ts = entry.timestamp?.getTime();
-        if (!ts || ts < sinceTime || ts > untilTime) {
-          return;
-        }
-        const dayKey = formatDayKey(entry.timestamp ?? now);
-        const bucket = dailyMap.get(dayKey) ?? emptyTotals();
-        applyUsageTotals(bucket, entry.usage);
-        if (entry.costBreakdown?.total !== undefined) {
-          applyCostBreakdown(bucket, entry.costBreakdown);
-        } else {
-          applyCostTotal(bucket, entry.costTotal);
-        }
-        dailyMap.set(dayKey, bucket);
+function selectIncrementalSqliteRecords(
+  records: Record<string, unknown>[],
+  previousLeafId: string | undefined,
+): { records: Record<string, unknown>[]; visibleLeafId?: string } | undefined {
+  let visibleLeafId = previousLeafId;
+  const visible: Record<string, unknown>[] = [];
+  for (const record of records) {
+    if (isSessionTranscriptLeafControl(record) || record.appendMode === "side") {
+      return undefined;
+    }
+    if (!isCanonicalSessionTranscriptEntry(record)) {
+      continue;
+    }
+    const id = typeof record.id === "string" && record.id ? record.id : undefined;
+    if (!id) {
+      return undefined;
+    }
+    if (Object.hasOwn(record, "parentId")) {
+      const parentId = record.parentId === null ? undefined : record.parentId;
+      if (parentId !== visibleLeafId) {
+        return undefined;
+      }
+    }
+    visible.push(record);
+    visibleLeafId = id;
+  }
+  return { records: visible, ...(visibleLeafId ? { visibleLeafId } : {}) };
+}
 
-        applyUsageTotals(totals, entry.usage);
-        if (entry.costBreakdown?.total !== undefined) {
-          applyCostBreakdown(totals, entry.costBreakdown);
-        } else {
-          applyCostTotal(totals, entry.costTotal);
-        }
-      },
+function sqliteCheckpointAnchorHash(event: unknown): string {
+  return hashUsageCostCheckpoint(JSON.stringify(event));
+}
+
+async function scanSqliteUsageRollup(params: {
+  file: UsageCostTranscriptFile;
+  previous?: UsageCostStoredRollup;
+  pricingFingerprint: string;
+  resolveCost: UsageCostResolver;
+}): Promise<UsageCostRollupEntry> {
+  const marker = parseSqliteSessionFileMarker(params.file.filePath);
+  if (!marker) {
+    throw new Error(`invalid SQLite transcript marker: ${params.file.filePath}`);
+  }
+  const maxSeq = params.file.maxSeq ?? 0;
+  const eventCount = params.file.eventCount ?? 0;
+  const scope = {
+    agentId: marker.agentId,
+    sessionId: marker.sessionId,
+    storePath: marker.storePath,
+  };
+  const snapshotLastRow = maxSeq > 0 ? readTranscriptEventAtSeqSync(scope, maxSeq) : undefined;
+  if (maxSeq > 0 && !snapshotLastRow) {
+    throw new Error(`SQLite transcript checkpoint unavailable: ${params.file.filePath}`);
+  }
+  const snapshotAnchorHash = snapshotLastRow
+    ? sqliteCheckpointAnchorHash(snapshotLastRow.event)
+    : hashUsageCostCheckpoint("");
+  const previousCheckpoint =
+    params.previous?.entry.checkpoint.kind === "sqlite"
+      ? params.previous.entry.checkpoint
+      : undefined;
+  const previousAnchor = previousCheckpoint?.maxSeq
+    ? readTranscriptEventAtSeqSync(scope, previousCheckpoint.maxSeq)
+    : undefined;
+  const anchorMatches =
+    previousCheckpoint?.maxSeq === 0 ||
+    (previousAnchor &&
+      sqliteCheckpointAnchorHash(previousAnchor.event) === previousCheckpoint?.anchorHash);
+  const appendCandidate = Boolean(
+    params.previous &&
+    previousCheckpoint &&
+    previousCheckpoint.maxSeq < maxSeq &&
+    previousCheckpoint.eventCount < eventCount &&
+    anchorMatches,
+  );
+  const afterSeq = appendCandidate ? (previousCheckpoint?.maxSeq ?? 0) : 0;
+  const rows = loadTranscriptEventRowsAfterSeqSync(scope, afterSeq, maxSeq);
+  const rawRecords = rows.flatMap((row) =>
+    row.event && typeof row.event === "object" && !Array.isArray(row.event)
+      ? [row.event as Record<string, unknown>]
+      : [],
+  );
+  const incremental = appendCandidate
+    ? selectIncrementalSqliteRecords(rawRecords, previousCheckpoint?.visibleLeafId)
+    : undefined;
+  const appendOnly = Boolean(incremental && params.previous);
+  const allRows = appendOnly ? rows : loadTranscriptEventRowsAfterSeqSync(scope, 0, maxSeq);
+  const allRecords = appendOnly
+    ? (incremental?.records ?? [])
+    : selectVisibleTranscriptEvents(allRows.map((row) => row.event)).flatMap((event) =>
+        event && typeof event === "object" && !Array.isArray(event)
+          ? [event as Record<string, unknown>]
+          : [],
+      );
+  const rollup =
+    appendOnly && params.previous
+      ? cloneSessionUsageRollupData(params.previous.entry.rollup)
+      : createSessionUsageRollupData();
+  const counts = scanRecordsIntoRollup({
+    records: allRecords,
+    rollup,
+    resolveCost: params.resolveCost,
+  });
+  const postFile = await resolveUsageCostTranscriptFile(params.file.filePath);
+  if (!postFile || (postFile.maxSeq ?? 0) < maxSeq || (postFile.eventCount ?? 0) < eventCount) {
+    throw new Error(`SQLite transcript changed while scanning: ${params.file.filePath}`);
+  }
+  const currentLastRow = maxSeq > 0 ? readTranscriptEventAtSeqSync(scope, maxSeq) : undefined;
+  if (
+    (maxSeq > 0 && !currentLastRow) ||
+    (currentLastRow && sqliteCheckpointAnchorHash(currentLastRow.event) !== snapshotAnchorHash)
+  ) {
+    throw new Error(`SQLite transcript changed while scanning: ${params.file.filePath}`);
+  }
+  const visibleLeafId = appendOnly
+    ? incremental?.visibleLeafId
+    : (scanSessionTranscriptTree(allRows.map((row) => row.event)).leafId ?? undefined);
+  return {
+    version: USAGE_COST_ROLLUP_VERSION,
+    pricingFingerprint: params.pricingFingerprint,
+    checkpoint: {
+      kind: "sqlite",
+      maxSeq,
+      eventCount,
+      size: params.file.size,
+      mtimeMs: params.file.mtimeMs,
+      anchorHash: snapshotAnchorHash,
+      ...(visibleLeafId ? { visibleLeafId } : {}),
+    },
+    scannedAt: Date.now(),
+    parsedRecords:
+      (appendOnly ? (params.previous?.entry.parsedRecords ?? 0) : 0) + counts.parsedRecords,
+    countedRecords:
+      (appendOnly ? (params.previous?.entry.countedRecords ?? 0) : 0) + counts.countedRecords,
+    rollup,
+  };
+}
+
+async function scanUsageFileForRollup(params: {
+  file: UsageCostTranscriptFile;
+  previous?: UsageCostStoredRollup;
+  pricingFingerprint: string;
+  resolveCost: UsageCostResolver;
+}): Promise<UsageCostRollupEntry> {
+  return params.file.kind === "sqlite"
+    ? await scanSqliteUsageRollup(params)
+    : await scanJsonlUsageRollup(params);
+}
+
+async function refreshCostUsageCacheForAgent(params: {
+  config?: OpenClawConfig;
+  agentId: string;
+  agentDir?: string;
+  databasePath?: string;
+  maxFiles?: number;
+  sessionsDir?: string;
+  sessionFiles?: string[];
+  startMs?: number;
+}): Promise<UsageCostRefreshResult> {
+  const databasePath = params.databasePath ?? resolveUsageCostCacheDatabasePath(params.agentId);
+  const lock = acquireSessionCostUsageRefreshLock(params.agentId, databasePath);
+  if (!lock.acquired) {
+    return "busy";
+  }
+  try {
+    const agentDir = params.agentDir ?? resolveUsageCostAgentDir(params.config, params.agentId);
+    const pricingFingerprint = resolveUsageCostPricingFingerprint(params.config, agentDir);
+    const rows = readSessionCostUsageRollupRows(params.agentId, databasePath);
+    const rawValues = new Map(rows.map((row) => [row.key, row.valueJson]));
+    const rollups = readUsageCostRollups(params.agentId, pricingFingerprint, databasePath);
+    const discoveredFiles = await listUsageCountedTranscriptFiles(
+      params.agentId,
+      params.sessionsDir ? { sessionsDir: params.sessionsDir } : undefined,
+    );
+    const requestedFiles: UsageCostTranscriptFile[] = [];
+    for (const requested of params.sessionFiles ?? []) {
+      const resolved = await resolveUsageCostTranscriptFile(requested);
+      if (resolved) {
+        requestedFiles.push(resolved);
+      }
+    }
+    const filesByPath = new Map(discoveredFiles.map((file) => [file.filePath, file]));
+    for (const file of requestedFiles) {
+      filesByPath.set(file.filePath, file);
+    }
+    const files = [...filesByPath.values()];
+    deleteSessionCostUsageRollupsExcept({
+      agentId: params.agentId,
+      databasePath,
+      liveKeys: new Set(files.map((file) => file.filePath)),
+    });
+
+    const requestedPaths = new Set<string>();
+    for (const file of requestedFiles) {
+      requestedPaths.add(file.filePath);
+    }
+    const refreshFiles =
+      requestedPaths.size > 0
+        ? files.filter((file) => requestedPaths.has(file.filePath))
+        : params.startMs === undefined
+          ? files
+          : files.filter((file) => file.mtimeMs >= params.startMs!);
+    const maxFiles =
+      params.maxFiles !== undefined && Number.isFinite(params.maxFiles) && params.maxFiles > 0
+        ? Math.floor(params.maxFiles)
+        : undefined;
+    const staleFiles = getUsageCostStaleRollupFiles({ rollups, files: refreshFiles })
+      .toSorted((a, b) => a.size - b.size || a.filePath.localeCompare(b.filePath))
+      .slice(0, maxFiles);
+    const resolveCost = createUsageCostResolver({ config: params.config, agentDir });
+
+    for (const file of staleFiles) {
+      const previous = rollups.get(file.filePath);
+      const entry = await scanUsageFileForRollup({
+        file,
+        previous,
+        pricingFingerprint,
+        resolveCost,
+      });
+      const valueJson = JSON.stringify(entry);
+      const written = writeSessionCostUsageRollup({
+        agentId: params.agentId,
+        databasePath,
+        rollupId: file.filePath,
+        previousValueJson: rawValues.get(file.filePath) ?? null,
+        valueJson,
+        updatedAt: entry.scannedAt,
+      });
+      if (!written) {
+        throw new Error(`usage rollup changed while refreshing: ${file.filePath}`);
+      }
+      rollups.set(file.filePath, { entry, valueJson });
+      rawValues.set(file.filePath, valueJson);
+    }
+    return "refreshed";
+  } finally {
+    lock.release();
+  }
+}
+
+const usageCostRefreshRuntime = { refreshCostUsageCacheForAgent };
+
+async function refreshCostUsageCache(params: {
+  config?: OpenClawConfig;
+  agentId: string;
+  agentDir?: string;
+  maxFiles?: number;
+  sessionFiles?: string[];
+  startMs?: number;
+}): Promise<UsageCostRefreshResult> {
+  return await refreshCostUsageCacheForAgent(params);
+}
+
+export async function loadCostUsageSummaryFromCache(params: {
+  startMs: number;
+  endMs: number;
+  dayBucket?: UsageDailyBucket;
+  config?: OpenClawConfig;
+  agentId: string;
+  requestRefresh?: boolean;
+  refreshMode?: "background" | "sync-when-empty";
+}): Promise<CostUsageSummary> {
+  const agentDir = resolveUsageCostAgentDir(params.config, params.agentId);
+  const databasePath = resolveUsageCostCacheDatabasePath(params.agentId);
+  const pricingFingerprint = resolveUsageCostPricingFingerprint(params.config, agentDir);
+  let rollups = readUsageCostRollups(params.agentId, pricingFingerprint, databasePath);
+  let files = await listUsageCountedTranscriptFiles(params.agentId);
+  const staleFiles = getUsageCostStaleRollupFiles({ rollups, files });
+  if (params.requestRefresh !== false && staleFiles.length > 0) {
+    const cachedFiles = countUsableUsageCostRollups({ rollups, files });
+    if (params.refreshMode === "sync-when-empty" && cachedFiles === 0) {
+      const result = await refreshCostUsageCache({
+        config: params.config,
+        agentId: params.agentId,
+        agentDir,
+        startMs: params.startMs,
+      });
+      rollups = readUsageCostRollups(params.agentId, pricingFingerprint, databasePath);
+      files = await listUsageCountedTranscriptFiles(params.agentId);
+      if (result === "refreshed" && getUsageCostStaleRollupFiles({ rollups, files }).length > 0) {
+        requestCostUsageCacheRefresh({ config: params.config, agentId: params.agentId });
+      }
+    } else {
+      requestCostUsageCacheRefresh({ config: params.config, agentId: params.agentId });
+    }
+  }
+  return buildCostUsageSummaryFromRollups({
+    rollups,
+    files,
+    startMs: params.startMs,
+    endMs: params.endMs,
+    dayBucket: params.dayBucket,
+    refreshing:
+      usageCostRefreshes.has(databasePath) ||
+      isSessionCostUsageRefreshRunning(params.agentId, databasePath),
+  });
+}
+
+export async function loadSessionCostSummariesFromCache(params: {
+  sessions: Array<{ sessionId?: string; sessionFile: string }>;
+  config?: OpenClawConfig;
+  agentId: string;
+  startMs?: number;
+  endMs?: number;
+  includeUntimestamped?: boolean;
+  dayBucket?: UsageDailyBucket;
+  requestRefresh?: boolean;
+}): Promise<{ summaries: Array<SessionCostSummary | null>; cacheStatus: UsageCacheStatus }> {
+  const agentDir = resolveUsageCostAgentDir(params.config, params.agentId);
+  const databasePath = resolveUsageCostCacheDatabasePath(params.agentId);
+  const pricingFingerprint = resolveUsageCostPricingFingerprint(params.config, agentDir);
+  const rollups = readUsageCostRollups(params.agentId, pricingFingerprint, databasePath);
+  const fileTasks = params.sessions.map(
+    (session) => async () => await resolveUsageCostTranscriptFile(session.sessionFile),
+  );
+  const { results: files } = await runTasksWithConcurrency({
+    tasks: fileTasks,
+    limit: USAGE_COST_TRANSCRIPT_STAT_CONCURRENCY,
+  });
+  const staleFiles = new Set<string>();
+  let cachedFiles = 0;
+  const hasExplicitRange = params.startMs !== undefined || params.endMs !== undefined;
+  const startMs = params.startMs ?? Number.NEGATIVE_INFINITY;
+  const endMs = params.endMs ?? Number.POSITIVE_INFINITY;
+  const dayFormatter = createUsageDayKeyFormatter(params.dayBucket);
+  const summaries = params.sessions.map((session, index) => {
+    const file = files[index];
+    const stored = file ? rollups.get(file.filePath) : undefined;
+    if (!file || !stored || !isUsageCostRollupFresh({ stored, file })) {
+      staleFiles.add(file?.filePath ?? session.sessionFile);
+      return null;
+    }
+    cachedFiles += 1;
+    return buildSessionCostSummaryFromRollup({
+      rollup: stored.entry.rollup,
+      sessionId: session.sessionId,
+      sessionFile: session.sessionFile,
+      startMs,
+      endMs,
+      includeUntimestamped: params.includeUntimestamped === true || !hasExplicitRange,
+      formatDay: dayFormatter,
+    });
+  });
+  const refreshRequested = params.requestRefresh !== false && staleFiles.size > 0;
+  if (refreshRequested) {
+    requestCostUsageCacheRefresh({
+      config: params.config,
+      agentId: params.agentId,
+      sessionFiles: [...staleFiles],
     });
   }
-
-  const daily = Array.from(dailyMap.entries())
-    .map(([date, bucket]) => Object.assign({ date }, bucket))
-    .toSorted((a, b) => a.date.localeCompare(b.date));
-
-  // Calculate days for backwards compatibility in response
-  const days = Math.ceil((untilTime - sinceTime) / (24 * 60 * 60 * 1000)) + 1;
-
+  const refreshRunning = isSessionCostUsageRefreshRunning(params.agentId, databasePath);
   return {
-    updatedAt: Date.now(),
-    days,
-    daily,
-    totals,
+    summaries,
+    cacheStatus: {
+      status:
+        staleFiles.size === 0
+          ? "fresh"
+          : refreshRunning || refreshRequested
+            ? "refreshing"
+            : cachedFiles > 0
+              ? "partial"
+              : "stale",
+      cachedFiles,
+      pendingFiles: staleFiles.size,
+      staleFiles: staleFiles.size,
+      refreshedAt: latestUsageCostRollupScan(rollups),
+    },
+  };
+}
+
+function requestCostUsageCacheRefresh(params: {
+  config?: OpenClawConfig;
+  agentId: string;
+  sessionFiles?: string[];
+}): void {
+  const databasePath = resolveUsageCostCacheDatabasePath(params.agentId);
+  const refreshKey = databasePath;
+  const existing = usageCostRefreshes.get(refreshKey);
+  if (existing) {
+    mergeUsageCostRefreshRequest(existing, params);
+    return;
+  }
+
+  const state: UsageCostRefreshState = {
+    agentId: params.agentId,
+    config: params.config,
+    databasePath,
+    fullRefreshRequested: false,
+    pendingSessionFiles: new Set(),
+    running: false,
+    sessionsDir: resolveSessionTranscriptsDirForAgent(params.agentId),
+    busyRetryDelayMs: USAGE_COST_REFRESH_RETRY_MIN_MS,
+  };
+  mergeUsageCostRefreshRequest(state, params);
+  usageCostRefreshes.set(refreshKey, state);
+  scheduleUsageCostRefresh(refreshKey, state);
+}
+
+function mergeUsageCostRefreshRequest(
+  state: UsageCostRefreshState,
+  params: {
+    config?: OpenClawConfig;
+    agentId: string;
+    sessionFiles?: string[];
+  },
+): void {
+  if (params.config) {
+    state.config = params.config;
+  }
+  state.agentId = params.agentId;
+  if (!params.sessionFiles) {
+    state.fullRefreshRequested = true;
+    return;
+  }
+  for (const sessionFile of params.sessionFiles) {
+    state.pendingSessionFiles.add(sessionFile);
+  }
+}
+
+function scheduleUsageCostRefresh(
+  refreshKey: string,
+  state: UsageCostRefreshState,
+  delayMs = 0,
+): void {
+  if (state.running || state.timer) {
+    return;
+  }
+  const timer = setTimeout(() => {
+    state.timer = undefined;
+    void runQueuedUsageCostRefresh(refreshKey, state);
+  }, delayMs);
+  timer.unref?.();
+  state.timer = timer;
+}
+
+async function runQueuedUsageCostRefresh(
+  refreshKey: string,
+  state: UsageCostRefreshState,
+): Promise<void> {
+  state.running = true;
+  let retryDelayMs = 0;
+  try {
+    while (state.fullRefreshRequested || state.pendingSessionFiles.size > 0) {
+      const fullRefreshRequested = state.fullRefreshRequested;
+      const sessionFiles = fullRefreshRequested ? [] : [...state.pendingSessionFiles];
+      if (!fullRefreshRequested) {
+        state.pendingSessionFiles.clear();
+      }
+      state.fullRefreshRequested = false;
+      const result = await usageCostRefreshRuntime.refreshCostUsageCacheForAgent({
+        config: state.config,
+        agentId: state.agentId,
+        databasePath: state.databasePath,
+        sessionsDir: state.sessionsDir,
+        sessionFiles: fullRefreshRequested ? undefined : sessionFiles,
+      });
+      if (result === "busy") {
+        if (fullRefreshRequested) {
+          state.fullRefreshRequested = true;
+        } else {
+          for (const sessionFile of sessionFiles) {
+            state.pendingSessionFiles.add(sessionFile);
+          }
+        }
+        retryDelayMs = state.busyRetryDelayMs;
+        // Contention among many per-agent refreshes must degrade to polling, not a 20Hz spin.
+        state.busyRetryDelayMs = Math.min(
+          state.busyRetryDelayMs * 2,
+          USAGE_COST_REFRESH_RETRY_MAX_MS,
+        );
+        break;
+      }
+      state.busyRetryDelayMs = USAGE_COST_REFRESH_RETRY_MIN_MS;
+    }
+  } catch (error) {
+    logger.warn(`background refresh failed: ${formatErrorMessage(error)}`, { error });
+  } finally {
+    state.running = false;
+    if (state.fullRefreshRequested || state.pendingSessionFiles.size > 0) {
+      scheduleUsageCostRefresh(refreshKey, state, retryDelayMs);
+    } else {
+      usageCostRefreshes.delete(refreshKey);
+    }
+  }
+}
+
+function clearUsageCostRefreshesForTest(): void {
+  for (const state of usageCostRefreshes.values()) {
+    if (state.timer) {
+      clearTimeout(state.timer);
+    }
+  }
+  usageCostRefreshes.clear();
+}
+
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.sessionCostUsageTestApi")] = {
+    requestCostUsageCacheRefresh,
+    usageCostRefreshRuntime,
+    clearUsageCostRefreshesForTest,
   };
 }
 
@@ -454,72 +1886,65 @@ export async function loadCostUsageSummary(params?: {
  * Scan all transcript files to discover sessions not in the session store.
  * Returns basic metadata for each discovered session.
  */
-export async function discoverAllSessions(params?: {
-  agentId?: string;
+export async function discoverAllSessions(params: {
+  agentId: string;
   startMs?: number;
   endMs?: number;
+  includeFirstUserMessage?: boolean;
 }): Promise<DiscoveredSession[]> {
-  const sessionsDir = resolveSessionTranscriptsDirForAgent(params?.agentId);
-  const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
+  const files = await listUsageCountedTranscriptStats(params.agentId, {
+    minMtimeMs: params.startMs,
+  });
 
   const discovered = new Map<string, DiscoveredSession>();
 
-  for (const entry of entries) {
-    if (!entry.isFile() || !isUsageCountedSessionTranscriptFileName(entry.name)) {
-      continue;
-    }
-
-    const filePath = path.join(sessionsDir, entry.name);
-    const stats = await fs.promises.stat(filePath).catch(() => null);
-    if (!stats) {
-      continue;
-    }
-
-    // Filter by date range if provided
-    if (params?.startMs && stats.mtimeMs < params.startMs) {
-      continue;
-    }
+  for (const file of files) {
     // Do not exclude by endMs: a session can have activity in range even if it continued later.
+    const filePath = file.filePath;
+    const fileName = path.basename(filePath);
+    const sqliteMarker = parseSqliteSessionFileMarker(filePath);
 
-    const sessionId = parseUsageCountedSessionIdFromFileName(entry.name);
+    const sessionId = sqliteMarker?.sessionId ?? parseUsageCountedSessionIdFromFileName(fileName);
     if (!sessionId) {
       continue;
     }
-    const isPrimaryTranscript = isPrimarySessionTranscriptFileName(entry.name);
+    const isPrimaryTranscript = sqliteMarker ? true : isPrimarySessionTranscriptFileName(fileName);
 
     // Try to read first user message for label extraction
     let firstUserMessage: string | undefined;
-    try {
-      for await (const parsed of readJsonlRecords(filePath)) {
-        try {
-          const message = parsed.message as Record<string, unknown> | undefined;
-          if (message?.role === "user") {
-            const content = message.content;
-            if (typeof content === "string") {
-              firstUserMessage = content.slice(0, 100);
-            } else if (Array.isArray(content)) {
-              for (const block of content) {
-                if (
-                  typeof block === "object" &&
-                  block &&
-                  (block as Record<string, unknown>).type === "text"
-                ) {
-                  const text = (block as Record<string, unknown>).text;
-                  if (typeof text === "string") {
-                    firstUserMessage = text.slice(0, 100);
+    if (params.includeFirstUserMessage !== false) {
+      try {
+        for await (const parsed of readTranscriptRecords(filePath)) {
+          try {
+            const message = parsed.message as Record<string, unknown> | undefined;
+            if (message?.role === "user") {
+              const content = message.content;
+              if (typeof content === "string") {
+                firstUserMessage = truncateUtf16Safe(content, 100);
+              } else if (Array.isArray(content)) {
+                for (const block of content) {
+                  if (
+                    typeof block === "object" &&
+                    block &&
+                    (block as Record<string, unknown>).type === "text"
+                  ) {
+                    const text = (block as Record<string, unknown>).text;
+                    if (typeof text === "string") {
+                      firstUserMessage = truncateUtf16Safe(text, 100);
+                    }
+                    break;
                   }
-                  break;
                 }
               }
+              break; // Found first user message
             }
-            break; // Found first user message
+          } catch {
+            // Skip malformed lines
           }
-        } catch {
-          // Skip malformed lines
         }
+      } catch {
+        // Ignore read errors
       }
-    } catch {
-      // Ignore read errors
     }
 
     const existing = discovered.get(sessionId);
@@ -529,13 +1954,13 @@ export async function discoverAllSessions(params?: {
     const shouldReplace =
       !existing ||
       (isPrimaryTranscript && !existingIsPrimary) ||
-      (isPrimaryTranscript === existingIsPrimary && stats.mtimeMs >= existing.mtime);
+      (isPrimaryTranscript === existingIsPrimary && file.mtimeMs >= existing.mtime);
 
     if (shouldReplace) {
       discovered.set(sessionId, {
         sessionId,
         sessionFile: filePath,
-        mtime: stats.mtimeMs,
+        mtime: file.mtimeMs,
         firstUserMessage: firstUserMessage ?? existing?.firstUserMessage,
       });
       continue;
@@ -556,271 +1981,58 @@ export async function loadSessionCostSummary(params: {
   sessionEntry?: SessionEntry;
   sessionFile?: string;
   config?: OpenClawConfig;
-  agentId?: string;
+  agentId: string;
   startMs?: number;
   endMs?: number;
+  includeUntimestamped?: boolean;
+  dayBucket?: UsageDailyBucket;
 }): Promise<SessionCostSummary | null> {
   const sessionFile = resolveExistingUsageSessionFile(params);
-  if (!sessionFile || !fs.existsSync(sessionFile)) {
+  if (!sessionFile) {
     return null;
   }
-
-  const totals = emptyTotals();
-  let firstActivity: number | undefined;
-  let lastActivity: number | undefined;
-  const activityDatesSet = new Set<string>();
-  const dailyMap = new Map<string, { tokens: number; cost: number }>();
-  const dailyMessageMap = new Map<string, SessionDailyMessageCounts>();
-  const dailyLatencyMap = new Map<string, number[]>();
-  const dailyModelUsageMap = new Map<string, SessionDailyModelUsage>();
-  const messageCounts: SessionMessageCounts = {
-    total: 0,
-    user: 0,
-    assistant: 0,
-    toolCalls: 0,
-    toolResults: 0,
-    errors: 0,
-  };
-  const toolUsageMap = new Map<string, number>();
-  const modelUsageMap = new Map<string, SessionModelUsage>();
-  const errorStopReasons = new Set(["error", "aborted", "timeout"]);
-  const latencyValues: number[] = [];
-  let lastUserTimestamp: number | undefined;
-  const MAX_LATENCY_MS = 12 * 60 * 60 * 1000;
-
-  await scanTranscriptFile({
-    filePath: sessionFile,
-    config: params.config,
-    onEntry: (entry) => {
-      const ts = entry.timestamp?.getTime();
-
-      // Filter by date range if specified
-      if (params.startMs !== undefined && ts !== undefined && ts < params.startMs) {
-        return;
-      }
-      if (params.endMs !== undefined && ts !== undefined && ts > params.endMs) {
-        return;
-      }
-
-      if (ts !== undefined) {
-        if (!firstActivity || ts < firstActivity) {
-          firstActivity = ts;
-        }
-        if (!lastActivity || ts > lastActivity) {
-          lastActivity = ts;
-        }
-      }
-
-      if (entry.role === "user") {
-        messageCounts.user += 1;
-        messageCounts.total += 1;
-        if (entry.timestamp) {
-          lastUserTimestamp = entry.timestamp.getTime();
-        }
-      }
-      if (entry.role === "assistant") {
-        messageCounts.assistant += 1;
-        messageCounts.total += 1;
-        const ts = entry.timestamp?.getTime();
-        if (ts !== undefined) {
-          const latencyMs =
-            entry.durationMs ??
-            (lastUserTimestamp !== undefined ? Math.max(0, ts - lastUserTimestamp) : undefined);
-          if (
-            latencyMs !== undefined &&
-            Number.isFinite(latencyMs) &&
-            latencyMs <= MAX_LATENCY_MS
-          ) {
-            latencyValues.push(latencyMs);
-            const dayKey = formatDayKey(entry.timestamp ?? new Date(ts));
-            const dailyLatencies = dailyLatencyMap.get(dayKey) ?? [];
-            dailyLatencies.push(latencyMs);
-            dailyLatencyMap.set(dayKey, dailyLatencies);
-          }
-        }
-      }
-
-      if (entry.toolNames.length > 0) {
-        messageCounts.toolCalls += entry.toolNames.length;
-        for (const name of entry.toolNames) {
-          toolUsageMap.set(name, (toolUsageMap.get(name) ?? 0) + 1);
-        }
-      }
-
-      if (entry.toolResultCounts.total > 0) {
-        messageCounts.toolResults += entry.toolResultCounts.total;
-        messageCounts.errors += entry.toolResultCounts.errors;
-      }
-
-      if (entry.stopReason && errorStopReasons.has(entry.stopReason)) {
-        messageCounts.errors += 1;
-      }
-
-      if (entry.timestamp) {
-        const dayKey = formatDayKey(entry.timestamp);
-        activityDatesSet.add(dayKey);
-        const daily = dailyMessageMap.get(dayKey) ?? {
-          date: dayKey,
-          total: 0,
-          user: 0,
-          assistant: 0,
-          toolCalls: 0,
-          toolResults: 0,
-          errors: 0,
-        };
-        daily.total += entry.role === "user" || entry.role === "assistant" ? 1 : 0;
-        if (entry.role === "user") {
-          daily.user += 1;
-        } else if (entry.role === "assistant") {
-          daily.assistant += 1;
-        }
-        daily.toolCalls += entry.toolNames.length;
-        daily.toolResults += entry.toolResultCounts.total;
-        daily.errors += entry.toolResultCounts.errors;
-        if (entry.stopReason && errorStopReasons.has(entry.stopReason)) {
-          daily.errors += 1;
-        }
-        dailyMessageMap.set(dayKey, daily);
-      }
-
-      if (!entry.usage) {
-        return;
-      }
-
-      applyUsageTotals(totals, entry.usage);
-      if (entry.costBreakdown?.total !== undefined) {
-        applyCostBreakdown(totals, entry.costBreakdown);
-      } else {
-        applyCostTotal(totals, entry.costTotal);
-      }
-
-      if (entry.timestamp) {
-        const dayKey = formatDayKey(entry.timestamp);
-        const entryTokens =
-          (entry.usage.input ?? 0) +
-          (entry.usage.output ?? 0) +
-          (entry.usage.cacheRead ?? 0) +
-          (entry.usage.cacheWrite ?? 0);
-        const entryCost =
-          entry.costBreakdown?.total ??
-          (entry.costBreakdown
-            ? (entry.costBreakdown.input ?? 0) +
-              (entry.costBreakdown.output ?? 0) +
-              (entry.costBreakdown.cacheRead ?? 0) +
-              (entry.costBreakdown.cacheWrite ?? 0)
-            : (entry.costTotal ?? 0));
-
-        const existing = dailyMap.get(dayKey) ?? { tokens: 0, cost: 0 };
-        dailyMap.set(dayKey, {
-          tokens: existing.tokens + entryTokens,
-          cost: existing.cost + entryCost,
-        });
-
-        if (entry.provider || entry.model) {
-          const modelKey = `${dayKey}::${entry.provider ?? "unknown"}::${entry.model ?? "unknown"}`;
-          const dailyModel =
-            dailyModelUsageMap.get(modelKey) ??
-            ({
-              date: dayKey,
-              provider: entry.provider,
-              model: entry.model,
-              tokens: 0,
-              cost: 0,
-              count: 0,
-            } as SessionDailyModelUsage);
-          dailyModel.tokens += entryTokens;
-          dailyModel.cost += entryCost;
-          dailyModel.count += 1;
-          dailyModelUsageMap.set(modelKey, dailyModel);
-        }
-      }
-
-      if (entry.provider || entry.model) {
-        const key = `${entry.provider ?? "unknown"}::${entry.model ?? "unknown"}`;
-        const existing =
-          modelUsageMap.get(key) ??
-          ({
-            provider: entry.provider,
-            model: entry.model,
-            count: 0,
-            totals: emptyTotals(),
-          } as SessionModelUsage);
-        existing.count += 1;
-        applyUsageTotals(existing.totals, entry.usage);
-        if (entry.costBreakdown?.total !== undefined) {
-          applyCostBreakdown(existing.totals, entry.costBreakdown);
-        } else {
-          applyCostTotal(existing.totals, entry.costTotal);
-        }
-        modelUsageMap.set(key, existing);
-      }
-    },
-  });
-
-  // Convert daily map to sorted array
-  const dailyBreakdown: SessionDailyUsage[] = Array.from(dailyMap.entries())
-    .map(([date, data]) => ({ date, tokens: data.tokens, cost: data.cost }))
-    .toSorted((a, b) => a.date.localeCompare(b.date));
-
-  const dailyMessageCounts: SessionDailyMessageCounts[] = Array.from(
-    dailyMessageMap.values(),
-  ).toSorted((a, b) => a.date.localeCompare(b.date));
-
-  const dailyLatency: SessionDailyLatency[] = Array.from(dailyLatencyMap.entries())
-    .map(([date, values]) => {
-      const stats = computeLatencyStats(values);
-      if (!stats) {
-        return null;
-      }
-      return Object.assign({ date }, stats);
-    })
-    .filter((entry): entry is SessionDailyLatency => Boolean(entry))
-    .toSorted((a, b) => a.date.localeCompare(b.date));
-
-  const dailyModelUsage: SessionDailyModelUsage[] = Array.from(
-    dailyModelUsageMap.values(),
-  ).toSorted((a, b) => a.date.localeCompare(b.date) || b.cost - a.cost);
-
-  const toolUsage: SessionToolUsage | undefined = toolUsageMap.size
-    ? {
-        totalCalls: Array.from(toolUsageMap.values()).reduce((sum, count) => sum + count, 0),
-        uniqueTools: toolUsageMap.size,
-        tools: Array.from(toolUsageMap.entries())
-          .map(([name, count]) => ({ name, count }))
-          .toSorted((a, b) => b.count - a.count),
-      }
-    : undefined;
-
-  const modelUsage = modelUsageMap.size
-    ? Array.from(modelUsageMap.values()).toSorted((a, b) => {
-        const costDiff = (b.totals?.totalCost ?? 0) - (a.totals?.totalCost ?? 0);
-        if (costDiff !== 0) {
-          return costDiff;
-        }
-        return (b.totals?.totalTokens ?? 0) - (a.totals?.totalTokens ?? 0);
-      })
-    : undefined;
-
-  return {
+  const file = await resolveUsageCostTranscriptFile(sessionFile);
+  if (!file) {
+    return null;
+  }
+  const agentDir = resolveUsageCostAgentDir(params.config, params.agentId);
+  const databasePath = resolveUsageCostCacheDatabasePath(params.agentId);
+  while (
+    (await refreshCostUsageCacheForAgent({
+      config: params.config,
+      agentId: params.agentId,
+      agentDir,
+      databasePath,
+      sessionFiles: [sessionFile],
+    })) === "busy"
+  ) {
+    // Direct detail callers require the requested session, unlike background
+    // summary refreshes. Wait for the agent-wide writer to release, then retry.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, USAGE_COST_DIRECT_REFRESH_RETRY_MS);
+    });
+  }
+  const currentFile = await resolveUsageCostTranscriptFile(sessionFile);
+  if (!currentFile) {
+    return null;
+  }
+  const pricingFingerprint = resolveUsageCostPricingFingerprint(params.config, agentDir);
+  const stored = readUsageCostRollups(params.agentId, pricingFingerprint, databasePath).get(
+    currentFile.filePath,
+  );
+  if (!stored || !isUsageCostRollupFresh({ stored, file: currentFile })) {
+    return null;
+  }
+  const hasExplicitRange = params.startMs !== undefined || params.endMs !== undefined;
+  return buildSessionCostSummaryFromRollup({
+    rollup: stored.entry.rollup,
     sessionId: params.sessionId,
     sessionFile,
-    firstActivity,
-    lastActivity,
-    durationMs:
-      firstActivity !== undefined && lastActivity !== undefined
-        ? Math.max(0, lastActivity - firstActivity)
-        : undefined,
-    activityDates: Array.from(activityDatesSet).toSorted(),
-    dailyBreakdown,
-    dailyMessageCounts,
-    dailyLatency: dailyLatency.length ? dailyLatency : undefined,
-    dailyModelUsage: dailyModelUsage.length ? dailyModelUsage : undefined,
-    messageCounts,
-    toolUsage,
-    modelUsage,
-    latency: computeLatencyStats(latencyValues),
-    ...totals,
-  };
+    startMs: params.startMs ?? Number.NEGATIVE_INFINITY,
+    endMs: params.endMs ?? Number.POSITIVE_INFINITY,
+    includeUntimestamped: params.includeUntimestamped === true || !hasExplicitRange,
+    formatDay: createUsageDayKeyFormatter(params.dayBucket),
+  });
 }
 
 export async function loadSessionUsageTimeSeries(params: {
@@ -828,36 +2040,41 @@ export async function loadSessionUsageTimeSeries(params: {
   sessionEntry?: SessionEntry;
   sessionFile?: string;
   config?: OpenClawConfig;
-  agentId?: string;
+  agentId: string;
   maxPoints?: number;
 }): Promise<SessionUsageTimeSeries | null> {
   const sessionFile = resolveExistingUsageSessionFile(params);
-  if (!sessionFile || !fs.existsSync(sessionFile)) {
+  if (!sessionFile) {
+    return null;
+  }
+  if (!parseSqliteSessionFileMarker(sessionFile) && !fs.existsSync(sessionFile)) {
     return null;
   }
 
-  const points: SessionUsageTimePoint[] = [];
-  let cumulativeTokens = 0;
-  let cumulativeCost = 0;
+  if (params.maxPoints !== undefined && params.maxPoints !== null) {
+    if (!Number.isFinite(params.maxPoints) || params.maxPoints <= 0) {
+      return { sessionId: params.sessionId, points: [] };
+    }
+  }
+
+  const points: Array<Omit<SessionUsageTimePoint, "cumulativeTokens" | "cumulativeCost">> = [];
+  const agentDir = resolveUsageCostAgentDir(params.config, params.agentId);
+  const resolveCost = createUsageCostResolver({ config: params.config, agentDir });
 
   await scanUsageFile({
     filePath: sessionFile,
     config: params.config,
+    resolveCost,
     onEntry: (entry) => {
       const ts = entry.timestamp?.getTime();
       if (!ts) {
         return;
       }
 
-      const input = entry.usage.input ?? 0;
-      const output = entry.usage.output ?? 0;
-      const cacheRead = entry.usage.cacheRead ?? 0;
-      const cacheWrite = entry.usage.cacheWrite ?? 0;
-      const totalTokens = entry.usage.total ?? input + output + cacheRead + cacheWrite;
+      const { input, output, cacheRead, cacheWrite, totalTokens } = computeUsageTokenTotals(
+        entry.usage,
+      );
       const cost = entry.costTotal ?? 0;
-
-      cumulativeTokens += totalTokens;
-      cumulativeCost += cost;
 
       points.push({
         timestamp: ts,
@@ -867,14 +2084,20 @@ export async function loadSessionUsageTimeSeries(params: {
         cacheWrite,
         totalTokens,
         cost,
-        cumulativeTokens,
-        cumulativeCost,
       });
     },
   });
 
   // Sort by timestamp
-  const sortedPoints = points.toSorted((a, b) => a.timestamp - b.timestamp);
+  let cumulativeTokens = 0;
+  let cumulativeCost = 0;
+  const sortedPoints: SessionUsageTimePoint[] = points
+    .toSorted((a, b) => a.timestamp - b.timestamp)
+    .map((point) => {
+      cumulativeTokens += point.totalTokens;
+      cumulativeCost += point.cost;
+      return Object.assign(point, { cumulativeTokens, cumulativeCost });
+    });
 
   // Optionally downsample if too many points
   const maxPoints = params.maxPoints ?? 100;
@@ -931,18 +2154,30 @@ export async function loadSessionLogs(params: {
   sessionEntry?: SessionEntry;
   sessionFile?: string;
   config?: OpenClawConfig;
-  agentId?: string;
+  agentId: string;
   limit?: number;
 }): Promise<SessionLogEntry[] | null> {
   const sessionFile = resolveExistingUsageSessionFile(params);
-  if (!sessionFile || !fs.existsSync(sessionFile)) {
+  if (!sessionFile) {
+    return null;
+  }
+  if (!parseSqliteSessionFileMarker(sessionFile) && !fs.existsSync(sessionFile)) {
     return null;
   }
 
   const logs: SessionLogEntry[] = [];
+  if (params.limit !== undefined && params.limit !== null) {
+    if (!Number.isFinite(params.limit) || params.limit <= 0) {
+      return [];
+    }
+  }
   const limit = params.limit ?? 50;
+  const boundedLimit = Number.isInteger(limit);
+  const retentionLimit = limit * 2;
+  const agentDir = resolveUsageCostAgentDir(params.config, params.agentId);
+  const resolveCost = createUsageCostResolver({ config: params.config, agentDir });
 
-  for await (const parsed of readJsonlRecords(sessionFile)) {
+  for await (const parsed of readTranscriptRecordsBestEffort(sessionFile)) {
     try {
       const message = parsed.message as Record<string, unknown> | undefined;
       if (!message) {
@@ -1024,19 +2259,16 @@ export async function loadSessionLogs(params: {
         continue;
       }
 
-      // Truncate very long content
+      // Truncate very long content.
       const maxLen = 2000;
       if (content.length > maxLen) {
-        content = content.slice(0, maxLen) + "…";
+        content = truncateUtf16Safe(content, maxLen) + "…";
       }
 
       // Get timestamp
-      let timestamp = 0;
-      if (typeof parsed.timestamp === "string") {
-        timestamp = new Date(parsed.timestamp).getTime();
-      } else if (typeof message.timestamp === "number") {
-        timestamp = message.timestamp;
-      }
+      // Keep detail logs on the usage-summary timestamp path, including nested
+      // fallback; direct Date parsing can leak NaN as null through Gateway JSON.
+      const timestamp = parseTimestamp(parsed)?.getTime() ?? 0;
 
       // Get usage for assistant messages
       let tokens: number | undefined;
@@ -1052,14 +2284,25 @@ export async function loadSessionLogs(params: {
               (usage.cacheRead ?? 0) +
               (usage.cacheWrite ?? 0);
           const breakdown = extractCostBreakdown(usageRaw);
-          if (breakdown?.total !== undefined) {
+          const costConfig = resolveCost({
+            provider:
+              (typeof message.provider === "string" ? message.provider : undefined) ??
+              (typeof parsed.provider === "string" ? parsed.provider : undefined),
+            model:
+              (typeof message.model === "string" ? message.model : undefined) ??
+              (typeof parsed.model === "string" ? parsed.model : undefined),
+          });
+          if (
+            breakdown?.total !== undefined &&
+            !shouldRecomputeRecordedZeroCost({
+              usage,
+              cost: costConfig,
+              costBreakdown: breakdown,
+              costTotal: breakdown.total,
+            })
+          ) {
             cost = breakdown.total;
           } else {
-            const costConfig = resolveModelCostConfig({
-              provider: message.provider as string | undefined,
-              model: message.model as string | undefined,
-              config: params.config,
-            });
             cost = estimateUsageCost({ usage, cost: costConfig });
           }
         }
@@ -1072,18 +2315,29 @@ export async function loadSessionLogs(params: {
         tokens,
         cost,
       });
+      // Timestamps can arrive out of order, so keep a bounded sorted window instead
+      // of relying on transcript append order or retaining the whole file.
+      if (boundedLimit && logs.length > retentionLimit) {
+        logs.sort((a, b) => a.timestamp - b.timestamp);
+        logs.splice(0, logs.length - limit);
+      }
     } catch {
       // Ignore malformed lines
     }
   }
 
   // Sort by timestamp and limit
-  const sortedLogs = logs.toSorted((a, b) => a.timestamp - b.timestamp);
+  if (boundedLimit) {
+    logs.sort((a, b) => a.timestamp - b.timestamp);
+    return logs.length > limit ? logs.slice(-limit) : logs;
+  }
 
   // Return most recent logs
+  const sortedLogs = logs.toSorted((a, b) => a.timestamp - b.timestamp);
   if (sortedLogs.length > limit) {
     return sortedLogs.slice(-limit);
   }
 
   return sortedLogs;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

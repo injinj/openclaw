@@ -5,11 +5,17 @@
 
 import {
   DEFAULT_ACCOUNT_ID,
+  hasConfiguredAccountValue,
   listCombinedAccountIds,
   resolveMergedAccountConfig,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/account-resolution";
 import { resolveDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-name-runtime";
+import { parseStrictInteger } from "openclaw/plugin-sdk/number-runtime";
+import {
+  normalizeOptionalString,
+  normalizeStringEntries,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import type {
   SynologyChatChannelConfig,
   ResolvedSynologyChatAccount,
@@ -22,7 +28,10 @@ function getChannelConfig(cfg: OpenClawConfig): SynologyChatChannelConfig | unde
 }
 
 function resolveImplicitAccountId(channelCfg: SynologyChatChannelConfig): string | undefined {
-  return channelCfg.token || process.env.SYNOLOGY_CHAT_TOKEN ? DEFAULT_ACCOUNT_ID : undefined;
+  return hasConfiguredAccountValue(channelCfg.token) ||
+    hasConfiguredAccountValue(process.env.SYNOLOGY_CHAT_TOKEN)
+    ? DEFAULT_ACCOUNT_ID
+    : undefined;
 }
 
 function getRawAccountConfig(
@@ -61,21 +70,26 @@ function parseAllowedUserIds(raw: string | string[] | undefined): string[] {
   if (Array.isArray(raw)) {
     return raw.filter(Boolean);
   }
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return normalizeStringEntries(raw.split(","));
+}
+
+function normalizeRateLimitPerMinuteValue(raw: unknown): number | undefined {
+  if (typeof raw === "number") {
+    return Number.isSafeInteger(raw) && raw >= 0 ? raw : undefined;
+  }
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined;
+  }
+  const parsed = parseStrictInteger(trimmed);
+  return parsed != null && parsed >= 0 ? parsed : undefined;
 }
 
 function parseRateLimitPerMinute(raw: string | undefined): number {
-  if (raw == null) {
-    return 30;
-  }
-  const trimmed = raw.trim();
-  if (!/^-?\d+$/.test(trimmed)) {
-    return 30;
-  }
-  return Number.parseInt(trimmed, 10);
+  return normalizeRateLimitPerMinuteValue(raw) ?? 30;
 }
 
 /**
@@ -116,12 +130,12 @@ export function resolveAccount(
   });
 
   // Env var fallbacks (primarily for the "default" account)
-  const envToken = process.env.SYNOLOGY_CHAT_TOKEN ?? "";
-  const envIncomingUrl = process.env.SYNOLOGY_CHAT_INCOMING_URL ?? "";
-  const envNasHost = process.env.SYNOLOGY_NAS_HOST ?? "localhost";
-  const envAllowedUserIds = process.env.SYNOLOGY_ALLOWED_USER_IDS ?? "";
+  const envToken = normalizeOptionalString(process.env.SYNOLOGY_CHAT_TOKEN) ?? "";
+  const envIncomingUrl = normalizeOptionalString(process.env.SYNOLOGY_CHAT_INCOMING_URL) ?? "";
+  const envNasHost = normalizeOptionalString(process.env.SYNOLOGY_NAS_HOST) ?? "localhost";
+  const envAllowedUserIds = normalizeOptionalString(process.env.SYNOLOGY_ALLOWED_USER_IDS) ?? "";
   const envRateLimitValue = parseRateLimitPerMinute(process.env.SYNOLOGY_RATE_LIMIT);
-  const envBotName = process.env.OPENCLAW_BOT_NAME ?? "OpenClaw";
+  const envBotName = normalizeOptionalString(process.env.OPENCLAW_BOT_NAME) ?? "OpenClaw";
   const webhookPathSource = resolveWebhookPathSource({ accountId: id, channelCfg, rawAccount });
   const dangerouslyAllowInheritedWebhookPath =
     rawAccount.dangerouslyAllowInheritedWebhookPath ??
@@ -144,7 +158,8 @@ export function resolveAccount(
     dangerouslyAllowInheritedWebhookPath,
     dmPolicy: merged.dmPolicy ?? "allowlist",
     allowedUserIds: parseAllowedUserIds(merged.allowedUserIds ?? envAllowedUserIds),
-    rateLimitPerMinute: merged.rateLimitPerMinute ?? envRateLimitValue,
+    rateLimitPerMinute:
+      normalizeRateLimitPerMinuteValue(merged.rateLimitPerMinute) ?? envRateLimitValue,
     botName: merged.botName ?? envBotName,
     allowInsecureSsl: merged.allowInsecureSsl ?? false,
   };

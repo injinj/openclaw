@@ -1,30 +1,32 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+/**
+ * Gemini CLI bundle MCP adapter that writes temporary system settings files.
+ */
 import { applyMergePatch } from "../../config/merge-patch.js";
+import { tryReadJson } from "../../infra/json-files.js";
 import type { BundleMcpConfig, BundleMcpServerConfig } from "../../plugins/bundle-mcp.js";
 import {
-  applyCommonServerConfig,
   decodeHeaderEnvPlaceholder,
   isRecord,
+  normalizeBundleMcpServerConfig,
   normalizeStringRecord,
-} from "./bundle-mcp-adapter-shared.js";
+} from "../bundle-mcp-adapter.js";
+import { withOpenClawMcpCaptureHeader, writeTemporaryBundleMcpJson } from "./bundle-mcp-runtime.js";
+
+const GEMINI_MCP_SERVER_FIELDS = { strings: ["type"], booleans: ["trust"] } as const;
 
 async function readJsonObject(filePath: string): Promise<Record<string, unknown>> {
-  try {
-    const raw = JSON.parse(await fs.readFile(filePath, "utf-8")) as unknown;
-    return raw && typeof raw === "object" && !Array.isArray(raw)
-      ? ({ ...raw } as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
+  const raw = await tryReadJson<unknown>(filePath);
+  return raw && typeof raw === "object" && !Array.isArray(raw)
+    ? ({ ...raw } as Record<string, unknown>)
+    : {};
 }
 
 function resolveEnvPlaceholder(
   value: string,
   inheritedEnv: Record<string, string> | undefined,
 ): string {
+  // Gemini settings need concrete header values; resolve placeholders from the
+  // inherited run env first, then the process env.
   const decoded = decodeHeaderEnvPlaceholder(value);
   if (!decoded) {
     return value;
@@ -37,11 +39,7 @@ function normalizeGeminiServerConfig(
   server: BundleMcpServerConfig,
   inheritedEnv: Record<string, string> | undefined,
 ): Record<string, unknown> {
-  const next: Record<string, unknown> = {};
-  applyCommonServerConfig(next, server);
-  if (typeof server.type === "string") {
-    next.type = server.type;
-  }
+  const next = normalizeBundleMcpServerConfig(server, GEMINI_MCP_SERVER_FIELDS);
   const headers = normalizeStringRecord(server.headers);
   if (headers) {
     next.headers = Object.fromEntries(
@@ -51,18 +49,14 @@ function normalizeGeminiServerConfig(
       ]),
     );
   }
-  if (typeof server.trust === "boolean") {
-    next.trust = server.trust;
-  }
   return next;
 }
 
+/** Writes merged Gemini system settings and returns env plus cleanup hook. */
 export async function writeGeminiSystemSettings(
   mergedConfig: BundleMcpConfig,
   inheritedEnv: Record<string, string> | undefined,
 ): Promise<{ env: Record<string, string>; cleanup: () => Promise<void> }> {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-gemini-mcp-"));
-  const settingsPath = path.join(tempDir, "settings.json");
   const existingSettingsPath =
     inheritedEnv?.GEMINI_CLI_SYSTEM_SETTINGS_PATH ?? process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH;
   const base =
@@ -86,14 +80,35 @@ export async function writeGeminiSystemSettings(
   if (!isRecord(settings.mcp) || !isRecord(settings.mcpServers)) {
     throw new Error("Gemini MCP settings merge produced an invalid object");
   }
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+  const temporary = await writeTemporaryBundleMcpJson("openclaw-gemini-mcp-", settings);
   return {
     env: {
       ...inheritedEnv,
-      GEMINI_CLI_SYSTEM_SETTINGS_PATH: settingsPath,
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: temporary.filePath,
     },
-    cleanup: async () => {
-      await fs.rm(tempDir, { recursive: true, force: true });
+    cleanup: temporary.cleanup,
+  };
+}
+
+/** Writes per-attempt Gemini settings with the active loopback capture token. */
+export async function writeGeminiMcpCaptureSettings(params: {
+  inheritedEnv: Record<string, string> | undefined;
+  captureKey: string;
+}): Promise<{ env: Record<string, string>; cleanup: () => Promise<void> }> {
+  const existingSettingsPath = params.inheritedEnv?.GEMINI_CLI_SYSTEM_SETTINGS_PATH;
+  if (!existingSettingsPath) {
+    throw new Error("Gemini MCP capture requires prepared system settings");
+  }
+  const settings = await readJsonObject(existingSettingsPath);
+  const temporary = await writeTemporaryBundleMcpJson(
+    "openclaw-gemini-mcp-attempt-",
+    withOpenClawMcpCaptureHeader(settings, params.captureKey),
+  );
+  return {
+    env: {
+      ...params.inheritedEnv,
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: temporary.filePath,
     },
+    cleanup: temporary.cleanup,
   };
 }

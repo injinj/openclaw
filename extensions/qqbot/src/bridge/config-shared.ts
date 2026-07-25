@@ -1,4 +1,6 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import { defineChannelSetupContract } from "openclaw/plugin-sdk/channel-setup";
+// Qqbot helper module supports config shared behavior.
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   applyAccountNameToChannelSection,
   deleteAccountFromConfigSection,
@@ -29,16 +31,17 @@ export const qqbotMeta = {
   docsPath: "/channels/qqbot",
   blurb: "Connect to QQ via official QQ Bot API",
   order: 50,
+  preferSessionLookupForAnnounceTarget: true,
 } as const;
 
-export function validateQQBotSetupInput(params: {
+function validateQQBotSetupInput(params: {
   accountId: string;
   input: ChannelSetupInput;
 }): string | null {
   return engineValidateSetupInput(params.accountId, params.input);
 }
 
-export function applyQQBotSetupAccountConfig(params: {
+function applyQQBotSetupAccountConfig(params: {
   cfg: OpenClawConfig;
   accountId: string;
   input: ChannelSetupInput;
@@ -50,15 +53,15 @@ export function applyQQBotSetupAccountConfig(params: {
   ) as OpenClawConfig;
 }
 
-export function isQQBotConfigured(account: ResolvedQQBotAccount | undefined): boolean {
+function isQQBotConfigured(account: ResolvedQQBotAccount | undefined): boolean {
   return engineIsAccountConfigured(account as never);
 }
 
-export function describeQQBotAccount(account: ResolvedQQBotAccount | undefined) {
+function describeQQBotAccount(account: ResolvedQQBotAccount | undefined) {
   return engineDescribeAccount(account as never);
 }
 
-export function formatQQBotAllowFrom(params: {
+function formatQQBotAllowFrom(params: {
   allowFrom: Array<string | number> | undefined | null;
 }): string[] {
   return engineFormatAllowFrom(params.allowFrom);
@@ -130,3 +133,23 @@ export const qqbotSetupAdapterShared = {
     input: ChannelSetupInput;
   }) => applyQQBotSetupAccountConfig({ cfg, accountId, input }),
 };
+
+export const qqbotSetupContract = defineChannelSetupContract({
+  fields: {
+    token: {
+      kind: "string",
+      sensitive: true,
+      cli: { flags: "--token <appId:secret>", description: "QQBot app id and client secret" },
+    },
+    tokenFile: {
+      kind: "string",
+      sensitive: true,
+      cli: { flags: "--token-file <path>", description: "QQBot client secret file" },
+    },
+    useEnv: {
+      kind: "boolean",
+      cli: { flags: "--use-env", description: "Use QQBOT environment credentials" },
+    },
+  },
+  legacyAdapter: qqbotSetupAdapterShared,
+});
