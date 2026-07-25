@@ -393,6 +393,7 @@ export function createSessionActions(context: SessionActionContext) {
   };
 
   const clearDisplayedSession = (key = state.currentSessionKey) => {
+    lastHistoryFingerprint = null;
     chatLog.clearAll();
     btw.clear();
     chatLog.addSystem(`session ${key}`);
@@ -415,6 +416,58 @@ export function createSessionActions(context: SessionActionContext) {
     applySessionInfoFromPatch(result);
     clearDisplayedSession();
     return true;
+  };
+
+  /* Fingerprint of the last fully rendered history payload.  loadHistory()
+   * clears the chat log and re-renders every message; because the TUI
+   * renders into normal terminal scrollback, that re-prints the entire
+   * session.  Server-side history mutations that do not change the rendered
+   * transcript (session compaction, duplicate reload triggers) would spam
+   * the whole conversation again — so when the incoming payload renders
+   * identically to what is already displayed, skip the re-render. */
+  let lastHistoryFingerprint: string | null = null;
+
+  const fingerprintHistory = (
+    messages: unknown[],
+    showTools: boolean,
+    showThinking: boolean,
+  ): string => {
+    /* FNV-1a over the fields that influence rendering; cheap + stable */
+    let h = 0x811c9dc5;
+    const mix = (s: string) => {
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+      }
+      h ^= 0x1f;
+      h = Math.imul(h, 0x01000193);
+    };
+    mix(`${state.currentSessionKey}|${showTools ? "t" : ""}${showThinking ? "k" : ""}`);
+    let count = 0;
+    for (const entry of messages) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const message = entry as Record<string, unknown>;
+      const role = asString(message.role, "");
+      if (role === "toolResult") {
+        if (!showTools) {
+          continue;
+        }
+        mix(`r|${asString(message.toolCallId, "")}|${asString(message.toolName, "")}`);
+        count++;
+        continue;
+      }
+      const text = extractTextFromMessage(message, {
+        includeThinking: showThinking,
+      });
+      if (!text) {
+        continue;
+      }
+      mix(`${role}|${text}`);
+      count++;
+    }
+    return `${count}:${(h >>> 0).toString(16)}`;
   };
 
   const loadHistory = async (): Promise<TuiHistoryLoadResult> => {
@@ -467,6 +520,21 @@ export function createSessionActions(context: SessionActionContext) {
         await refreshSessionInfo();
       }
       const showTools = (state.sessionInfo.verboseLevel ?? "off") !== "off";
+      const inFlightEarly = record.inFlightRun;
+      const inFlightEarlyRunId = asString(inFlightEarly?.runId, "");
+      const fingerprint = fingerprintHistory(record.messages ?? [], showTools, state.showThinking);
+      if (state.historyLoaded && fingerprint === lastHistoryFingerprint) {
+        /* identical transcript already on screen: skip the clearAll + full
+         * re-render (avoids re-printing the whole session into scrollback
+         * after a compaction or a redundant reload trigger) */
+        if (inFlightEarlyRunId) {
+          state.activeChatRunId = inFlightEarlyRunId;
+          setActivityStatus("streaming");
+        }
+        void rememberSessionKey?.(state.currentSessionKey);
+        return { loaded: true, inFlightRunId: inFlightEarlyRunId || null };
+      }
+      lastHistoryFingerprint = fingerprint;
       const historyUsers: Array<{ text: string; timestamp?: number | null }> = [];
       chatLog.clearAll({ preservePendingUsers: true });
       btw.clear();
