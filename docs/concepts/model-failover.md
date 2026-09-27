@@ -305,6 +305,20 @@ The value is a TTL in milliseconds. `0` or unset disables the cache. Positive va
 
 Billing/credit failures (for example "insufficient credits" / "credit balance too low") are treated as failover-worthy. OpenClaw marks the credential as **disabled** for ten minutes initially and rotates to the next eligible profile/provider.
 
+If your provider's billing errors are known to be transient — for example an Anthropic console spend limit that trips on a burst and resets on its own, which surfaces as the same `credit balance is too low` message as a genuinely empty balance — turn the lockout off:
+
+```json5
+{
+  auth: {
+    cooldowns: {
+      billingLockout: false,
+    },
+  },
+}
+```
+
+Billing failures then use the regular short cooldown above (30s / 1m / 5m) instead of the disable window, so the profile is re-tried automatically. Running `openclaw models auth login` for the provider also clears an existing billing lockout.
+
 Configured inline API keys cannot retry during an active disable window. After the window expires, they become eligible again. Another billing failure starts a new ten-minute window. Stored auth profiles can also recover through bounded primary-provider probes during a disable window. Recharging does not itself clear persisted state, and upgrading leaves an already-active window at its existing deadline.
 
 <Note>

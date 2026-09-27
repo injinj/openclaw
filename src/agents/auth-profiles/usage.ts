@@ -19,7 +19,6 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveProviderModelAuthPolicy } from "../model-auth-policy.js";
 import { readProviderJsonResponse } from "../provider-http-errors.js";
 import { resolveProviderRequestHeaders } from "../provider-request-config.js";
-import { persistInlineAuthFailure } from "./inline-usage.js";
 import { isSettledOAuthRefreshFailure } from "./oauth-refresh-failure.js";
 import { resolveAuthProfileOrder } from "./order.js";
 import { resolveSharedAuthStorePath } from "./path-resolve.js";
@@ -29,7 +28,7 @@ import {
   loadAuthProfileStoreWithoutExternalProfiles,
   updateAuthProfileStoreWithLock,
 } from "./store-runtime.js";
-import { applyScopedAuthReadThrough, resolvePersistedAuthProfileOwnerAgentDir } from "./store.js";
+import { resolvePersistedAuthProfileOwnerAgentDir } from "./store.js";
 import type {
   AuthProfileBlockedSource,
   AuthProfileCooldownClassification,
@@ -39,13 +38,17 @@ import type {
   OAuthCredential,
   ProfileUsageStats,
 } from "./types.js";
-import { computeNextProfileUsageStats, resolveUsageWindowUntil } from "./usage-failure-state.js";
+import {
+  computeNextProfileUsageStats,
+  resolveBillingLockout,
+  resolveUsageWindowUntil,
+} from "./usage-failure-state.js";
+import { logDroppedAuthProfileBookkeeping } from "./usage-inline-failure.js";
 import {
   isActiveUnusableWindow,
   isAuthCooldownBypassedForProvider,
   isBlockedWindowActiveForModel,
   isCooldownScopedToDifferentModel,
-  resolveInlineProviderApiKeyUsageId,
 } from "./usage-state.js";
 
 const authProfileUsageLog = createSubsystemLogger("agent/embedded");
@@ -79,15 +82,6 @@ const testing = {
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
   (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.authProfileUsageTestApi")] =
     testing;
-}
-
-function logDroppedAuthProfileBookkeeping(kind: string, profileId: string): void {
-  authProfileUsageLog.warn("dropped auth profile bookkeeping after locked store update failed", {
-    event: "auth_profile_bookkeeping_dropped",
-    kind,
-    profileId,
-    tags: ["auth_profiles", "persistence"],
-  });
 }
 
 async function updateOwnedAuthProfileUsage(
@@ -768,6 +762,7 @@ export async function markAuthProfileFailure(params: {
         now,
         reason,
         modelId,
+        billingLockout: resolveBillingLockout(params.cfg),
       });
       nextStats = currentWhamResult
         ? applyWhamCooldownResult({
@@ -906,42 +901,6 @@ export async function markAuthProfileBlockedUntil(params: {
   if (updated === null) {
     logDroppedAuthProfileBookkeeping("blocked_until", profileId);
   }
-}
-
-export async function markInlineProviderApiKeyFailure(params: {
-  store: AuthProfileStore;
-  provider: string;
-  reason: AuthProfileFailureReason;
-  cfg?: OpenClawConfig;
-  agentDir: string;
-  runId?: string;
-  modelId?: string;
-}): Promise<void> {
-  const { store, provider, reason, agentDir, runId, modelId } = params;
-  if (
-    (reason !== "auth" && reason !== "auth_permanent" && reason !== "billing") ||
-    isAuthCooldownBypassedForProvider(provider)
-  ) {
-    return;
-  }
-
-  const usageId = resolveInlineProviderApiKeyUsageId(provider);
-
-  const receipt = await persistInlineAuthFailure(agentDir, { provider, reason, modelId });
-  if (receipt) {
-    store.usageStats = applyScopedAuthReadThrough(receipt.store).usageStats;
-    logAuthProfileFailureStateChange({
-      runId,
-      profileId: usageId,
-      provider,
-      reason,
-      previous: receipt.previousStats,
-      next: receipt.nextStats,
-      now: receipt.now,
-    });
-    return;
-  }
-  logDroppedAuthProfileBookkeeping("inline_api_key_failure", usageId);
 }
 
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

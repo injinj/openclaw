@@ -151,6 +151,8 @@ export const MODEL_FIELD_HELP: Record<string, string> = {
     "Require @mention in channels before responding (default: true).",
   "auth.profiles": "Named auth profiles (provider + mode + optional email).",
   "auth.order": "Ordered auth profile IDs per provider (used for automatic failover).",
+  "auth.cooldowns.billingLockout":
+    "When false, billing/credit failures use the regular short cooldown instead of the multi-hour disabled window (for providers whose billing errors clear on their own). Default: true.",
   "agents.defaults.workspace":
     "Default agent workspace for bootstrap and memory files. Also used as the working directory when agents.defaults.cwd is unset. Set this explicitly when running from wrappers so path resolution stays deterministic.",
   "agents.defaults.cwd":

@@ -77,8 +77,8 @@ export {
   isProfileInCooldown,
   markAuthProfileBlockedUntil,
   markAuthProfileFailure,
-  markInlineProviderApiKeyFailure,
   resolveInlineProviderApiKeyUsageId,
   resolveProfilesUnavailableReason,
   resolveProfileUnusableUntilForDisplay,
 } from "./auth-profiles/usage.js";
+export { markInlineProviderApiKeyFailure } from "./auth-profiles/usage-inline-failure.js";

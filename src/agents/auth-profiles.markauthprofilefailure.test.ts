@@ -29,9 +29,9 @@ vi.mock("../plugins/provider-external-auth-core.js", () => ({
 
 import { clearRuntimeAuthProfileStoreSnapshots } from "./auth-profiles/runtime-snapshots.js";
 import { ensureAuthProfileStore, saveAuthProfileStore } from "./auth-profiles/store-runtime.js";
+import { markInlineProviderApiKeyFailure } from "./auth-profiles/usage-inline-failure.js";
 import {
   markAuthProfileFailure,
-  markInlineProviderApiKeyFailure,
   resolveInlineProviderApiKeyUsageId,
 } from "./auth-profiles/usage.js";
 
