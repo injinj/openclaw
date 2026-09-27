@@ -44,7 +44,7 @@ import type {
   OAuthCredential,
   ProfileUsageStats,
 } from "./types.js";
-import { resolveUsageWindowUntil } from "./usage-failure-state.js";
+import { resolveBillingLockout, resolveUsageWindowUntil } from "./usage-failure-state.js";
 import { runAuthProfileUsage } from "./usage-lifecycle.js";
 import {
   isSameWhamCredential,
@@ -603,6 +603,7 @@ export async function markAuthProfileFailure(params: {
         modelId,
         whamResult,
         probeEligible: shouldProbeWham,
+        billingLockout: resolveBillingLockout(params.cfg),
         observedProfile: observed?.credential,
         blockGeneration,
       });
@@ -729,7 +730,12 @@ export async function markInlineProviderApiKeyFailure(params: {
 
   const usageId = resolveInlineProviderApiKeyUsageId(provider);
 
-  const receipt = await persistInlineAuthFailure(agentDir, { provider, reason, modelId });
+  const receipt = await persistInlineAuthFailure(agentDir, {
+    provider,
+    reason,
+    modelId,
+    billingLockout: resolveBillingLockout(params.cfg),
+  });
   if (receipt) {
     store.usageStats = applyScopedAuthReadThrough(receipt.store).usageStats;
     logAuthProfileFailureStateChange({

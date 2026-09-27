@@ -319,6 +319,11 @@ export const OpenClawSchemaShape = {
         )
         .optional(),
       order: z.record(z.string(), z.array(z.string())).optional(),
+      cooldowns: z
+        .strictObject({
+          billingLockout: z.boolean().optional(),
+        })
+        .optional(),
     })
     .optional(),
   accessGroups: AccessGroupsSchema,

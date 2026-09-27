@@ -39,7 +39,7 @@ describe("dead config keys", () => {
     "marketplaces",
     "cli",
     "commitments",
-    "auth.cooldowns",
+    "auth.cooldowns.billingBackoffHours",
     "secrets.resolution",
     "browser.remoteCdpTimeoutMs",
     "browser.remoteCdpHandshakeTimeoutMs",

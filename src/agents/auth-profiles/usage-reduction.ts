@@ -146,6 +146,8 @@ export type AuthProfileFailureReduction = {
   probeEligible: boolean;
   observedProfile?: AuthProfileCredential;
   blockGeneration?: ProfileUsageStats;
+  /** auth.cooldowns.billingLockout resolved by the caller; false => short cooldown for billing. */
+  billingLockout?: boolean;
 };
 
 export type PersonalAuthProfileUsageReduction =
@@ -189,7 +191,13 @@ export function reduceAuthProfileFailure(
     currentWhamResult?.available && previousStats?.blockedReason === "subscription_limit"
       ? reconcileWhamBlock(previousStats, currentWhamResult, now)
       : (previousStats ?? {});
-  const computed = computeNextProfileUsageStats({ existing, now, reason, modelId });
+  const computed = computeNextProfileUsageStats({
+    existing,
+    now,
+    reason,
+    modelId,
+    billingLockout: input.billingLockout,
+  });
   return currentWhamResult
     ? applyWhamCooldownResult({ existing, computed, now, whamResult: currentWhamResult })
     : computed;

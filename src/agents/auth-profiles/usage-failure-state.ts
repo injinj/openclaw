@@ -1,4 +1,5 @@
 import { resolveExpiresAtMsFromDurationMs } from "@openclaw/normalization-core/number-coercion";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AuthProfileFailureReason, ProfileUsageStats } from "./types.js";
 import {
   isBlockedWindowActiveForModel,
@@ -63,11 +64,22 @@ function calculateCappedExponentialBackoffMs(params: {
   return Math.min(maxMs, raw);
 }
 
+/** auth.cooldowns.billingLockout (default true): false keeps billing on the short cooldown. */
+export function resolveBillingLockout(cfg?: OpenClawConfig): boolean {
+  return cfg?.auth?.cooldowns?.billingLockout !== false;
+}
+
 export function computeNextProfileUsageStats(params: {
   existing: ProfileUsageStats;
   now: number;
   reason: AuthProfileFailureReason;
   modelId?: string;
+  /**
+   * auth.cooldowns.billingLockout: false demotes billing failures from the
+   * disabled lane to the regular short cooldown, for providers whose billing
+   * errors clear on their own (for example an Anthropic console spend limit).
+   */
+  billingLockout?: boolean;
 }): ProfileUsageStats {
   // The provider quota writer already recorded this failure and its retry deadline.
   if (
@@ -116,7 +128,10 @@ export function computeNextProfileUsageStats(params: {
   };
 
   const disabledFailureReason =
-    params.reason === "billing" || params.reason === "auth_permanent" ? params.reason : null;
+    (params.reason === "billing" && params.billingLockout !== false) ||
+    params.reason === "auth_permanent"
+      ? params.reason
+      : null;
   const backoffPolicy =
     disabledFailureReason || params.reason === "rate_limit"
       ? FAILURE_BACKOFF_POLICIES[disabledFailureReason ?? "rate_limit"]

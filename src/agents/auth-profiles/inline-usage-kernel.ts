@@ -22,6 +22,8 @@ export type InlineAuthFailureInput = {
   provider: string;
   reason: Extract<AuthProfileFailureReason, "auth" | "auth_permanent" | "billing">;
   modelId?: string;
+  /** auth.cooldowns.billingLockout resolved by the caller; false => short cooldown for billing. */
+  billingLockout?: boolean;
   expectedCredentials: unknown;
   inheritedUsageStats?: AuthProfileStore["usageStats"];
 };
@@ -92,6 +94,7 @@ export function recordInlineAuthFailureInDatabase(
     now,
     reason: input.reason,
     modelId: input.modelId,
+    billingLockout: input.billingLockout,
   });
   store.usageStats = { ...store.usageStats, [usageId]: nextStats };
   const { statePayload, stateChanged, selectionChanged } = prepareAuthProfileStateMutation({
