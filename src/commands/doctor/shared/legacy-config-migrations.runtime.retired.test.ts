@@ -383,7 +383,8 @@ describe("retired runtime config migrations", () => {
     "marketplaces",
     "cli.banner.taglineMode",
     "commitments",
-    "auth.cooldowns",
+    "auth.cooldowns.billingBackoffHours",
+    "auth.cooldowns.failureWindowHours",
     "secrets.resolution",
     "browser.remoteCdpTimeoutMs",
     "browser.tabCleanup.idleMinutes",
@@ -437,6 +438,16 @@ describe("retired runtime config migrations", () => {
     expect(getPath(result.raw, path)).toBeUndefined();
     expect(result.changes).toContain(
       `Removed retired runtime tuning knobs: ${path.replace("agents.list.0.", "agents.list[0].")}; built-in defaults now apply.`,
+    );
+  });
+
+  it("keeps auth.cooldowns.billingLockout while stripping the retired numeric knobs", () => {
+    const result = applyAll({
+      auth: { cooldowns: { billingLockout: false, billingBackoffHours: 5, billingMaxHours: 24 } },
+    });
+    expect(result.raw).toEqual({ auth: { cooldowns: { billingLockout: false } } });
+    expect(result.changes).toContain(
+      "Removed retired runtime tuning knobs: auth.cooldowns.billingBackoffHours, auth.cooldowns.billingMaxHours; built-in defaults now apply.",
     );
   });
 

@@ -137,7 +137,17 @@ const RETIRED_TUNING_PATHS = [
   ["marketplaces"],
   ["cli", "banner", "taglineMode"],
   ["commitments"],
-  ["auth", "cooldowns"],
+  // The numeric auth cooldown knobs were purged in #111382; auth.cooldowns itself
+  // stays live for the boolean billingLockout switch.
+  ["auth", "cooldowns", "billingBackoffHours"],
+  ["auth", "cooldowns", "billingBackoffHoursByProvider"],
+  ["auth", "cooldowns", "billingMaxHours"],
+  ["auth", "cooldowns", "authPermanentBackoffMinutes"],
+  ["auth", "cooldowns", "authPermanentMaxMinutes"],
+  ["auth", "cooldowns", "failureWindowHours"],
+  ["auth", "cooldowns", "overloadedBackoffMs"],
+  ["auth", "cooldowns", "overloadedProfileRotations"],
+  ["auth", "cooldowns", "rateLimitedProfileRotations"],
   ["secrets", "resolution"],
   ["browser", "remoteCdpTimeoutMs"],
   ["browser", "remoteCdpHandshakeTimeoutMs"],
