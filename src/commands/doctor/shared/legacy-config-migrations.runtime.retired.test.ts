@@ -225,6 +225,16 @@ describe("retired runtime config migrations", () => {
     },
   );
 
+  it("keeps auth.cooldowns.billingLockout while stripping the retired numeric knobs", () => {
+    const result = applyAll({
+      auth: { cooldowns: { billingLockout: false, billingBackoffHours: 5, billingMaxHours: 24 } },
+    });
+    expect(result.raw).toEqual({ auth: { cooldowns: { billingLockout: false } } });
+    expect(result.changes).toContain(
+      "Removed retired runtime tuning knobs: auth.cooldowns.billingBackoffHours, auth.cooldowns.billingMaxHours; built-in defaults now apply.",
+    );
+  });
+
   it("migrates presentation, agent limits and the selected WhatsApp debounce", () => {
     const result = applyAll({
       ui: {
