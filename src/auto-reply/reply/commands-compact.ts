@@ -18,38 +18,73 @@ import {
 } from "../../agents/openai-routing.js";
 import { resolveOwnerPromptNumbers } from "../../agents/owner-display.js";
 import { resolveManualCompactionCliTarget } from "../../agents/session-runtime-compat.js";
+import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { resolveCollapsedSessionAuthPinSource } from "../../config/sessions/auth-profile-override-provenance.js";
 import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { resolveSessionStorePathForScope } from "../../config/sessions/session-store-path.js";
 import type { InternalSessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import { resolveSystemEventQueueKey } from "../../infra/system-event-ownership.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { matchCommandPrefix, rejectUnauthorizedCommand } from "./command-gates.js";
 import type { CommandHandler, CommandHandlerResult } from "./commands-types.js";
 import { createCompactionNoticePayload } from "./compaction-notice.js";
 import { stripMentions, stripStructuralPrefixes } from "./mentions.js";
 
-function extractCompactInstructions(params: {
+const compactCommandLog = createSubsystemLogger("auto-reply/compaction");
+
+/** Bare-word and flag spellings that skip the pre-compaction memory flush. */
+const COMPACT_NO_FLUSH_TOKENS = new Set(["--no-flush", "--noflush", "noflush"]);
+
+export type CompactCommandArgs = {
+  customInstructions?: string;
+  skipMemoryFlush: boolean;
+};
+
+/** Split /compact arguments into flags and the free-text summary instructions. */
+export function parseCompactCommandArgs(rest: string | undefined): CompactCommandArgs {
+  const text = rest?.trim() ?? "";
+  if (!text) {
+    return { skipMemoryFlush: false };
+  }
+  let skipMemoryFlush = false;
+  const remaining: string[] = [];
+  for (const token of text.split(/\s+/)) {
+    if (COMPACT_NO_FLUSH_TOKENS.has(normalizeLowercaseStringOrEmpty(token))) {
+      skipMemoryFlush = true;
+      continue;
+    }
+    remaining.push(token);
+  }
+  const customInstructions = remaining.join(" ").trim();
+  return {
+    customInstructions: customInstructions.length ? customInstructions : undefined,
+    skipMemoryFlush,
+  };
+}
+
+function extractCompactArgs(params: {
   rawBody?: string;
   ctx: import("../templating.js").MsgContext;
   cfg: OpenClawConfig;
   agentId?: string;
   isGroup: boolean;
-}): string | undefined {
+}): CompactCommandArgs {
   const raw = stripStructuralPrefixes(params.rawBody ?? "");
   const stripped = params.isGroup
     ? stripMentions(raw, params.ctx, params.cfg, params.agentId)
     : raw;
   const trimmed = stripped.trim();
   if (!trimmed.toLowerCase().startsWith("/compact")) {
-    return undefined;
+    return { skipMemoryFlush: false };
   }
   let rest = trimmed.slice("/compact".length).trimStart();
   if (rest.startsWith(":")) {
     rest = rest.slice(1).trimStart();
   }
-  return rest.length ? rest : undefined;
+  return parseCompactCommandArgs(rest);
 }
 
 function formatCompactionReason(reason?: string): string | undefined {
@@ -199,7 +234,7 @@ export async function handleCompactCommand(
     sessionAgentId === currentAgentId && params.agentDir
       ? params.agentDir
       : resolveAgentDir(params.cfg, sessionAgentId);
-  const customInstructions = extractCompactInstructions({
+  const { customInstructions, skipMemoryFlush } = extractCompactArgs({
     rawBody: params.ctx.commandText,
     ctx: params.ctx,
     cfg: params.cfg,
@@ -301,6 +336,84 @@ export async function handleCompactCommand(
     return failure;
   }
   assertOwnerBeforeAcceptance();
+  if (!skipMemoryFlush) {
+    // Manual compaction summarizes the same context automatic compaction would, so
+    // give the agent the same chance to persist memory first. The flush helper owns
+    // the gate (threshold, per-compaction dedupe, memoryFlush.enabled, sandbox, CLI
+    // runtimes); a failed or timed-out flush never blocks the user's compact.
+    const preFlush = await prepareCurrentEntry();
+    if (!preFlush) {
+      return compactionUnavailable("command session changed", interruptionNotice);
+    }
+    const preFlushEntry = preFlush.entry;
+    // The flush writes the row (flush accounting, writer custody); drop this read's
+    // guard so its own writes do not read as a session change. Dispatch re-reads.
+    currentRead?.release();
+    currentRead = undefined;
+    try {
+      const followupRun = runtime.createSessionMaintenanceFollowup({
+        run: {
+          agentId: sessionAgentId,
+          agentDir: sessionAgentDir,
+          workspaceDir: params.workspaceDir,
+          cwd: params.workspaceDir,
+          messageProvider: params.command.channel,
+          agentAccountId: params.ctx.AccountId,
+          chatType: normalizeChatType(params.ctx.ChatType),
+          conversationRoutePeerId: params.ctx.ConversationRoutePeerId,
+          conversationToolPolicy: params.ctx.ConversationToolPolicy,
+          groupId: preFlushEntry.groupId,
+          groupChannel: preFlushEntry.groupChannel,
+          groupSpace: preFlushEntry.space,
+          skillsSnapshot: preFlushEntry.skillsSnapshot,
+          thinkingCatalog: params.thinkingCatalog,
+          thinkLevel,
+          verboseLevel: params.resolvedVerboseLevel ?? "off",
+          timeoutMs: resolveAgentTimeoutMs({ cfg: params.cfg }),
+          senderIsOwner: params.command.senderIsOwner,
+        },
+        sessionEntry: preFlushEntry,
+        cfg: params.cfg,
+        sessionKey: params.sessionKey,
+        provider: params.provider,
+        model: params.model,
+        auth: {
+          authProfileId: preFlushEntry.authProfileOverride?.trim() || undefined,
+          authProfileIdSource: resolveCollapsedSessionAuthPinSource(preFlushEntry),
+        },
+      });
+      followupRun.operatorAuthority = operatorAuthority;
+      const flushed = await runtime.runMemoryFlushIfNeeded({
+        cfg: params.cfg,
+        followupRun,
+        promptForEstimate: "",
+        defaultModel: params.model,
+        resolvedVerboseLevel: params.resolvedVerboseLevel ?? "off",
+        sessionEntry: preFlushEntry,
+        sessionStore: params.sessionStore,
+        sessionKey: params.sessionKey,
+        runtimePolicySessionKey: params.sessionKey,
+        storePath: compactionStorePath,
+        isHeartbeat: false,
+        replyOperation: params.opts?.replyOperation,
+        abortSignal: params.opts?.abortSignal,
+      });
+      if (flushed.outcome === "failed" || flushed.outcome === "exhausted") {
+        compactCommandLog.warn(
+          `manual /compact memory flush ${flushed.outcome} for ${params.sessionKey}; compacting anyway`,
+        );
+      }
+    } catch (error) {
+      compactCommandLog.warn(
+        `manual /compact memory flush threw for ${params.sessionKey}; compacting anyway: ${formatErrorMessage(error)}`,
+      );
+    }
+    failure = authorityFailure();
+    if (failure) {
+      return failure;
+    }
+    assertOwnerBeforeAcceptance();
+  }
   // Prepare one current row at compaction dispatch; write receipts keep its guard live.
   const prepared = await prepareCurrentEntry();
   if (!prepared) {

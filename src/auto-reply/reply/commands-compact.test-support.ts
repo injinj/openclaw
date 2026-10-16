@@ -13,6 +13,32 @@ import type { HandleCommandsParams } from "./commands-types.js";
 vi.mock("./commands-compact.runtime.js", () => ({
   abortEmbeddedAgentRun: vi.fn(),
   compactEmbeddedAgentSession: vi.fn(),
+  createSessionMaintenanceFollowup: vi.fn(
+    (params: {
+      run: Record<string, unknown>;
+      sessionEntry: SessionEntry;
+      cfg: OpenClawConfig;
+      sessionKey?: string;
+      provider: string;
+      model: string;
+      auth: Record<string, unknown>;
+    }) => ({
+      prompt: "",
+      enqueuedAt: 0,
+      run: {
+        ...params.run,
+        sessionId: params.sessionEntry.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionKey ?? params.sessionEntry.sessionId,
+        config: params.cfg,
+        provider: params.provider,
+        model: params.model,
+        ...params.auth,
+        senderIsOwner: false,
+      },
+      memoryAudienceSenderIsOwner: params.run.senderIsOwner === true,
+    }),
+  ),
   enqueueSystemEvent: vi.fn(),
   formatContextUsageShort: vi.fn(() => "Context 12.1k"),
   formatTokenCount: vi.fn((value: number) => `${value}`),
@@ -26,17 +52,23 @@ vi.mock("./commands-compact.runtime.js", () => ({
   ),
   isEmbeddedAgentRunAbortableForCompaction: vi.fn().mockReturnValue(false),
   resolveFreshSessionTotalTokens: vi.fn(() => 12_345),
+  runMemoryFlushIfNeeded: vi.fn(async (params: { sessionEntry?: SessionEntry }) => ({
+    sessionEntry: params.sessionEntry,
+    outcome: "skipped" as const,
+  })),
   waitForEmbeddedAgentRunEnd: vi.fn().mockResolvedValue(true),
 }));
 
 export const {
   abortEmbeddedAgentRun,
   compactEmbeddedAgentSession,
+  createSessionMaintenanceFollowup,
   enqueueSystemEvent,
   formatContextUsageShort,
   incrementCompactionCount,
   prepareCurrentSessionEntry,
   isEmbeddedAgentRunAbortableForCompaction,
+  runMemoryFlushIfNeeded,
   waitForEmbeddedAgentRunEnd,
 } = await import("./commands-compact.runtime.js");
 export const { handleCompactCommand } = await import("./commands-compact.js");
@@ -71,6 +103,10 @@ export function buildCompactParams(
 export function resetCompactCommandMocks() {
   vi.clearAllMocks();
   vi.mocked(incrementCompactionCount).mockResolvedValue(1);
+  vi.mocked(runMemoryFlushIfNeeded).mockImplementation(async (params) => ({
+    sessionEntry: params.sessionEntry,
+    outcome: "skipped",
+  }));
   vi.mocked(prepareCurrentSessionEntry).mockImplementation(async ({ expected }) => ({
     entry: { updatedAt: 1, ...expected },
     assertCurrent() {},
@@ -88,6 +124,14 @@ export function requireCompactEmbeddedAgentSessionCall(index = 0) {
   const call = vi.mocked(compactEmbeddedAgentSession).mock.calls[index]?.[0];
   if (!call) {
     throw new Error(`compactEmbeddedAgentSession call ${index} missing`);
+  }
+  return call;
+}
+
+export function requireRunMemoryFlushIfNeededCall(index = 0) {
+  const call = vi.mocked(runMemoryFlushIfNeeded).mock.calls[index]?.[0];
+  if (!call) {
+    throw new Error(`runMemoryFlushIfNeeded call ${index} missing`);
   }
   return call;
 }
