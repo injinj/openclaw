@@ -39,6 +39,7 @@ import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import { readGatewayRequestMutationAuthority } from "./session-mutation-guards.js";
 import { waitForTerminalSessionRunSettlement } from "./session-run-settlement.js";
+import { runGatewaySessionCompactionMemoryFlush } from "./sessions-compaction-memory-flush.js";
 import {
   preflightGatewaySessionCompaction,
   runGatewaySessionCompaction,
@@ -59,6 +60,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
       return;
     }
     const maxLines = params.maxLines;
+    const skipMemoryFlush = params.skipMemoryFlush === true;
     const sessionChangedError = () =>
       errorShape(ErrorCodes.INVALID_REQUEST, `Session ${key} changed before compaction. Retry.`, {
         details: { reason: SESSION_LIFECYCLE_CHANGED_ERROR_REASON },
@@ -297,7 +299,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
           }
 
           // The lifecycle owner spans preparation and execution.
-          const latestEntry = preparedEntry;
+          let latestEntry = preparedEntry;
           if (!latestEntry) {
             respond(false, undefined, sessionChangedError());
             return;
@@ -319,13 +321,40 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
               completed,
               reason,
             });
-          let result: Awaited<ReturnType<typeof runGatewaySessionCompaction>>;
-          let persisted = false;
-          let expectedEntry: InternalSessionEntry = latestEntry;
           const assertActive = () => {
             assertRequestCurrent();
             abortSignal?.throwIfAborted();
           };
+          if (!skipMemoryFlush) {
+            // Same pre-compaction flush as chat /compact and automatic compaction;
+            // the helper owns the gate and never throws. Re-read the row afterwards
+            // so compaction accounts against the flush's persisted state.
+            await runGatewaySessionCompactionMemoryFlush({
+              cfg,
+              entry: latestEntry,
+              agentId: target.agentId,
+              sessionKey: target.canonicalKey,
+              storePath,
+              abortSignal,
+              operatorAuthority: capturedOperator?.authority,
+            });
+            try {
+              assertActive();
+              latestEntry = await readCurrentEntry();
+            } catch (err) {
+              emitCompactionEnd(false, formatErrorMessage(err));
+              throw err;
+            }
+            if (!latestEntry) {
+              const reason = `Session ${key} changed before compaction. Retry.`;
+              emitCompactionEnd(false, reason);
+              respond(false, undefined, sessionChangedError());
+              return;
+            }
+          }
+          let result: Awaited<ReturnType<typeof runGatewaySessionCompaction>>;
+          let persisted = false;
+          let expectedEntry: InternalSessionEntry = latestEntry;
           try {
             result = await runGatewaySessionCompaction(
               {

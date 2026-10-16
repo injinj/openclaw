@@ -71,16 +71,17 @@ export function createSessionScopedOperations(host: SessionScopedOperationsHost)
 
   const compact = async (
     key: string,
-    options: { agentId?: string | null } = {},
+    options: { agentId?: string | null; skipMemoryFlush?: boolean } = {},
   ): Promise<SessionCompactResult> => {
     const scope = host.connection.capture();
     if (!scope) {
       throw new Error("Session compaction requires an active Gateway connection");
     }
-    const result = await scope.client.request<SessionCompactResult>(
-      "sessions.compact",
-      buildSessionRequestParams(key, options.agentId),
-    );
+    const result = await scope.client.request<SessionCompactResult>("sessions.compact", {
+      ...buildSessionRequestParams(key, options.agentId),
+      // Only the opt-out travels; the Gateway flushes by default.
+      ...(options.skipMemoryFlush === true ? { skipMemoryFlush: true } : {}),
+    });
     if (!host.connection.isCurrent(scope)) {
       throw new Error("Session compaction completed on a replaced Gateway connection");
     }

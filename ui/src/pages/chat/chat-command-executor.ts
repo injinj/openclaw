@@ -2,6 +2,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
 } from "@openclaw/normalization-core/string-coerce";
+import { parseCompactCommandArgs } from "../../../../src/auto-reply/reply/commands-compact.args.js";
 import {
   isSessionDefaultDirectiveValue,
   normalizeVerboseLevel,
@@ -129,7 +130,7 @@ export async function executeSlashCommand(
     case "help":
       return executeHelp();
     case "compact":
-      return executeCompact(sessionKey, context);
+      return executeCompact(sessionKey, args, context);
     case "model":
       return executeModel(client, sessionKey, args, context);
     case "think":
@@ -173,10 +174,16 @@ function executeHelp(): SlashCommandResult {
 
 async function executeCompact(
   sessionKey: string,
+  args: string,
   context: SlashCommandContext,
 ): Promise<SlashCommandResult> {
   try {
-    const options = selectedGlobalScope(sessionKey, context);
+    // The Gateway RPC takes no summary instructions; only the flush opt-out applies here.
+    const { skipMemoryFlush } = parseCompactCommandArgs(args);
+    const options = {
+      ...selectedGlobalScope(sessionKey, context),
+      ...(skipMemoryFlush ? { skipMemoryFlush: true } : {}),
+    };
     requireSessionMutationAccess(context, {
       method: "sessions.compact",
       requiredScope: "operator.admin",

@@ -595,6 +595,8 @@ export const SessionsCompactParamsSchema = closedObject({
   key: NonEmptyString,
   agentId: Type.Optional(NonEmptyString),
   maxLines: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** Skip the pre-compaction memory flush that model-backed compaction runs by default. */
+  skipMemoryFlush: Type.Optional(Type.Boolean()),
 });
 
 /** Repoints a session to the active-path state before one persisted user message. */

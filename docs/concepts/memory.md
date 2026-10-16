@@ -256,8 +256,9 @@ The flush uses a private copy of the conversation, so its housekeeping messages
 never appear in later user turns, even if interrupted. Its writes to memory
 are still saved normally.
 
-Manual `/compact` runs the same flush under the same gating before it compacts;
-use `/compact --no-flush` to skip it for one compaction.
+Manual `/compact` (in chat or the Control UI) and the `sessions.compact` Gateway
+RPC run the same flush under the same gating before they compact; use
+`/compact --no-flush` (RPC: `skipMemoryFlush: true`) to skip it for one compaction.
 
 Memory Core's file flush requires writable workspace access. Sessions whose sandbox
 requires read-only or no workspace access skip the flush, including sessions

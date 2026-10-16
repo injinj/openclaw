@@ -29,41 +29,14 @@ import { formatErrorMessage } from "../../infra/errors.js";
 import { resolveSystemEventQueueKey } from "../../infra/system-event-ownership.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { matchCommandPrefix, rejectUnauthorizedCommand } from "./command-gates.js";
+import { parseCompactCommandArgs, type CompactCommandArgs } from "./commands-compact.args.js";
 import type { CommandHandler, CommandHandlerResult } from "./commands-types.js";
 import { createCompactionNoticePayload } from "./compaction-notice.js";
 import { stripMentions, stripStructuralPrefixes } from "./mentions.js";
 
 const compactCommandLog = createSubsystemLogger("auto-reply/compaction");
 
-/** Bare-word and flag spellings that skip the pre-compaction memory flush. */
-const COMPACT_NO_FLUSH_TOKENS = new Set(["--no-flush", "--noflush", "noflush"]);
-
-export type CompactCommandArgs = {
-  customInstructions?: string;
-  skipMemoryFlush: boolean;
-};
-
-/** Split /compact arguments into flags and the free-text summary instructions. */
-export function parseCompactCommandArgs(rest: string | undefined): CompactCommandArgs {
-  const text = rest?.trim() ?? "";
-  if (!text) {
-    return { skipMemoryFlush: false };
-  }
-  let skipMemoryFlush = false;
-  const remaining: string[] = [];
-  for (const token of text.split(/\s+/)) {
-    if (COMPACT_NO_FLUSH_TOKENS.has(normalizeLowercaseStringOrEmpty(token))) {
-      skipMemoryFlush = true;
-      continue;
-    }
-    remaining.push(token);
-  }
-  const customInstructions = remaining.join(" ").trim();
-  return {
-    customInstructions: customInstructions.length ? customInstructions : undefined,
-    skipMemoryFlush,
-  };
-}
+export { parseCompactCommandArgs, type CompactCommandArgs } from "./commands-compact.args.js";
 
 function extractCompactArgs(params: {
   rawBody?: string;

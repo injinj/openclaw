@@ -227,7 +227,7 @@ plugins, and installed skills.
     | `/new [model]` | Archive the current session and start a fresh one |
     | `/reset [soft [message]]` | Reset the current session in place. `soft` keeps the transcript, drops reused CLI backend session ids, and reruns startup |
     | `/name <title>` | Name or rename the current session. Omit the title to see the current name and a suggestion |
-    | `/compact [--no-flush] [instructions]` | Compact the session context, running the pre-compaction memory flush first unless `--no-flush` is given. See [Compaction](/concepts/compaction) |
+    | `/compact [--no-flush] [instructions]` | Compact the session context, running the pre-compaction memory flush first unless `--no-flush` is given (in chat and in the Control UI). See [Compaction](/concepts/compaction) |
     | `/stop` | Abort the current run |
     | `/session idle <duration\|off>` | Manage thread-binding idle expiry |
     | `/session max-age <duration\|off>` | Manage thread-binding max-age expiry |

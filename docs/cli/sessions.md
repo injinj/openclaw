@@ -534,9 +534,10 @@ openclaw sessions compact "agent:main:main" --max-lines 200
 openclaw sessions compact "agent:work:main" --agent work --json
 ```
 
-- Without `--max-lines`, the Gateway LLM-summarizes the transcript. The CLI
-  does not impose a client deadline by default; the Gateway owns the
-  configured compaction lifecycle.
+- Without `--max-lines`, the Gateway LLM-summarizes the transcript, running the
+  pre-compaction [memory flush](/concepts/memory#automatic-memory-flush) first
+  under its normal gating. The CLI does not impose a client deadline by
+  default; the Gateway owns the configured compaction lifecycle.
 - With `--max-lines <n>`, it permanently truncates the SQLite transcript to the
   last `n` lines. The Gateway finishes rebuilding the retained transcript's
   indexes in its storage worker before reporting success, so the next turn does
@@ -562,11 +563,12 @@ no-opping.
 
 `openclaw gateway call sessions.compact --params '<json>'` accepts:
 
-| Field      | Type        | Required | Description                                                |
-| ---------- | ----------- | -------- | ---------------------------------------------------------- |
-| `key`      | string      | yes      | Session key to compact (for example `agent:main:main`).    |
-| `agentId`  | string      | no       | Agent id that owns the session (for `global` keys).        |
-| `maxLines` | integer ≥ 1 | no       | Truncate to the last N lines instead of LLM summarization. |
+| Field             | Type        | Required | Description                                                                                           |
+| ----------------- | ----------- | -------- | ----------------------------------------------------------------------------------------------------- |
+| `key`             | string      | yes      | Session key to compact (for example `agent:main:main`).                                               |
+| `agentId`         | string      | no       | Agent id that owns the session (for `global` keys).                                                   |
+| `maxLines`        | integer ≥ 1 | no       | Truncate to the last N lines instead of LLM summarization.                                            |
+| `skipMemoryFlush` | boolean     | no       | Skip the pre-compaction memory flush that LLM summarization runs by default. Ignored with `maxLines`. |
 
 Example LLM-summarize response:
 

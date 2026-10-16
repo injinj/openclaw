@@ -354,7 +354,10 @@ export type SessionCapability = {
   delete: (key: string, options?: SessionDeleteOptions) => Promise<SessionDeleteOutcome>;
   deleteMany: (targets: readonly SessionDeleteTarget[]) => Promise<SessionDeleteBatchResult>;
   reset: (key: string, options?: SessionResetOptions) => Promise<SessionResetResult>;
-  compact: (key: string, options?: { agentId?: string | null }) => Promise<SessionCompactResult>;
+  compact: (
+    key: string,
+    options?: { agentId?: string | null; skipMemoryFlush?: boolean },
+  ) => Promise<SessionCompactResult>;
   listFiles: (
     key: string,
     options?: { agentId?: string | null; path?: string; search?: string },

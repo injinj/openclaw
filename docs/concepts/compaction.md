@@ -132,7 +132,7 @@ compaction, but cannot run manual `/compact`.
 /compact Focus on the API design decisions
 ```
 
-Manual `/compact` runs the same pre-compaction [memory flush](/concepts/memory#automatic-memory-flush) as automatic compaction, with the same gating (context above the flush threshold, not already flushed for the current compaction, `memoryFlush.enabled`). Add `--no-flush` (or the bare word `noflush`) anywhere in the arguments to skip it, for example `/compact --no-flush Focus on the API design decisions`. A failed or timed-out flush is logged and compaction still proceeds.
+Manual `/compact` runs the same pre-compaction [memory flush](/concepts/memory#automatic-memory-flush) as automatic compaction, with the same gating (context above the flush threshold, not already flushed for the current compaction, `memoryFlush.enabled`). This applies to `/compact` in chat channels and in the Control UI chat, which compacts through the `sessions.compact` Gateway RPC. Add `--no-flush` (or the bare word `noflush`) anywhere in the arguments to skip it, for example `/compact --no-flush Focus on the API design decisions` (the Control UI accepts the flag but takes no summary instructions). Direct RPC callers skip the flush with `skipMemoryFlush: true`; `maxLines` trimming never flushes. A failed or timed-out flush is logged and compaction still proceeds.
 
 If a turn is active, `/compact` gives it up to 60 seconds to finish before
 cancelling it and waiting up to 15 more seconds for it to stop. When cancellation
